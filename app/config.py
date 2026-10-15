@@ -23,6 +23,8 @@ class Config:
     api_hash: str = field(default_factory=lambda: os.environ.get("API_HASH", ""))
     admin_ids: tuple[int, ...] = field(default_factory=tuple)
     tmdb_api_key: str = field(default_factory=lambda: os.environ.get("TMDB_API_KEY", ""))
+    openrouter_key: str = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY", ""))
+    llm_model: str = field(default_factory=lambda: os.environ.get("LLM_MODEL", "openai/gpt-4o-mini"))
     mini_app_url: str = field(
         default_factory=lambda: os.environ.get("MINI_APP_URL", "http://localhost:8000/app/").rstrip("/") + "/"
     )
@@ -40,6 +42,10 @@ class Config:
             if part.lstrip("-").isdigit():
                 ids.append(int(part))
         self.admin_ids = tuple(ids)
+
+    @property
+    def has_llm(self) -> bool:
+        return bool(self.openrouter_key)
 
     @property
     def has_tmdb(self) -> bool:

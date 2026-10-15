@@ -171,6 +171,9 @@ def parse_filename(raw: str) -> ParsedName:
             toks = m.group(1).split()
             if any(len(t) >= 2 or t == "0" or len(toks) > 1 for t in toks):
                 name = name[: m.start()].strip()
+    # trailing site-tag separator junk: "The Furious ... MoviesMod.At"
+    # (a leading "At" can be legit: "At Close Range" — only strip trailing)
+    name = re.sub(r"\s+\b[Aa][Tt]\b\s*$", " ", name)
     name = re.sub(r"\b(Season|Episode|Ep|Complete|Dual|Audio|Hindi|English|Engli|Eng|"
                 r"Tam|Tel|Mal|Kan|Multi|ESub)\b", " ", name, flags=re.I)
     name = RELEASE_GROUPS.sub("", name)

@@ -17,6 +17,7 @@ from .bot import MediaBot
 from .config import cfg
 from .db import DB
 from .indexer import Indexer
+from .llm import LLTitle
 from .tmdb import TMDB
 
 logging.basicConfig(
@@ -38,7 +39,10 @@ async def amain() -> None:
     db = DB(cfg.database_path)
     tmdb = TMDB(db, cfg.tmdb_api_key)
     bot = MediaBot(cfg, db, indexer=None)  # type: ignore[arg-type]
-    indexer = Indexer(bot.client, db, tmdb)
+    llm = LLTitle(cfg.openrouter_key, cfg.llm_model) if cfg.has_llm else None
+    if llm:
+        log.info("LLM title fallback enabled (%s)", cfg.llm_model)
+    indexer = Indexer(bot.client, db, tmdb, llm=llm)
     bot.indexer = indexer
 
     await bot.start()
@@ -57,6 +61,8 @@ async def amain() -> None:
         scan_task.cancel()
         await bot.stop()
         await tmdb.close()
+        if llm:
+            await llm.close()
 
 
 def main() -> None:

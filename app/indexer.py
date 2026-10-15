@@ -18,6 +18,7 @@ import time
 from pyrogram.errors import FloodWait
 
 from .classify import Classifier
+from .llm import LLTitle
 from .db import DB
 from .parser import ParsedName, parse_filename
 from .tmdb import TMDB
@@ -56,7 +57,7 @@ def _file_meta_from_msg(msg) -> dict | None:
 
 
 class Indexer:
-    def __init__(self, client, db: DB, tmdb: TMDB):
+    def __init__(self, client, db: DB, tmdb: TMDB, llm: LLTitle | None = None):
         # Bot-token only. History is read with messages.GetMessages by explicit
         # ID ranges (like Levii/EvaMaria filter bots) because Telegram blocks
         # bots from messages.GetHistory. The bot must be admin in private
@@ -64,6 +65,7 @@ class Indexer:
         self.client = client
         self.db = db
         self.tmdb = tmdb
+        self.llm = llm
         self.clf = Classifier(db)
         self._scan_lock = asyncio.Lock()
         self._enrich_queue: asyncio.Queue[int] = asyncio.Queue()
@@ -243,6 +245,7 @@ class Indexer:
         return bool(ts) and (time.time() - float(ts) < 7 * 24 * 3600)
 
     async def _enrich_one(self, title_id: int) -> None:
+        from .parser import normalize_title
         row = self.db.query_one("SELECT * FROM titles WHERE id=?", (title_id,))
         if not row or row["tmdb_id"]:
             return
@@ -250,10 +253,43 @@ class Indexer:
         p = ParsedName(raw=row["title"], title=row["title"],
                        norm_title=row["norm_title"], year=row["year"], kind=row["kind"])
         meta = await self.tmdb.match(p)
+        if not meta and self.llm and self.llm.available:
+            meta = await self._enrich_via_llm(row, p)
         if not meta:
             return
         # adopt canonical TMDB title; merge possible duplicate title rows
         await self._adopt_meta(row, meta)
+
+    async def _enrich_via_llm(self, row, p) -> dict | None:
+        """Ask the LLM to identify the title from a raw release filename,
+        then cross-check its guess against TMDB (threshold still applies)."""
+        from .parser import normalize_title
+        fn = self.db.query_one("SELECT file_name FROM files WHERE title_id=? LIMIT 1",
+                               (row["id"],))
+        filename = fn["file_name"] if fn else p.raw
+        ck = self.llm.cache_key(filename)
+        cached = self.db.get_kv(ck)
+        guess = None
+        if cached:
+            try:
+                guess = __import__("json").loads(cached)
+            except Exception:
+                guess = None
+        if guess is None:
+            guess = await self.llm.guess_title(filename)
+            self.db.set_kv(ck, __import__("json").dumps(guess or {}))
+            await asyncio.sleep(0.5)
+        if not guess or not guess.get("title"):
+            return None
+        p2 = ParsedName(raw=p.raw, title=guess["title"],
+                        norm_title=normalize_title(guess["title"]),
+                        year=guess.get("year") or p.year,
+                        kind=guess.get("kind") or p.kind)
+        meta = await self.tmdb.match(p2)
+        if meta:
+            log.info("llm identified %r as %r (%s)", p.raw[:60],
+                     meta["title"], meta.get("year"))
+        return meta
 
     async def _adopt_meta(self, row, meta: dict) -> None:
         from .parser import normalize_title

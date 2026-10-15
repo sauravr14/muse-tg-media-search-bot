@@ -197,6 +197,9 @@
   });
   window.addEventListener("hashchange", route);
 
-  // deep link: #/title/123
-  if (location.hash.match(/^#\/title\/\d+/)) route(); else home();
+  // deep link: #/title/123  or  ?startapp=title_123 (from Telegram web_app button)
+  const startParam = tg && tg.initDataUnsafe ? (tg.initDataUnsafe.start_param || "") : "";
+  const sp = startParam.match(/^title_(\d+)$/);
+  if (sp) { if (tg && tg.BackButton) tg.BackButton.show(); titlePage(+sp[1]); }
+  else if (location.hash.match(/^#\/title\/\d+/)) route(); else home();
 })();

@@ -6,14 +6,17 @@ the bot must be admin in every source channel.
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import time
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
+import aiohttp
+
 from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
-                            InlineKeyboardMarkup, Message)
+                            InlineKeyboardMarkup, Message, WebAppInfo)
 
 from .config import Config
 from .db import DB, RES_ORDER, _uj
@@ -115,8 +118,7 @@ class MediaBot:
         elif t["kind"] == "series":
             kb_rows = [[InlineKeyboardButton("📂 Browse seasons",
                                              callback_data=f"seasons:{t['id']}")]]
-        kb_rows.append([InlineKeyboardButton("🌐 Open in app",
-                                             url=f"{self.cfg.mini_app_url}#/title/{t['id']}")])
+        kb_rows.append([self._app_button("🌐 Open in app", f"title_{t['id']}")])
         kb = InlineKeyboardMarkup(kb_rows)
         if t["poster"]:
             try:
@@ -128,9 +130,42 @@ class MediaBot:
         await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML,
                                        reply_markup=kb)
 
+
+    # -- mini app ---------------------------------------------------------------
+    def _app_url(self, start_param: str = "") -> str:
+        base = self.cfg.mini_app_url
+        return base + (f"?startapp={start_param}" if start_param else "")
+
+    def _app_button(self, text: str, start_param: str = "") -> InlineKeyboardButton:
+        """Real Mini App button (https) or plain link fallback (http)."""
+        if self.cfg.mini_app_url.startswith("https://"):
+            return InlineKeyboardButton(text, web_app=WebAppInfo(url=self._app_url(start_param)))
+        # http fallback: plain link, deep link via hash for browsers
+        url = self.cfg.mini_app_url
+        if start_param.startswith("title_"):
+            url += f"#/title/{start_param[6:]}"
+        return InlineKeyboardButton(text, url=url)
+
+    async def _set_menu_button(self) -> None:
+        """Puts the Mini App behind the bot's menu button (needs https URL)."""
+        if not self.cfg.mini_app_url.startswith("https://"):
+            log.warning("MINI_APP_URL is not https — menu button skipped "
+                        "(Telegram requires https for Mini Apps)")
+            return
+        api = f"https://api.telegram.org/bot{self.cfg.bot_token}/setChatMenuButton"
+        payload = {"menu_button": {"type": "web_app", "text": "Media Library",
+                                   "web_app": {"url": self.cfg.mini_app_url}}}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(api, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    log.info("setChatMenuButton -> %s", (await r.text())[:120])
+        except Exception as e:
+            log.warning("setChatMenuButton failed: %r", e)
+
     # -- handlers ---------------------------------------------------------------
     def _register(self):
         c = self.client
+        admin_ids = list(self.cfg.admin_ids)
 
         @c.on_message(filters.private & filters.command("start"))
         async def start(_, m: Message):
@@ -138,9 +173,7 @@ class MediaBot:
             if len(arg) > 1 and arg[1].startswith("file_"):
                 await self._deliver_file(m.chat.id, arg[1][5:], m.from_user.id)
                 return
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🌐 Open Media Library", url=self.cfg.mini_app_url)
-            ]])
+            kb = InlineKeyboardMarkup([[self._app_button("🌐 Open Media Library")]])
             await m.reply_text(
                 "🎬 <b>Media Library</b>\n\n"
                 "Search movies & series from our channels.\n"
@@ -210,6 +243,14 @@ class MediaBot:
                     await self._show_episodes(q, int(data[7:]))
                 elif data.startswith("ep:"):
                     await self._show_episode(q, int(data[3:]))
+                elif data.startswith("idx_yes:"):
+                    await self._index_yes(q, int(data[8:]))
+                elif data.startswith("idx_no:"):
+                    await q.answer("Cancelled")
+                    try:
+                        await q.message.edit_text("Cancelled.")
+                    except Exception:
+                        pass
                 else:
                     await q.answer()
             except Exception as e:
@@ -219,6 +260,32 @@ class MediaBot:
                 except Exception:
                     pass
 
+        # ---- forward a channel post to index it ----
+        @c.on_message(filters.private & filters.forwarded & filters.user(admin_ids))
+        async def forward_index(_, m: Message):
+            fwd = m.forward_from_chat
+            if not fwd:
+                return
+            try:
+                me = await self.client.get_chat_member(fwd.id, "me")
+                is_admin = getattr(me, "status", "") in ("administrator", "creator")
+            except Exception:
+                is_admin = False
+            name = html.escape(fwd.title or str(fwd.id))
+            if not is_admin:
+                await m.reply_text(
+                    f"I'm not admin in <b>{name}</b> — make me admin there first, "
+                    f"then forward again.", parse_mode=ParseMode.HTML)
+                return
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Yes, index it", callback_data=f"idx_yes:{fwd.id}"),
+                InlineKeyboardButton("❌ No", callback_data=f"idx_no:{fwd.id}"),
+            ]])
+            await m.reply_text(
+                f"📡 Index <b>{name}</b> (<code>{fwd.id}</code>)?\n"
+                f"I'll scan its full history and keep indexing new posts.",
+                parse_mode=ParseMode.HTML, reply_markup=kb)
+
         # ---- admin ----
         self._register_admin(c)
         # live indexing of new channel posts
@@ -227,7 +294,6 @@ class MediaBot:
             await self.indexer.on_channel_post(_, m)
 
     def _register_admin(self, c):
-        admin_ids = list(self.cfg.admin_ids)
 
         @c.on_message(filters.private & filters.command("addchannel") & filters.user(admin_ids))
         async def addchannel(_, m: Message):
@@ -310,8 +376,7 @@ class MediaBot:
                                 (title_id,))
         rows = [[InlineKeyboardButton(f"Season {s['season_no']}",
                                       callback_data=f"season:{s['id']}")] for s in seasons]
-        rows.append([InlineKeyboardButton("🌐 Open in app",
-                                          url=f"{self.cfg.mini_app_url}#/title/{title_id}")])
+        rows.append([self._app_button("🌐 Open in app", f"title_{title_id}")])
         text = f"{_title_line(t)}\n\nSelect a season:"
         try:
             await q.message.edit_text(text, parse_mode=ParseMode.HTML,
@@ -383,11 +448,43 @@ class MediaBot:
                 chat_id, "Couldn't fetch that file — the bot may not be admin "
                          "in the source channel.")
 
+    async def _index_yes(self, q: CallbackQuery, chat_id: int):
+        try:
+            chat = await self.client.get_chat(chat_id)
+        except Exception as e:
+            await q.answer(f"Can't access it: {e}", show_alert=True)
+            return
+        self.db.upsert_source(chat_id, chat.title or "", chat.username or "")
+        await q.answer("Indexing started!")
+        try:
+            await q.message.edit_text(
+                f"✅ Indexing <b>{html.escape(chat.title or str(chat_id))}</b>…\n"
+                f"I'll ping you when the history scan finishes.",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        asyncio.create_task(self._scan_with_report(q.message.chat.id, chat_id,
+                                                   chat.title or str(chat_id)))
+
+    async def _scan_with_report(self, notify_chat: int, chat_id: int, name: str):
+        res = await self.indexer.scan_source(chat_id)
+        try:
+            if res.get("error"):
+                text = f"⚠️ Scan of <b>{html.escape(name)}</b> hit an error: {html.escape(str(res['error'])[:200])}"
+            else:
+                text = (f"✅ Scan of <b>{html.escape(name)}</b> done — "
+                        f"{res.get('scanned', 0)} messages checked, "
+                        f"{res.get('new', 0)} new files indexed.")
+            await self.client.send_message(notify_chat, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("scan report failed: %r", e)
+
     async def start(self):
         await self.client.start()
         me = await self.client.get_me()
         self.username = me.username or ""
         log.info("bot @%s started", self.username)
+        await self._set_menu_button()
 
     async def stop(self):
         try:

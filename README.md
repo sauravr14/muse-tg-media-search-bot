@@ -1,0 +1,99 @@
+# 🎬 Telegram Media Search Bot + Mini App
+
+A centralized media discovery platform for movies & TV series stored across your
+Telegram channels. Indexes channel media into a local catalog, groups qualities
+(480p/720p/1080p) under one movie card and episodes under seasons, fetches
+posters from TMDB, and serves it all through a Telegram bot **and** a Mini App
+web UI that opens inside Telegram.
+
+## Features
+
+- **Channel indexing** — historical backfill (resumable, idempotent) + live indexing of new posts. Bot-token only, no user session needed.
+- **Smart grouping** — `Inception.2010.480p/720p/1080p` → one movie card; `Breaking.Bad.S01E01/E02` → one series → seasons → episodes → qualities.
+- **TMDB metadata** — posters, backdrops, overview, genres, ratings, episode titles. Cached server-side; API key never reaches the frontend.
+- **Bot search** — plain text = search; results with posters; tap a quality to get the file copied into your chat; series browser (seasons → episodes → qualities); deep links (`t.me/<bot>?start=file_<id>`).
+- **Mini App** — dark-first responsive SPA: search with debounce, recently-added grids, movie/series detail pages, season tabs. Opens inside Telegram.
+- **Admin** — bot commands (`/addchannel`, `/index`, `/stats`, …) + a protected `/app/admin.html` page (retitle, hide files, review unmatched).
+- **Single container** — bot + API in one process; SQLite (WAL) so there is nothing else to run. Runs on a low-memory VPS, Koyeb, or Render.
+
+## Quick start (VPS with Docker)
+
+```bash
+git clone <this-repo> && cd tg-media-search-bot
+cp .env.example .env   # fill in BOT_TOKEN, TMDB_API_KEY, ADMIN_USER_IDS, MINI_APP_URL
+docker compose up -d --build
+```
+
+Then in Telegram:
+1. Make the bot **admin** in every source channel.
+2. `/addchannel @yourchannel` (as an admin user)
+3. `/index` — scans history in the background; new posts index live.
+4. Open the Mini App from `/start` → **Open Media Library**.
+
+Set `MINI_APP_URL` to the public URL of `/app/` (e.g. `https://media.example.com/app/`).
+
+## Environment
+
+| Variable | Required | Description |
+|---|---|---|
+| `BOT_TOKEN` | yes | From [@BotFather](https://t.me/BotFather) |
+| `ADMIN_USER_IDS` | yes | Comma-separated Telegram user ids (bot admin commands + web admin) |
+| `TMDB_API_KEY` | no | From [themoviedb.org](https://www.themoviedb.org/settings/api) — without it, posters are placeholders |
+| `MINI_APP_URL` | yes | Public URL of the Mini App, ending in `/app/` |
+| `DATABASE_PATH` | no | Default `/app/data/catalog.db` in Docker |
+| `PORT` | no | Default `8000` |
+
+Never commit real values — `.env` is git-ignored.
+
+## Bot commands
+
+**Everyone:** `/start` (+ Mini App button), `/search <name>`, `/recent`, `/movies`, `/series`, `/help` — or just type a name.
+
+**Admins:** `/addchannel <id|@username>`, `/rmchannel <id>`, `/channels`, `/index`, `/stats`.
+
+## Koyeb / Render
+
+- **Koyeb:** App → Service → GitHub repo, Dockerfile builder, port `8000`, health check `/healthz`. Set the env vars; point `MINI_APP_URL` at the Koyeb URL + `/app/`. Attach a volume at `/app/data` or the catalog resets on redeploy.
+- **Render:** New → Web Service → this repo (Docker runtime), health check `/healthz`, add a 1 GB disk at `/app/data`. See `render.yaml`.
+
+## Architecture
+
+```
+app/
+  main.py      # entrypoint: PyroFork bot + uvicorn in one asyncio loop
+  bot.py       # bot commands, search cards, callbacks, file delivery (msg.copy)
+  indexer.py   # historical backfill (checkpointed) + live channel handler + TMDB enricher
+  classify.py  # files -> canonical titles / seasons / episodes
+  parser.py    # filename -> title/year/resolution/SxxEyy/codec
+  tmdb.py      # TMDB client, cached in DB, failures never break indexing
+  api.py       # FastAPI: /api/*, WebApp initData validation, admin API
+  db.py        # SQLite schema (titles, seasons, episodes, files, sources, tmdb_cache) + FTS5
+  webapp/      # Mini App SPA (index.html, app.js, styles.css) + admin.html
+  config.py
+```
+
+**Why SQLite and not Postgres/Mongo:** zero extra services, survives on a 1 GB VPS,
+single source of truth, and the catalog workload (metadata only, no BLOBs) fits
+comfortably. Posters are hot-linked from TMDB's CDN, never downloaded.
+
+**Telegram limits (be honest):** a bot can only read channels it belongs to —
+make it admin of each source. File delivery uses `message.copy`, so the file
+stays on Telegram's servers; nothing is downloaded by this app.
+
+## Repository analysis
+
+`docs/REPO_ANALYSIS.md` contains the mandatory pre-build study of
+`sauravr14/file-store-video-bot` and `weebzone/Telegram-Stremio`
+(patterns studied read-only; **no code was copied** — this project is original
+work, MIT licensed).
+
+## Tests
+
+```bash
+pip install -r requirements.txt
+python -m unittest discover -s tests -t .
+```
+
+## License
+
+MIT — see `LICENSE`.

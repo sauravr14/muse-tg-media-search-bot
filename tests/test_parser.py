@@ -71,5 +71,30 @@ class ParserTest(unittest.TestCase):
         self.assertEqual({a.resolution, b.resolution, c.resolution}, {"480p", "720p", "1080p"})
 
 
+    def test_release_tags_stripped(self):
+        p = parse_filename("The Pianist 2002 REMASTERED 720p 10Bit BluRay NF Engli.mkv")
+        self.assertEqual(p.title, "The Pianist")
+        self.assertEqual(p.year, 2002)
+        self.assertEqual(p.resolution, "720p")
+
+    def test_hash_tokens_stripped(self):
+        p = parse_filename("Un Cœur En Hiver 1992 4K Nz87Gp0H5Au 247.mp4")
+        self.assertEqual(p.title, "Un Cœur En Hiver")
+        self.assertEqual(p.year, 1992)
+
+    def test_uuid_stripped(self):
+        p = parse_filename("Movie.Name.18240152-890F-4406-Ad34-C553B08A829D.1080p.WEB-DL.mkv")
+        self.assertEqual(p.title, "Movie Name")
+
+    def test_numeric_title_kept(self):
+        p = parse_filename("21 Jump Street 2012 1080p BluRay x264.mkv")
+        self.assertEqual(p.title, "21 Jump Street")
+        self.assertEqual(p.year, 2012)
+
+    def test_audio_tags_stripped(self):
+        p = parse_filename("Dune Part Two 2024 IMAX 2160p WEB-DL DDP5.1 Atmos H.265.mkv")
+        self.assertEqual(p.title, "Dune Part Two")
+        self.assertEqual(p.year, 2024)
 if __name__ == "__main__":
     unittest.main()
+

@@ -165,6 +165,47 @@ class Indexer:
             if src["enabled"]:
                 await self.scan_source(src["chat_id"])
 
+    async def rebuild_catalog(self) -> dict:
+        """Re-parse every stored file with the current parser and regroup
+        titles/seasons/episodes from scratch. Telegram references (chat/msg
+        ids) are preserved, so no re-scan is needed; hidden flags survive.
+        New titles are queued for TMDB enrichment."""
+        from .parser import parse_filename
+        async with self._scan_lock:
+            files = self.db.query("SELECT * FROM files")
+            hidden = {(f["tg_chat_id"], f["tg_msg_id"])
+                      for f in files if f["status"] == "hidden"}
+            self.db.execute("DELETE FROM files")
+            self.db.execute("DELETE FROM episodes")
+            self.db.execute("DELETE FROM seasons")
+            self.db.execute("DELETE FROM titles")
+            n = 0
+            for f in files:
+                p = parse_filename(f["file_name"] or "")
+                if not p.title:
+                    continue
+                meta = {"file_name": f["file_name"], "size": f["size"] or 0,
+                        "duration": f["duration"] or 0, "mime": f["mime"] or "",
+                        "tg_chat_id": f["tg_chat_id"], "tg_msg_id": f["tg_msg_id"],
+                        "caption": f["caption"] or "", "msg_date": f["msg_date"] or 0}
+                res = self.clf.ingest(p, meta)
+                n += 1
+                if res.get("duplicate"):
+                    continue
+                if (f["tg_chat_id"], f["tg_msg_id"]) in hidden:
+                    self.db.execute("UPDATE files SET status='hidden' WHERE id=?",
+                                    (res["file_id"],))
+                title = self.db.query_one(
+                    "SELECT id, tmdb_id FROM titles WHERE id=?", (res["title_id"],))
+                if title and not title["tmdb_id"]:
+                    try:
+                        self._enrich_queue.put_nowait(title["id"])
+                    except asyncio.QueueFull:
+                        pass
+            titles = self.db.query_one("SELECT COUNT(*) c FROM titles")["c"]
+            log.info("catalog rebuilt: %d files -> %d titles", n, titles)
+            return {"files": n, "titles": titles}
+
     # -- live handler ----------------------------------------------------------
     async def on_channel_post(self, _, msg) -> None:
         src = self.db.query_one(

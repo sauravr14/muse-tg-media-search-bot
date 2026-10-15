@@ -120,6 +120,7 @@
         h += `<div class="section-title">Available versions</div>` +
           (t.versions.length ? t.versions.map(verRow).join("")
             : `<div class="empty">No files yet.</div>`);
+        view.innerHTML = h;
       } else {
         h += `<div class="section-title">Seasons</div><div class="season-tabs">` +
           t.seasons.map((s, i) => `<button data-s="${i}" class="${i === 0 ? "active" : ""}">S${s.season_no}</button>`).join("") +
@@ -160,7 +161,11 @@
         b.disabled = true;
         try {
           const d = await api("/api/deeplink/file/" + b.dataset.file);
-          if (tg) tg.openTelegramLink(d.url); else location.href = d.url;
+          if (tg) {
+            tg.openTelegramLink(d.url);
+            // hand the user to the bot chat where the file lands
+            setTimeout(() => { try { tg.close(); } catch (e) {} }, 1200);
+          } else location.href = d.url;
         } catch (e) { toast("Couldn't prepare the file link."); b.disabled = false; }
       }));
   }

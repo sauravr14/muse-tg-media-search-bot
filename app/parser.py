@@ -52,6 +52,25 @@ RELEASE_GROUPS = re.compile(
     re.I,
 )
 
+# Release tags that are never part of the display title
+TAG_STRIP_RE = re.compile(
+    r"\b(REMASTERED|REMASTER|PROPER|REPACK|RERIP|UNRATED|EXTENDED|"
+    r"DIRECTORS?[.\s_-]*CUT|THEATRICAL|IMAX|"
+    r"10BIT|8BIT|12BIT|HDR10\+?|HDR|DV|SDR|"
+    r"NF|AMZN|DSNP|HULU|ATVP|HBO|PCOK|CRIT|"
+    r"AAC|AC3|EAC3|DTS(?:-HD)?|DDP?5\.1|5\.1|7\.1|2\.0|ATMOS|TRUEHD|"
+    r"ESUBS?|SUBS|SUBBED|DUBBED|DUAL|MULTI|"
+    r"MP4|MKV|AVI|M4V|WMV|FLV|WEBM|"
+    r"MOVIESMOD|PAHE)\b",
+    re.I,
+)
+# UUIDs and hash-like tokens are never part of a title
+UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b")
+HEX_RE = re.compile(r"\b[0-9a-fA-F]{8,}\b")
+# long alphanumeric tokens with 3+ digits: hashes, not titles ("Nz87Gp0H5Au").
+# Real titles with digits ("21JumpStreet", "Se7en") have <3 digits.
+HASHY_RE = re.compile(r"\b(?=[A-Za-z0-9]{10,})(?:[A-Za-z]*\d){3,}[A-Za-z0-9]*\b")
+
 
 @dataclass
 class ParsedName:
@@ -127,8 +146,21 @@ def parse_filename(raw: str) -> ParsedName:
     # drop leftover quality/codec/source tokens
     for rx, _ in RES_PATTERNS + CODEC_PATTERNS + SOURCE_PATTERNS:
         name = rx.sub(" ", name)
+    name = UUID_RE.sub(" ", name)
+    name = TAG_STRIP_RE.sub(" ", name)  # before flatten: catches DDP5.1, 5.1, H.265
     name = re.sub(r"[._\-+]+", " ", name)
-    name = re.sub(r"\b(Season|Episode|Ep|Complete|Dual|Audio|Hindi|English|ESub)\b", " ", name, flags=re.I)
+    # release tags, then hash-like leftovers
+    name = TAG_STRIP_RE.sub(" ", name)
+    name = HEX_RE.sub(" ", name)
+    name = HASHY_RE.sub(" ", name)
+    if p.year:
+        # a year was found: trailing bare numbers are junk ("Film 1992 ... 247"),
+        # but a leading number can be the title itself ("21 Jump Street")
+        stripped = re.sub(r"(?:\s*\b\d{1,4}\b)+\s*$", " ", name)
+        if stripped.strip():
+            name = stripped
+    name = re.sub(r"\b(Season|Episode|Ep|Complete|Dual|Audio|Hindi|English|Engli|Eng|"
+                r"Tam|Tel|Mal|Kan|Multi|ESub)\b", " ", name, flags=re.I)
     name = RELEASE_GROUPS.sub("", name)
     name = re.sub(r"\s+", " ", name).strip(" -")
 

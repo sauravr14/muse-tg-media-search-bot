@@ -375,6 +375,12 @@ class MediaBot:
                                "I'll report here when it's done.")
             asyncio.create_task(self._index_all_report(m.chat.id))
 
+        @c.on_message(filters.private & filters.command("reparse") & filters.user(admin_ids))
+        async def reparse(_, m: Message):
+            await m.reply_text("🔄 Re-parsing all filenames and regrouping titles — "
+                               "I'll report here when it's done.")
+            asyncio.create_task(self._reparse_report(m.chat.id))
+
         @c.on_message(filters.private & filters.command("stats") & filters.user(admin_ids))
         async def stats(_, m: Message):
             s = self.db.stats()
@@ -535,6 +541,20 @@ class MediaBot:
             await self.client.send_message(notify_chat, text, parse_mode=ParseMode.HTML)
         except Exception as e:
             log.warning("scan report failed: %r", e)
+
+    async def _reparse_report(self, notify_chat: int):
+        try:
+            res = await self.indexer.rebuild_catalog()
+            text = (f"✅ Re-parse done: <b>{res['files']}</b> files regrouped into "
+                    f"<b>{res['titles']}</b> titles.\nTMDB posters will fill in over "
+                    f"the next few minutes.")
+        except Exception as e:
+            log.warning("reparse failed: %r", e)
+            text = f"⚠️ Re-parse failed: {html.escape(str(e)[:200])}"
+        try:
+            await self.client.send_message(notify_chat, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("reparse report failed: %r", e)
 
     async def _index_all_report(self, notify_chat: int):
         lines = []

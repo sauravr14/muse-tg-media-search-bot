@@ -15,6 +15,8 @@ import asyncio
 import logging
 import time
 
+from pyrogram.errors import FloodWait
+
 from .classify import Classifier
 from .db import DB
 from .parser import ParsedName, parse_filename
@@ -54,12 +56,12 @@ def _file_meta_from_msg(msg) -> dict | None:
 
 
 class Indexer:
-    def __init__(self, client, db: DB, tmdb: TMDB, history_client=None):
+    def __init__(self, client, db: DB, tmdb: TMDB):
+        # Bot-token only. History is read with messages.GetMessages by explicit
+        # ID ranges (like Levii/EvaMaria filter bots) because Telegram blocks
+        # bots from messages.GetHistory. The bot must be admin in private
+        # channels; public channels work from a forwarded post or t.me link.
         self.client = client
-        # History scans need a *user* session: Telegram forbids bots from
-        # calling messages.GetHistory (BOT_METHOD_INVALID). The bot client
-        # still handles commands, live channel posts and file delivery.
-        self.history_client = history_client or client
         self.db = db
         self.tmdb = tmdb
         self.clf = Classifier(db)
@@ -84,47 +86,78 @@ class Indexer:
         return res
 
     # -- historical scan -----------------------------------------------------
-    async def scan_source(self, chat_id: int, max_messages: int = 0) -> dict:
-        """Scan backwards from the checkpoint. Returns counts."""
+    def max_seen(self, chat_id: int) -> int:
+        v = self.db.get_kv(f"max_seen:{chat_id}")
+        return int(v) if v.isdigit() else 0
+
+    def note_seen(self, chat_id: int, msg_id: int) -> None:
+        if msg_id > self.max_seen(chat_id):
+            self.db.set_kv(f"max_seen:{chat_id}", str(msg_id))
+
+    async def access_test(self, chat_id) -> tuple[bool, str]:
+        """Single GetMessages probe. Returns (ok, reason)."""
+        try:
+            m = await self.client.get_messages(chat_id, 1)
+            _ = m.empty  # touch it
+            return True, ""
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+            return await self.access_test(chat_id)
+        except Exception as e:
+            name = type(e).__name__
+            if name in ("ChannelInvalid", "ChannelPrivate", "UsernameInvalid",
+                        "UsernameNotModified", "PeerIdInvalid"):
+                return False, ("I can't open that channel — make me an admin there "
+                               "first (required for private channels).")
+            return False, f"{name}: {e}"
+
+    async def scan_source(self, chat_id: int, top_id: int = 0) -> dict:
+        """Scan message IDs (checkpoint+1 .. top_id) in batches via GetMessages.
+
+        top_id comes from a forwarded post or t.me link. Falls back to the
+        highest ID seen via live posts/forwards. Resumable and idempotent.
+        """
         async with self._scan_lock:
             src = self.db.query_one("SELECT * FROM sources WHERE chat_id=?", (chat_id,))
             if not src:
                 return {"error": "unknown source"}
+            if top_id:
+                self.note_seen(chat_id, top_id)
+            hi = top_id or self.max_seen(chat_id)
+            lo = (src["last_msg_id"] or 0) + 1
+            if hi < lo:
+                return {"scanned": 0, "new": 0, "note": "nothing new to scan"}
             self.db.set_source(chat_id, status="scanning", error="")
+            ok, reason = await self.access_test(chat_id)
+            if not ok:
+                self.db.set_source(chat_id, status="error", error=reason)
+                return {"scanned": 0, "new": 0, "error": reason}
             done = new = 0
-            offset_id = src["last_msg_id"] or 0
-            oldest = offset_id
+            cur = lo
             try:
-                while True:
-                    batch = []
-                    async for msg in self.history_client.get_chat_history(
-                        chat_id, offset_id=offset_id, limit=BATCH
-                    ):
-                        batch.append(msg)
-                    if not batch:
-                        break
-                    for msg in batch:
-                        if msg.id < (oldest or msg.id + 1):
-                            oldest = msg.id
-                        r = await self.ingest_message(msg)
+                while cur <= hi:
+                    ids = list(range(cur, min(cur + BATCH - 1, hi) + 1))
+                    try:
+                        msgs = await self.client.get_messages(chat_id, ids)
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value + 1)
+                        continue
+                    for msg in msgs:
                         done += 1
+                        if msg is None or getattr(msg, "empty", False):
+                            continue
+                        r = await self.ingest_message(msg)
                         if r and not r.get("duplicate"):
                             new += 1
-                    offset_id = min(m.id for m in batch)
-                    self.db.set_source(chat_id, last_msg_id=offset_id)
-                    if max_messages and done >= max_messages:
-                        break
-                    await asyncio.sleep(0.2)
+                    cur += BATCH
+                    self.db.set_source(chat_id, last_msg_id=min(cur - 1, hi))
+                    await asyncio.sleep(0.4)
             except Exception as e:
                 log.warning("scan of %s failed: %r", chat_id, e)
-                err = str(e)
-                if "BOT_METHOD_INVALID" in err or "GetHistory" in err:
-                    err = ("history_unavailable: Telegram does not allow bots to read "
-                           "channel history. Set SESSION_STRING (a user session) to enable "
-                           "history scans; new posts are still indexed live.")
-                self.db.set_source(chat_id, status="error", error=f"{type(e).__name__}: {err}")
-                return {"scanned": done, "new": new, "error": err}
-            self.db.set_source(chat_id, status="idle")
+                self.db.set_source(chat_id, status="error",
+                                   error=f"{type(e).__name__}: {e}")
+                return {"scanned": done, "new": new, "error": str(e)}
+            self.db.set_source(chat_id, status="idle", last_msg_id=hi)
             return {"scanned": done, "new": new}
 
     async def scan_all(self) -> None:
@@ -140,6 +173,7 @@ class Indexer:
         if not src:
             return
         try:
+            self.note_seen(msg.chat.id, msg.id)
             await self.ingest_message(msg)
         except Exception as e:
             log.warning("live ingest failed: %r", e)

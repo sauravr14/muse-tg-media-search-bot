@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import time
 
 from pyrogram import Client, filters
@@ -24,6 +25,20 @@ from .indexer import Indexer
 
 log = logging.getLogger("mediabot.bot")
 PAGE = 6
+LINK_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/(c/)?([A-Za-z0-9_]+|\d+)/(\d+)/?$"
+)
+
+
+def _parse_post_link(text: str):
+    """t.me/<channel>/<id> or t.me/c/<digits>/<id> -> (chat_id, msg_id)."""
+    m = LINK_RE.search((text or "").strip())
+    if not m:
+        return None
+    is_private, name, msg_id = m.group(1), m.group(2), int(m.group(3))
+    if is_private:
+        return -int(f"100{name}"), msg_id
+    return f"@{name}", msg_id
 
 
 def _fmt_size(n: int) -> str:
@@ -231,6 +246,34 @@ class MediaBot:
                 lines.append(f"• {html.escape(t['title'])}{year}")
             await m.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
+        # ---- forward a channel post (or send a t.me post link) to index it ----
+        @c.on_message(filters.private & filters.forwarded & filters.user(admin_ids))
+        async def forward_index(_, m: Message):
+            fwd = m.forward_from_chat
+            fwd_id = m.forward_from_message_id
+            if fwd and fwd_id:
+                await self._prompt_index(m.chat.id, fwd.id, fwd_id,
+                                         fwd.title or str(fwd.id))
+            else:
+                await m.reply_text(
+                    "I couldn't read that forward (the channel may restrict forwarding). "
+                    "Send a post link instead: <code>https://t.me/channelname/123</code>",
+                    parse_mode=ParseMode.HTML)
+
+        @c.on_message(filters.private & filters.text & filters.user(admin_ids)
+                       & filters.regex(LINK_RE))
+        async def link_index(_, m: Message):
+            parsed = _parse_post_link(m.text)
+            if not parsed:
+                return
+            chat_id, msg_id = parsed
+            try:
+                chat = await self.client.get_chat(chat_id)
+                title = chat.title or str(chat_id)
+            except Exception:
+                title = str(chat_id)
+            await self._prompt_index(m.chat.id, chat_id, msg_id, title)
+
         @c.on_message(filters.private & filters.text & ~filters.regex(r"^/"))
         async def plain_search(_, m: Message):
             await self._do_search(m.chat.id, m.text.strip(), m.from_user.id)
@@ -249,8 +292,9 @@ class MediaBot:
                 elif data.startswith("ep:"):
                     await self._show_episode(q, int(data[3:]))
                 elif data.startswith("idx_yes:"):
-                    await self._index_yes(q, int(data[8:]))
-                elif data.startswith("idx_no:"):
+                    _, cid, top = data.split(":")
+                    await self._index_yes(q, int(cid), int(top))
+                elif data == "idx_no":
                     await q.answer("Cancelled")
                     try:
                         await q.message.edit_text("Cancelled.")
@@ -265,33 +309,7 @@ class MediaBot:
                 except Exception:
                     pass
 
-        # ---- forward a channel post to index it ----
-        @c.on_message(filters.private & filters.forwarded & filters.user(admin_ids))
-        async def forward_index(_, m: Message):
-            fwd = m.forward_from_chat
-            if not fwd:
-                return
-            try:
-                me = await self.client.get_chat_member(fwd.id, "me")
-                is_admin = getattr(me, "status", "") in ("administrator", "creator")
-            except Exception:
-                is_admin = False
-            name = html.escape(fwd.title or str(fwd.id))
-            if not is_admin:
-                await m.reply_text(
-                    f"I'm not admin in <b>{name}</b> — make me admin there first, "
-                    f"then forward again.", parse_mode=ParseMode.HTML)
-                return
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Yes, index it", callback_data=f"idx_yes:{fwd.id}"),
-                InlineKeyboardButton("❌ No", callback_data=f"idx_no:{fwd.id}"),
-            ]])
-            await m.reply_text(
-                f"📡 Index <b>{name}</b> (<code>{fwd.id}</code>)?\n"
-                f"I'll scan its full history and keep indexing new posts.",
-                parse_mode=ParseMode.HTML, reply_markup=kb)
-
-        # ---- admin ----
+        # ---- admin ----        # ---- admin ----
         self._register_admin(c)
         # live indexing of new channel posts
         @c.on_message(filters.channel)
@@ -316,7 +334,10 @@ class MediaBot:
                 return
             self.db.upsert_source(chat.id, chat.title or "", chat.username or "")
             await m.reply_text(f"✅ Added <b>{html.escape(chat.title or arg)}</b> "
-                               f"(<code>{chat.id}</code>). Run /index to scan history.",
+                               f"(<code>{chat.id}</code>).\n\n"
+                               f"To start indexing, <b>forward any message</b> from that "
+                               f"channel here (or send a <code>t.me</code> post link) "
+                               f"and tap ✅ Yes.",
                                parse_mode=ParseMode.HTML)
 
         @c.on_message(filters.private & filters.command("rmchannel") & filters.user(admin_ids))
@@ -457,26 +478,53 @@ class MediaBot:
                 chat_id, "Couldn't fetch that file — the bot may not be admin "
                          "in the source channel.")
 
-    async def _index_yes(self, q: CallbackQuery, chat_id: int):
-        try:
-            chat = await self.client.get_chat(chat_id)
-        except Exception as e:
-            await q.answer(f"Can't access it: {e}", show_alert=True)
+    async def _prompt_index(self, notify_chat: int, chat_id, top_id: int, title: str):
+        """Access-test the channel, then ask the admin to confirm indexing."""
+        ok, reason = await self.indexer.access_test(chat_id)
+        name = html.escape(title)
+        if not ok:
+            await self.client.send_message(
+                notify_chat,
+                f"⚠️ Can't index <b>{name}</b> — {html.escape(reason)}",
+                parse_mode=ParseMode.HTML)
             return
-        self.db.upsert_source(chat_id, chat.title or "", chat.username or "")
+        try:
+            real = await self.client.get_chat(chat_id)
+            cid = real.id
+            title = real.title or title
+            username = real.username or ""
+        except Exception:
+            cid, username = chat_id, ""
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, index it",
+                                 callback_data=f"idx_yes:{cid}:{top_id}"),
+            InlineKeyboardButton("❌ No", callback_data="idx_no"),
+        ]])
+        self.db.upsert_source(cid, title, username)
+        await self.client.send_message(
+            notify_chat,
+            f"📡 Index <b>{html.escape(title)}</b> (<code>{cid}</code>)?\n"
+            f"Last message: <code>{top_id}</code> — I'll scan the full history "
+            f"and keep indexing new posts.",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    async def _index_yes(self, q: CallbackQuery, chat_id: int, top_id: int):
+        chat = self.db.query_one("SELECT title FROM sources WHERE chat_id=?", (chat_id,))
+        title = (chat["title"] if chat else None) or str(chat_id)
         await q.answer("Indexing started!")
         try:
             await q.message.edit_text(
-                f"✅ Indexing <b>{html.escape(chat.title or str(chat_id))}</b>…\n"
-                f"I'll ping you when the history scan finishes.",
+                f"✅ Indexing <b>{html.escape(title)}</b> from message 1 to {top_id}…\n"
+                f"I'll ping you when the scan finishes.",
                 parse_mode=ParseMode.HTML)
         except Exception:
             pass
         asyncio.create_task(self._scan_with_report(q.message.chat.id, chat_id,
-                                                   chat.title or str(chat_id)))
+                                                   title, top_id))
 
-    async def _scan_with_report(self, notify_chat: int, chat_id: int, name: str):
-        res = await self.indexer.scan_source(chat_id)
+    async def _scan_with_report(self, notify_chat: int, chat_id: int, name: str,
+                                top_id: int = 0):
+        res = await self.indexer.scan_source(chat_id, top_id=top_id)
         try:
             if res.get("error"):
                 text = f"⚠️ Scan of <b>{html.escape(name)}</b> hit an error: {html.escape(str(res['error'])[:200])}"

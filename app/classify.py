@@ -132,17 +132,24 @@ class Classifier:
             title = self.create_title(p, tmdb_meta)
         title_id = title["id"]
         episode_id = None
+        season_id = None
+        pack_label = ""
 
-        if p.kind == "series" and p.episode:
+        if p.is_pack:
+            # season pack: attaches to the season, not to an episode
+            season = self.get_or_create_season(title_id, p.season or 1)
+            season_id = season["id"]
+            pack_label = p.pack_label or "Complete"
+        elif p.kind == "series" and p.episode:
             season = self.get_or_create_season(title_id, p.season or 1)
             ep = self.get_or_create_episode(title_id, season["id"], p.episode)
             episode_id = ep["id"]
 
         cur = db.execute(
-            "INSERT INTO files(title_id, episode_id, file_name, norm_name, resolution,"
+            "INSERT INTO files(title_id, episode_id, season_id, pack_label, file_name, norm_name, resolution,"
             " quality, codec, size, duration, mime, tg_chat_id, tg_msg_id, caption,"
-            " msg_date, indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (title_id, episode_id, file_meta["file_name"], p.norm_title, p.resolution,
+            " msg_date, indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (title_id, episode_id, season_id, pack_label, file_meta["file_name"], p.norm_title, p.resolution,
              p.quality, p.codec, file_meta.get("size", 0), file_meta.get("duration", 0),
              file_meta.get("mime", ""), file_meta["tg_chat_id"], file_meta["tg_msg_id"],
              file_meta.get("caption", ""), file_meta.get("msg_date", 0), now),

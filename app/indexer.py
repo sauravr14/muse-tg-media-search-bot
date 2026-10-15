@@ -299,6 +299,46 @@ class Indexer:
                 return meta
         return None
 
+    async def _merge_titles(self, old_id: int, new_id: int) -> None:
+        """Fold duplicate title old_id into new_id (same TMDB id).
+
+        Moves seasons/episodes/files over, merging same-numbered seasons and
+        episodes, so no file loses its episode association. (A naive
+        DELETE FROM seasons would cascade and null out files.episode_id.)"""
+        db = self.db
+        for se in db.query("SELECT * FROM seasons WHERE title_id=?", (old_id,)):
+            tgt = db.query_one(
+                "SELECT id FROM seasons WHERE title_id=? AND season_no=?",
+                (new_id, se["season_no"]))
+            if tgt:
+                tgt_id = tgt["id"]
+                for ep in db.query("SELECT * FROM episodes WHERE season_id=?",
+                                   (se["id"],)):
+                    ex = db.query_one(
+                        "SELECT id FROM episodes WHERE season_id=? AND ep_no=?",
+                        (tgt_id, ep["ep_no"]))
+                    if ex:
+                        db.execute("UPDATE files SET episode_id=?, season_id=? "
+                                   "WHERE episode_id=?", (ex["id"], tgt_id, ep["id"]))
+                        db.execute("DELETE FROM episodes WHERE id=?", (ep["id"],))
+                    else:
+                        db.execute("UPDATE episodes SET season_id=?, title_id=? "
+                                   "WHERE id=?", (tgt_id, new_id, ep["id"]))
+                db.execute("UPDATE files SET season_id=? WHERE season_id=?",
+                           (tgt_id, se["id"]))
+                db.execute("DELETE FROM seasons WHERE id=?", (se["id"],))
+            else:
+                db.execute("UPDATE seasons SET title_id=? WHERE id=?",
+                           (new_id, se["id"]))
+                db.execute("UPDATE episodes SET title_id=? WHERE season_id=?",
+                           (new_id, se["id"]))
+                # pack files keep their season_id: the season row itself moved
+        db.execute("UPDATE files SET title_id=? WHERE title_id=?", (new_id, old_id))
+        db.execute("DELETE FROM titles WHERE id=?", (old_id,))
+        db.execute("UPDATE titles SET last_file_at=? WHERE id=?",
+                   (time.time(), new_id))
+        log.info("merged title %s into %s", old_id, new_id)
+
     async def _adopt_meta(self, row, meta: dict) -> None:
         from .parser import normalize_title
         db = self.db
@@ -307,12 +347,7 @@ class Indexer:
         other = db.query_one("SELECT id FROM titles WHERE tmdb_id=? AND id != ?",
                              (meta["tmdb_id"], row["id"]))
         if other:
-            db.execute("UPDATE files SET title_id=? WHERE title_id=?", (other["id"], row["id"]))
-            db.execute("UPDATE episodes SET title_id=? WHERE title_id=?", (other["id"], row["id"]))
-            db.execute("DELETE FROM seasons WHERE title_id=?", (row["id"],))
-            db.execute("DELETE FROM titles WHERE id=?", (row["id"],))
-            db.execute("UPDATE titles SET last_file_at=? WHERE id=?", (now, other["id"]))
-            log.info("merged title %s into tmdb %s", row["id"], meta["tmdb_id"])
+            await self._merge_titles(row["id"], other["id"])
             return
         db.execute(
             "UPDATE titles SET title=?, norm_title=?, orig_title=?, alt_titles=?, year=?,"

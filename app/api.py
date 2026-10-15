@@ -62,7 +62,7 @@ class RateLimiter:
 def _file_dict(f) -> dict:
     return {"id": f["id"], "name": f["file_name"], "resolution": f["resolution"],
             "quality": f["quality"], "codec": f["codec"], "size": f["size"],
-            "duration": f["duration"]}
+            "duration": f["duration"], "pack_label": f["pack_label"] or ""}
 
 
 def _title_card(t) -> dict:
@@ -132,7 +132,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
         if t["kind"] == "movie":
             files = db.query(
                 "SELECT * FROM files WHERE title_id=? AND episode_id IS NULL "
-                "AND status='ok' ORDER BY " + RES_ORDER + " DESC", (title_id,))
+                "AND season_id IS NULL AND status='ok' ORDER BY " + RES_ORDER + " DESC", (title_id,))
             out["versions"] = [_file_dict(f) for f in files]
         else:
             seasons = []
@@ -148,7 +148,11 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
                                 "air_date": e["air_date"], "overview": e["overview"],
                                 "versions": [_file_dict(f) for f in files]})
                 seasons.append({"season_no": se["season_no"], "poster": se["poster"],
-                                "overview": se["overview"], "episodes": eps})
+                                "overview": se["overview"], "episodes": eps,
+                                "packs": [_file_dict(f) for f in db.query(
+                                    "SELECT * FROM files WHERE season_id=? "
+                                    "AND episode_id IS NULL AND status='ok' "
+                                    "ORDER BY " + RES_ORDER + " DESC", (se["id"],))]})
             out["seasons"] = seasons
         return out
 

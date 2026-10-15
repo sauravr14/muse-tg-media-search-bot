@@ -120,6 +120,39 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(p.title, "Congratulations")
         self.assertEqual(p.quality, "WEB-DL")
 
+    def test_underscore_filename(self):
+        p = parse_filename("Lanterns_2026_S01E01_720p_10bit_AMZN_WEBRip_HEVX_x265_JHS_Hindi.mkv")
+        self.assertEqual(p.title, "Lanterns")
+        self.assertEqual(p.year, 2026)
+        self.assertEqual(p.kind, "series")
+        self.assertEqual((p.season, p.episode), (1, 1))
+        self.assertEqual(p.resolution, "720p")
+
+    def test_pack_complete(self):
+        p = parse_filename("Lanterns_2026_S01_COMBINED_720p_10bit_AMZN_WEBRip_HEVC_x265_JHS.mkv")
+        self.assertTrue(p.is_pack)
+        self.assertEqual(p.pack_label, "Complete")
+        self.assertEqual(p.season, 1)
+        self.assertIsNone(p.episode)
+        self.assertEqual(p.title, "Lanterns")
+
+    def test_pack_range(self):
+        p = parse_filename("Lanterns 2026 S01 COMBINED [E01-04] 1080p 10bit AMZN.mkv")
+        self.assertTrue(p.is_pack)
+        self.assertEqual(p.pack_label, "E01\u2013E04")
+        self.assertEqual(p.resolution, "1080p")
+
+    def test_complete_unknown_not_pack(self):
+        p = parse_filename("A Complete Unknown 2024 1080p BluRay.mkv")
+        self.assertFalse(p.is_pack)
+        self.assertEqual(p.title, "A Complete Unknown")
+
+    def test_trailing_at_stripped(self):
+        p = parse_filename("The.Furious.ESubs.MoviesMod.At.2026.mkv")
+        self.assertEqual(p.title, "The Furious")
+        p = parse_filename("At Close Range 1986 1080p.mkv")
+        self.assertEqual(p.title, "At Close Range")
+
 if __name__ == "__main__":
     unittest.main()
 

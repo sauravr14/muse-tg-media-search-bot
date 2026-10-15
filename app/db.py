@@ -98,6 +98,8 @@ CREATE TABLE IF NOT EXISTS files (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     title_id    INTEGER REFERENCES titles(id) ON DELETE SET NULL,
     episode_id  INTEGER REFERENCES episodes(id) ON DELETE SET NULL,
+    season_id   INTEGER REFERENCES seasons(id) ON DELETE SET NULL,
+    pack_label  TEXT NOT NULL DEFAULT '',
     file_name   TEXT NOT NULL,
     norm_name   TEXT NOT NULL DEFAULT '',
     resolution  TEXT NOT NULL DEFAULT '',
@@ -154,6 +156,14 @@ class DB:
         with self._write_lock:
             conn = self._conn()
             conn.executescript(SCHEMA)
+            # lightweight migrations for existing DBs
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(files)")}
+            if "season_id" not in cols:
+                conn.execute("ALTER TABLE files ADD COLUMN season_id INTEGER "
+                             "REFERENCES seasons(id) ON DELETE SET NULL")
+            if "pack_label" not in cols:
+                conn.execute("ALTER TABLE files ADD COLUMN pack_label TEXT "
+                             "NOT NULL DEFAULT ''")
             conn.commit()
 
     # -- generic helpers -------------------------------------------------

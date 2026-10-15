@@ -128,11 +128,18 @@
         view.innerHTML = h;
         const renderEps = (i) => {
           const s = t.seasons[i];
-          document.getElementById("eps").innerHTML = s.episodes.length ? s.episodes.map((e) =>
+          let ph = "";
+          if (s.packs && s.packs.length) {
+            ph = `<div class="section-title">📦 Season packs</div>` + s.packs.map((v) =>
+              `<div class="ver"><div><div class="q">📦 ${esc(v.pack_label || "Pack")} · ${esc(v.resolution || "Unknown")}${v.quality ? " · " + esc(v.quality) : ""}</div>
+              <div class="s">${fmtSize(v.size)}</div></div>
+              <button class="btn" data-file="${v.id}">Get</button></div>`).join("");
+          }
+          document.getElementById("eps").innerHTML = ph + (s.episodes.length ? s.episodes.map((e) =>
             `<div class="ep"><div class="ep-head" data-ep="${e.ep_no}">
                <span>E${String(e.ep_no).padStart(2, "0")}${e.title ? " — " + esc(e.title) : ""}</span><span>▸</span>
              </div><div class="ep-body" hidden>${e.versions.length ? e.versions.map(verRow).join("") : "No files."}</div>
-             </div>`).join("") : `<div class="empty">No episodes yet.</div>`;
+             </div>`).join("") : `<div class="empty">No episodes yet.</div>`);
           document.querySelectorAll(".ep-head").forEach((el) =>
             el.addEventListener("click", () => {
               const b = el.nextElementSibling; b.hidden = !b.hidden;

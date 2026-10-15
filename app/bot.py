@@ -103,7 +103,8 @@ class MediaBot:
                 "SELECT * FROM files WHERE episode_id=? AND status='ok' "
                 "ORDER BY " + RES_ORDER + " DESC", (episode_id,))
         return self.db.query(
-            "SELECT * FROM files WHERE title_id=? AND episode_id IS NULL AND status='ok' "
+            "SELECT * FROM files WHERE title_id=? AND episode_id IS NULL "
+            "AND season_id IS NULL AND status='ok' "
             "ORDER BY " + RES_ORDER + " DESC", (title_id,))
 
     def _kb_versions(self, files, prefix="getf"):
@@ -427,6 +428,12 @@ class MediaBot:
         eps = self.db.query("SELECT * FROM episodes WHERE season_id=? ORDER BY ep_no",
                             (season_id,))
         rows = []
+        packs = self.db.query(
+            "SELECT * FROM files WHERE season_id=? AND episode_id IS NULL "
+            "AND status='ok' ORDER BY " + RES_ORDER + " DESC", (season_id,))
+        for f in packs:
+            label = f"📦 {f['pack_label'] or 'Pack'} ({f['resolution'] or '?'})"
+            rows.append([InlineKeyboardButton(label, callback_data=f"getf:{f['id']}")])
         for e in eps:
             n = self.db.query_one("SELECT COUNT(*) c FROM files WHERE episode_id=?",
                                   (e["id"],))["c"]

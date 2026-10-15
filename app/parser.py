@@ -23,8 +23,8 @@ RES_PATTERNS = [
 ]
 YEAR_RE = re.compile(r"\b(19\d{2}|20[0-3]\d)\b")
 CODEC_PATTERNS = [
-    (re.compile(r"\bx265\b|\bHEVC\b|\bh\.?265\b", re.I), "x265"),
-    (re.compile(r"\bx264\b|\bAVC\b|\bh\.?264\b", re.I), "x264"),
+    (re.compile(r"\bx265\b|\bHEVC\b|\bh\.?265\b|\bH\s*265\b", re.I), "x265"),
+    (re.compile(r"\bx264\b|\bAVC\b|\bh\.?264\b|\bH\s*264\b", re.I), "x264"),
     (re.compile(r"\bXviD\b", re.I), "XviD"),
 ]
 SOURCE_PATTERNS = [
@@ -37,6 +37,36 @@ SOURCE_PATTERNS = [
 ]
 # S01E02, S1E2, s01e02
 SE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
+# season-pack markers: "S01 COMBINED", "Season 1 Complete", "[E01-04]"
+PACK_RE = re.compile(r"\b(COMBINED|COMPLETE)\b", re.I)
+PACK_RANGE_RE = re.compile(r"[\(\[]\s*[Ee](\d{1,3})\s*[-–]\s*(?:[Ee])?(\d{1,3})\s*[\)\]]")
+SEASON_NUM_RE = re.compile(r"\b[Ss](\d{1,2})\b")
+SEASON_WORD_RE = re.compile(r"\b[Ss]eason\s+(\d{1,2})\b", re.I)
+
+
+def _detect_pack(name: str, p: "ParsedName", pack_range: tuple | None = None) -> str:
+    """Detect season-pack filenames ("S01 COMBINED", "[E01-04]").
+
+    Sets p.kind/season/is_pack/pack_label. Returns the name with pack
+    tokens removed. A bare "Complete" with no season/range evidence
+    ("Complete Unknown") is not a pack. pack_range is read from the raw
+    filename before "-" is flattened."""
+    if not PACK_RE.search(name):
+        return name
+    sm = SEASON_NUM_RE.search(name) or SEASON_WORD_RE.search(name)
+    if not sm and not pack_range:
+        return name
+    p.kind = "series"
+    p.is_pack = True
+    if sm:
+        p.season = int(sm.group(1))
+        name = name[: sm.start()] + " " + name[sm.end():]
+    if pack_range:
+        a, b = pack_range
+        p.pack_label = f"E{a:02d}\u2013E{b:02d}"
+    else:
+        p.pack_label = "Complete"
+    return PACK_RE.sub(" ", name)
 # 1x02
 X_RE = re.compile(r"\b(\d{1,2})x(\d{1,3})\b")
 # Season 1 Episode 2 / Season.1.Episode.2
@@ -56,9 +86,10 @@ RELEASE_GROUPS = re.compile(
 TAG_STRIP_RE = re.compile(
     r"\b(REMASTERED|REMASTER|PROPER|REPACK|RERIP|UNRATED|EXTENDED|"
     r"DIRECTORS?[.\s_-]*CUT|THEATRICAL|IMAX|"
-    r"10BIT|8BIT|12BIT|HDR10\+?|HDR|DV|SDR|"
+    r"10BIT|8BIT|12BIT|HDR10PLUS|HDR10\+?|HDR|DV|SDR|"
     r"NF|AMZN|DSNP|HULU|ATVP|HBO|PCOK|CRIT|"
     r"\bHQ\b|\bHD\b|"
+    r"HEVX|JHS|"
     r"AAC|AC3|EAC3|DTS(?:-HD)?|DDP?\s*2\s*0|DDP?\s*5\s*1|\b5\s*1\b|\b2\s*0\b|ATMOS|TRUEHD|"
     r"H\s*26[45]\b|"
     r"ESUBS?|SUBS|SUBBED|DUBBED|DUAL|MULTI|"
@@ -89,6 +120,8 @@ class ParsedName:
     resolution: str = ""
     quality: str = ""
     codec: str = ""
+    is_pack: bool = False  # season pack (episode is None)
+    pack_label: str = ""  # "E01–E04" | "Complete"
     extra: dict = field(default_factory=dict)
 
 
@@ -107,6 +140,17 @@ def normalize_title(title: str) -> str:
 def parse_filename(raw: str) -> ParsedName:
     p = ParsedName(raw=raw)
     name = _strip_ext(raw.strip())
+    # UUIDs must go before separators are flattened ("a-b-c" -> "a b c")
+    name = UUID_RE.sub(" ", name)
+    # pack episode range like [E01-04]: read before "-" is flattened
+    rm = PACK_RANGE_RE.search(name)
+    pack_range = (int(rm.group(1)), int(rm.group(2))) if rm else None
+    # flatten separators FIRST so \b-anchored patterns work on
+    # underscore/dot filenames ("Lanterns_2026_S01E01_720p")
+    name = re.sub(r"[._\-+]+", " ", name)
+
+    # season packs ("S01 COMBINED", "[E01-04]") before series markers
+    name = _detect_pack(name, p, pack_range)
 
     for rx, val in RES_PATTERNS:
         if rx.search(name):
@@ -122,12 +166,13 @@ def parse_filename(raw: str) -> ParsedName:
             break
 
     # series markers (checked before year so S01E02 isn't mangled)
-    m = SE_RE.search(name) or X_RE.search(name) or SEASON_EP_WORDS_RE.search(name)
-    if m:
-        p.kind = "series"
-        p.season = int(m.group(1))
-        p.episode = int(m.group(2))
-        name = name[: m.start()] + " " + name[m.end():]
+    if not p.is_pack:
+        m = SE_RE.search(name) or X_RE.search(name) or SEASON_EP_WORDS_RE.search(name)
+        if m:
+            p.kind = "series"
+            p.season = int(m.group(1))
+            p.episode = int(m.group(2))
+            name = name[: m.start()] + " " + name[m.end():]
 
     years = list(YEAR_RE.finditer(name))
     if years:
@@ -138,7 +183,7 @@ def parse_filename(raw: str) -> ParsedName:
         name = name[: m.start()] + " " + name[m.end():]
 
     # episode-only marker after year removal ("Show E02")
-    if p.kind == "movie":
+    if p.kind == "movie" and not p.is_pack:
         m = EP_ONLY_RE.search(name)
         if m and not re.search(r"\bseason\b", name, re.I):
             p.kind = "series"
@@ -155,10 +200,6 @@ def parse_filename(raw: str) -> ParsedName:
     # drop leftover quality/codec/source tokens
     for rx, _ in RES_PATTERNS + CODEC_PATTERNS + SOURCE_PATTERNS:
         name = rx.sub(" ", name)
-    name = UUID_RE.sub(" ", name)
-    name = TAG_STRIP_RE.sub(" ", name)  # before flatten: catches DDP5.1, 5.1, H.265
-    name = re.sub(r"[._\-+]+", " ", name)
-    # release tags, then hash-like leftovers
     name = TAG_STRIP_RE.sub(" ", name)
     name = HEX_RE.sub(" ", name)
     name = HASHY_RE.sub(" ", name)
@@ -174,7 +215,7 @@ def parse_filename(raw: str) -> ParsedName:
     # trailing site-tag separator junk: "The Furious ... MoviesMod.At"
     # (a leading "At" can be legit: "At Close Range" — only strip trailing)
     name = re.sub(r"\s+\b[Aa][Tt]\b\s*$", " ", name)
-    name = re.sub(r"\b(Season|Episode|Ep|Complete|Dual|Audio|Hindi|English|Engli|Eng|"
+    name = re.sub(r"\b(Season|Episode|Ep|Dual|Audio|Hindi|English|Engli|Eng|"
                 r"Tam|Tel|Mal|Kan|Multi|ESub)\b", " ", name, flags=re.I)
     name = RELEASE_GROUPS.sub("", name)
     name = re.sub(r"\s+", " ", name).strip(" -")

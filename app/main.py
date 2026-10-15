@@ -31,10 +31,13 @@ async def amain() -> None:
     if not cfg.bot_token:
         log.error("BOT_TOKEN is not set. See .env.example.")
         sys.exit(1)
+    if not cfg.api_id or not cfg.api_hash:
+        log.error("API_ID / API_HASH are required for the MTProto client (get them at "
+                  "https://my.telegram.org -> API development tools). See .env.example.")
+        sys.exit(1)
     db = DB(cfg.database_path)
     tmdb = TMDB(db, cfg.tmdb_api_key)
-    bot = MediaBot(cfg, db, indexer=None)  # type: ignore[arg-type]
-    indexer = Indexer(bot.client, db, tmdb)
+    bot = MediaBot(cfg, db, indexer=None)  # type: ignore[arg-type]    indexer = Indexer(bot.client, db, tmdb)
     bot.indexer = indexer
 
     await bot.start()

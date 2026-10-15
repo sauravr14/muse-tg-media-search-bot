@@ -37,6 +37,7 @@ Set `MINI_APP_URL` to the public URL of `/app/` (e.g. `https://media.example.com
 | Variable | Required | Description |
 |---|---|---|
 | `BOT_TOKEN` | yes | From [@BotFather](https://t.me/BotFather) |
+| `API_ID` / `API_HASH` | yes | From [my.telegram.org](https://my.telegram.org) → API development tools (required for MTProto auth, even with a bot token) |
 | `ADMIN_USER_IDS` | yes | Comma-separated Telegram user ids (bot admin commands + web admin) |
 | `TMDB_API_KEY` | no | From [themoviedb.org](https://www.themoviedb.org/settings/api) — without it, posters are placeholders |
 | `MINI_APP_URL` | yes | Public URL of the Mini App, ending in `/app/` |

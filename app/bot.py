@@ -43,7 +43,8 @@ class MediaBot:
         self.cfg = cfg
         self.db = db
         self.indexer = indexer
-        self.client = Client("mediabot", bot_token=cfg.bot_token, in_memory=True)
+        self.client = Client("mediabot", api_id=cfg.api_id, api_hash=cfg.api_hash,
+                             bot_token=cfg.bot_token, in_memory=True)
         self.username = ""
         self._spam: dict[int, float] = {}
         self._register()

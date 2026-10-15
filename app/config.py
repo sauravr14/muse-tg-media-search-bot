@@ -19,6 +19,8 @@ def _int(name: str, default: int) -> int:
 @dataclass
 class Config:
     bot_token: str = field(default_factory=lambda: os.environ.get("BOT_TOKEN", ""))
+    api_id: int = field(default_factory=lambda: _int("API_ID", 0))
+    api_hash: str = field(default_factory=lambda: os.environ.get("API_HASH", ""))
     admin_ids: tuple[int, ...] = field(default_factory=tuple)
     tmdb_api_key: str = field(default_factory=lambda: os.environ.get("TMDB_API_KEY", ""))
     mini_app_url: str = field(

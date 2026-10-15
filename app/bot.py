@@ -181,6 +181,11 @@ class MediaBot:
                 "/search <name> · /recent · /movies · /series · /help",
                 parse_mode=ParseMode.HTML, reply_markup=kb)
 
+        @c.on_message(filters.private & filters.command("id"))
+        async def whoami(_, m: Message):
+            await m.reply_text(f"Your Telegram user id: <code>{m.from_user.id}</code>",
+                               parse_mode=ParseMode.HTML)
+
         @c.on_message(filters.private & filters.command("help"))
         async def help_(_, m: Message):
             await m.reply_text(
@@ -226,7 +231,7 @@ class MediaBot:
                 lines.append(f"• {html.escape(t['title'])}{year}")
             await m.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
-        @c.on_message(filters.private & filters.text & ~filters.command(["start"]))
+        @c.on_message(filters.private & filters.text & ~filters.regex(r"^/"))
         async def plain_search(_, m: Message):
             await self._do_search(m.chat.id, m.text.strip(), m.from_user.id)
 

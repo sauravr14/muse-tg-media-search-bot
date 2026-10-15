@@ -52,6 +52,21 @@ Never commit real values — `.env` is git-ignored.
 
 **Admins:** `/addchannel <id|@username>`, `/rmchannel <id>`, `/channels`, `/index`, `/stats`.
 
+## Mini App on Vercel (HTTPS for Telegram)
+
+Telegram only loads Mini Apps over HTTPS. Host the web UI on Vercel:
+
+1. Push this repo to GitHub (already done).
+2. Vercel → New Project → import the repo → set **Root Directory** to `app/webapp`.
+3. Deploy. Your Mini App URL becomes `https://<your-app>.vercel.app/`.
+4. `app/webapp/vercel.json` rewrites `/api/*` to the VPS backend
+   (`http://152.67.176.107:8000`) server-side, so the SPA needs no changes
+   and there are no mixed-content or CORS issues. Update the IP there if your
+   VPS address changes.
+5. Set `MINI_APP_URL=https://<your-app>.vercel.app/` in the VPS `.env` and
+   redeploy the container — the bot then serves real Mini App buttons, and you
+   can paste the same URL into BotFather → /mybots → Bot Settings → Menu Button.
+
 ## Koyeb / Render
 
 - **Koyeb:** App → Service → GitHub repo, Dockerfile builder, port `8000`, health check `/healthz`. Set the env vars; point `MINI_APP_URL` at the Koyeb URL + `/app/`. Attach a volume at `/app/data` or the catalog resets on redeploy.

@@ -302,8 +302,10 @@ class MediaBot:
             if not arg:
                 await m.reply_text("Usage: /addchannel <channel_id or @username>")
                 return
+            # private channels have no username — accept the -100... id
+            target: int | str = int(arg) if arg.lstrip("-").isdigit() else arg
             try:
-                chat = await self.client.get_chat(arg)
+                chat = await self.client.get_chat(target)
             except Exception as e:
                 await m.reply_text(f"Can't access that chat: {e}")
                 return

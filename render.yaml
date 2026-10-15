@@ -1,0 +1,26 @@
+# Render deployment (https://dashboard.render.com)
+# 1. Push this repo to GitHub.
+# 2. New -> Web Service -> select repo. Runtime: Docker.
+# 3. Health check path: /healthz
+# 4. Add env vars: BOT_TOKEN, TMDB_API_KEY, ADMIN_USER_IDS, MINI_APP_URL
+#    (set MINI_APP_URL to the public Render URL + /app/)
+# 5. Add a persistent disk mounted at /app/data so the SQLite catalog
+#    survives deploys (Render disks persist; without one the DB resets).
+services:
+  - type: web
+    name: tg-media-search-bot
+    runtime: docker
+    healthCheckPath: /healthz
+    disk:
+      name: catalog-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: TMDB_API_KEY
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false
+      - key: MINI_APP_URL
+        sync: false

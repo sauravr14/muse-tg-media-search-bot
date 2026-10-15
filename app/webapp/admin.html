@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin — Media Library</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="styles.css">
+<style>body{padding:14px}table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{border:1px solid #2a2a38;padding:6px 8px;text-align:left}th{background:#1c1c26}</style>
+</head>
+<body>
+<h2>🔧 Admin</h2>
+<div id="out">Checking admin access…</div>
+<script>
+(function(){
+  const tg = window.Telegram.WebApp; tg.ready();
+  const initData = tg.initData;
+  const out = document.getElementById("out");
+  async function call(path, opts){
+    const r = await fetch(path, Object.assign({headers:{"x-telegram-init-data":initData}}, opts||{}));
+    if(r.status===403){ out.innerHTML="<p>⛔ Not an admin.</p>"; throw 0; }
+    return r.json();
+  }
+  (async()=>{
+    try{
+      const d = await call("/api/admin/overview");
+      const s = d.stats;
+      let h = `<p>Files <b>${s.files}</b> · Movies <b>${s.movies}</b> · Series <b>${s.series}</b> · Episodes <b>${s.episodes}</b> · Unmatched <b>${s.unmatched}</b></p>`;
+      h += `<h3>Sources</h3><table><tr><th>Channel</th><th>ID</th><th>Files</th><th>Status</th></tr>` +
+        d.sources.map(x=>`<tr><td>${x.title||""}</td><td>${x.chat_id}</td><td>—</td><td>${x.status}</td></tr>`).join("") + `</table>`;
+      h += `<h3>Unmatched files</h3><div id="unm">loading…</div>`;
+      out.innerHTML = h;
+      const u = await call("/api/admin/unmatched?limit=30");
+      document.getElementById("unm").innerHTML = u.files.length
+        ? `<table><tr><th>File</th><th>Action</th></tr>` + u.files.map(f=>
+            `<tr><td>${f.file_name}</td><td><button onclick="hide(${f.id},this)">hide</button></td></tr>`).join("") + `</table>`
+        : "<p>None 🎉</p>";
+    }catch(e){ if(e!==0) out.innerHTML="<p>Failed to load.</p>"; }
+  })();
+  window.hide = async (id,btn)=>{
+    btn.disabled=true;
+    await call("/api/admin/file/"+id+"/hide",{method:"POST"});
+    btn.closest("tr").remove();
+  };
+})();
+</script>
+</body>
+</html>

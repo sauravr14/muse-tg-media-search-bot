@@ -1,0 +1,13 @@
+services:
+  mediabot:
+    build: .
+    container_name: tg-media-search-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/catalog.db
+      PORT: 8000
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8000:8000"

@@ -1,0 +1,5 @@
+pyrofork==2.3.69
+fastapi==0.115.6
+uvicorn==0.30.6
+aiohttp==3.10.11
+python-dotenv==1.0.1

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Media Library</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">🎬 Media Library</div>
+  <div class="search-wrap">
+    <input id="search" type="search" placeholder="Search movies, series…" autocomplete="off">
+    <button id="clear" hidden>✕</button>
+  </div>
+</header>
+<nav id="tabs">
+  <button data-tab="home" class="active">Home</button>
+  <button data-tab="movies">Movies</button>
+  <button data-tab="series">Series</button>
+</nav>
+<main id="view"></main>
+<div id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

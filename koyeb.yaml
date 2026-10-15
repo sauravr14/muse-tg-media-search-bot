@@ -1,0 +1,10 @@
+# Koyeb deployment (https://app.koyeb.com)
+# 1. Push this repo to GitHub.
+# 2. Create a Koyeb App -> Service -> "GitHub" -> select this repo.
+# 3. Builder: Dockerfile. Port: 8000, health check path: /healthz.
+# 4. Add env vars: BOT_TOKEN, TMDB_API_KEY, ADMIN_USER_IDS, MINI_APP_URL
+#    (set MINI_APP_URL to the public Koyeb URL + /app/, e.g.
+#     https://<your-app>.koyeb.app/app/)
+# 5. Volumes are ephemeral on Koyeb: the SQLite catalog resets on redeploy.
+#    For a persistent catalog attach a Koyeb Volume at /app/data,
+#    or set DATABASE_URL to a managed Postgres (schema is portable).

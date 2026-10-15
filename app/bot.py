@@ -294,6 +294,7 @@ class MediaBot:
             await self.indexer.on_channel_post(_, m)
 
     def _register_admin(self, c):
+        admin_ids = list(self.cfg.admin_ids)
 
         @c.on_message(filters.private & filters.command("addchannel") & filters.user(admin_ids))
         async def addchannel(_, m: Message):

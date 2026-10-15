@@ -281,15 +281,23 @@ class Indexer:
             await asyncio.sleep(0.5)
         if not guess or not guess.get("title"):
             return None
-        p2 = ParsedName(raw=p.raw, title=guess["title"],
-                        norm_title=normalize_title(guess["title"]),
-                        year=guess.get("year") or p.year,
-                        kind=guess.get("kind") or p.kind)
-        meta = await self.tmdb.match(p2)
-        if meta:
-            log.info("llm identified %r as %r (%s)", p.raw[:60],
-                     meta["title"], meta.get("year"))
-        return meta
+        tried = set()
+        for variant in (guess["title"], guess["title"].split(":")[0],
+                        guess["title"].split(" - ")[0]):
+            variant = variant.strip()
+            if not variant or variant.lower() in tried:
+                continue
+            tried.add(variant.lower())
+            p2 = ParsedName(raw=p.raw, title=variant,
+                            norm_title=normalize_title(variant),
+                            year=guess.get("year") or p.year,
+                            kind=guess.get("kind") or p.kind)
+            meta = await self.tmdb.match(p2)
+            if meta:
+                log.info("llm identified %r as %r (%s)", p.raw[:60],
+                         meta["title"], meta.get("year"))
+                return meta
+        return None
 
     async def _adopt_meta(self, row, meta: dict) -> None:
         from .parser import normalize_title

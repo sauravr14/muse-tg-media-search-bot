@@ -95,6 +95,31 @@ class ParserTest(unittest.TestCase):
         p = parse_filename("Dune Part Two 2024 IMAX 2160p WEB-DL DDP5.1 Atmos H.265.mkv")
         self.assertEqual(p.title, "Dune Part Two")
         self.assertEqual(p.year, 2024)
+    def test_site_tags_stripped(self):
+        p = parse_filename("Egybest Cloudy With A Chance Of Meatballs 2 2013 720P X264")
+        self.assertEqual(p.title, "Cloudy With A Chance Of Meatballs 2")
+        self.assertEqual(p.year, 2013)
+        p = parse_filename("Iron Sky The Coming Race Mycima Tv 2019")
+        self.assertEqual(p.title, "Iron Sky The Coming Race")
+
+    def test_leading_site_id_stripped(self):
+        p = parse_filename("1354295 Outlander 2008 Cima4U")
+        self.assertEqual(p.title, "Outlander")
+        self.assertEqual(p.year, 2008)
+
+    def test_unclosed_bracket_stripped(self):
+        p = parse_filename("Dark Figure Of Crime Hq [Tam Tel")
+        self.assertEqual(p.title, "Dark Figure Of Crime")
+
+    def test_sequel_number_kept(self):
+        p = parse_filename("1682878 The Shop Around The Corner 1940 Cima4U 0")
+        self.assertEqual(p.title, "The Shop Around The Corner")
+
+    def test_flattened_audio_tags(self):
+        p = parse_filename("Congratulations 2009 1080P Web Dl Ddp2 0 H 264 Aliraqi")
+        self.assertEqual(p.title, "Congratulations")
+        self.assertEqual(p.quality, "WEB-DL")
+
 if __name__ == "__main__":
     unittest.main()
 

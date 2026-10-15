@@ -28,8 +28,8 @@ CODEC_PATTERNS = [
     (re.compile(r"\bXviD\b", re.I), "XviD"),
 ]
 SOURCE_PATTERNS = [
-    (re.compile(r"WEB[-.]?DL|WEBRip", re.I), "WEB-DL"),
-    (re.compile(r"BluRay|BRRip|BDRip", re.I), "BluRay"),
+    (re.compile(r"WEB[\s.-]?DL|WEBRip", re.I), "WEB-DL"),
+    (re.compile(r"Blu[\s.-]?Ray|BRRip|BDRip", re.I), "BluRay"),
     (re.compile(r"HDRip", re.I), "HDRip"),
     (re.compile(r"HDTV", re.I), "HDTV"),
     (re.compile(r"DVDScr|DVDRip", re.I), "DVD"),
@@ -58,9 +58,14 @@ TAG_STRIP_RE = re.compile(
     r"DIRECTORS?[.\s_-]*CUT|THEATRICAL|IMAX|"
     r"10BIT|8BIT|12BIT|HDR10\+?|HDR|DV|SDR|"
     r"NF|AMZN|DSNP|HULU|ATVP|HBO|PCOK|CRIT|"
-    r"AAC|AC3|EAC3|DTS(?:-HD)?|DDP?5\.1|5\.1|7\.1|2\.0|ATMOS|TRUEHD|"
+    r"\bHQ\b|\bHD\b|"
+    r"AAC|AC3|EAC3|DTS(?:-HD)?|DDP?\s*2\s*0|DDP?\s*5\s*1|\b5\s*1\b|\b2\s*0\b|ATMOS|TRUEHD|"
+    r"H\s*26[45]\b|"
     r"ESUBS?|SUBS|SUBBED|DUBBED|DUAL|MULTI|"
     r"MP4|MKV|AVI|M4V|WMV|FLV|WEBM|"
+    r"CIMA4U|MYCIMA(?:\s*(?:TV|ME|TO|WORLD))?|EGYBEST|EGYDEAD(?:\s*COM)?|"
+    r"AKWAM|FASELHD?|ALIRAQI|JOPULGA|OSN|SHAHID|"
+    r"FULL[\s_-]*MOVIE|"
     r"MOVIESMOD|PAHE)\b",
     re.I,
 )
@@ -143,6 +148,10 @@ def parse_filename(raw: str) -> ParsedName:
 
     # drop anything in brackets/parens (release info, not title)
     name = re.sub(r"[\(\[].*?[\)\]]", " ", name)
+    # also a trailing unclosed bracket: "Title Hq [Tam Tel"
+    name = re.sub(r"\s*[\(\[][^\)\]]*$", " ", name)
+    # leading site database ids: "1354295 Outlander 2008"
+    name = re.sub(r"^\d{6,}\s+", " ", name)
     # drop leftover quality/codec/source tokens
     for rx, _ in RES_PATTERNS + CODEC_PATTERNS + SOURCE_PATTERNS:
         name = rx.sub(" ", name)
@@ -154,11 +163,14 @@ def parse_filename(raw: str) -> ParsedName:
     name = HEX_RE.sub(" ", name)
     name = HASHY_RE.sub(" ", name)
     if p.year:
-        # a year was found: trailing bare numbers are junk ("Film 1992 ... 247"),
-        # but a leading number can be the title itself ("21 Jump Street")
-        stripped = re.sub(r"(?:\s*\b\d{1,4}\b)+\s*$", " ", name)
-        if stripped.strip():
-            name = stripped
+        # a year was found: trailing bare numbers are usually junk
+        # ("Film 1992 ... 247"), but a single 1-9 can be the sequel number
+        # ("Meatballs 2") and a leading number the title ("21 Jump Street")
+        m = re.search(r"((?:\s*\b\d{1,4}\b)+)\s*$", name)
+        if m:
+            toks = m.group(1).split()
+            if any(len(t) >= 2 or t == "0" or len(toks) > 1 for t in toks):
+                name = name[: m.start()].strip()
     name = re.sub(r"\b(Season|Episode|Ep|Complete|Dual|Audio|Hindi|English|Engli|Eng|"
                 r"Tam|Tel|Mal|Kan|Multi|ESub)\b", " ", name, flags=re.I)
     name = RELEASE_GROUPS.sub("", name)

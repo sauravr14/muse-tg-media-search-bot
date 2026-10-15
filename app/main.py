@@ -37,7 +37,8 @@ async def amain() -> None:
         sys.exit(1)
     db = DB(cfg.database_path)
     tmdb = TMDB(db, cfg.tmdb_api_key)
-    bot = MediaBot(cfg, db, indexer=None)  # type: ignore[arg-type]    indexer = Indexer(bot.client, db, tmdb)
+    bot = MediaBot(cfg, db, indexer=None)  # type: ignore[arg-type]
+    indexer = Indexer(bot.client, db, tmdb)
     bot.indexer = indexer
 
     await bot.start()

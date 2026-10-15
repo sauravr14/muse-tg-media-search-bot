@@ -350,8 +350,9 @@ class MediaBot:
 
         @c.on_message(filters.private & filters.command("index") & filters.user(admin_ids))
         async def index(_, m: Message):
-            await m.reply_text("🔄 Full scan started in the background. Check /stats.")
-            await self.indexer.scan_all()
+            await m.reply_text("🔄 Full scan started in the background — "
+                               "I'll report here when it's done.")
+            asyncio.create_task(self._index_all_report(m.chat.id))
 
         @c.on_message(filters.private & filters.command("stats") & filters.user(admin_ids))
         async def stats(_, m: Message):
@@ -486,6 +487,25 @@ class MediaBot:
             await self.client.send_message(notify_chat, text, parse_mode=ParseMode.HTML)
         except Exception as e:
             log.warning("scan report failed: %r", e)
+
+    async def _index_all_report(self, notify_chat: int):
+        lines = []
+        for src in self.db.list_sources():
+            if not src["enabled"]:
+                continue
+            res = await self.indexer.scan_source(src["chat_id"])
+            name = html.escape(src["title"] or str(src["chat_id"]))
+            if res.get("error"):
+                lines.append(f"⚠️ {name}: {html.escape(str(res['error'])[:200])}")
+            else:
+                lines.append(f"✅ {name}: {res.get('scanned', 0)} checked, "
+                             f"{res.get('new', 0)} new files indexed")
+        try:
+            await self.client.send_message(
+                notify_chat, "\n".join(lines) or "No sources configured.",
+                parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("index report failed: %r", e)
 
     async def start(self):
         await self.client.start()

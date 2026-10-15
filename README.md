@@ -92,9 +92,13 @@ app/
 single source of truth, and the catalog workload (metadata only, no BLOBs) fits
 comfortably. Posters are hot-linked from TMDB's CDN, never downloaded.
 
-**Telegram limits (be honest):** a bot can only read channels it belongs to —
-make it admin of each source. File delivery uses `message.copy`, so the file
-stays on Telegram's servers; nothing is downloaded by this app.
+**Telegram limits (be honest):**
+- A bot can only read channels it belongs to — make it admin of each source.
+- **Bots cannot read channel *history*** (`messages.GetHistory` → `BOT_METHOD_INVALID`).
+  New posts are indexed live without any extra setup; to backfill existing history,
+  set `SESSION_STRING` (generate with `python3 tools/make_session.py`).
+- File delivery uses `message.copy`, so files stay on Telegram's servers; nothing
+  is downloaded by this app.
 
 ## Repository analysis
 

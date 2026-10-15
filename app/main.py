@@ -17,6 +17,7 @@ from .bot import MediaBot
 from .config import cfg
 from .db import DB
 from .indexer import Indexer
+from pyrogram import Client as PyroClient
 from .tmdb import TMDB
 
 logging.basicConfig(
@@ -38,7 +39,16 @@ async def amain() -> None:
     db = DB(cfg.database_path)
     tmdb = TMDB(db, cfg.tmdb_api_key)
     bot = MediaBot(cfg, db, indexer=None)  # type: ignore[arg-type]
-    indexer = Indexer(bot.client, db, tmdb)
+    history_client = None
+    if cfg.has_session:
+        history_client = PyroClient("history", api_id=cfg.api_id, api_hash=cfg.api_hash,
+                                    session_string=cfg.session_string, in_memory=True)
+        await history_client.start()
+        log.info("history user-client started")
+    else:
+        log.warning("SESSION_STRING not set — history scans disabled; "
+                    "new channel posts are still indexed live")
+    indexer = Indexer(bot.client, db, tmdb, history_client=history_client)
     bot.indexer = indexer
 
     await bot.start()
@@ -56,6 +66,8 @@ async def amain() -> None:
         enrich_task.cancel()
         scan_task.cancel()
         await bot.stop()
+        if history_client:
+            await history_client.stop()
         await tmdb.close()
 
 

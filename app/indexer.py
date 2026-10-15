@@ -54,8 +54,12 @@ def _file_meta_from_msg(msg) -> dict | None:
 
 
 class Indexer:
-    def __init__(self, client, db: DB, tmdb: TMDB):
+    def __init__(self, client, db: DB, tmdb: TMDB, history_client=None):
         self.client = client
+        # History scans need a *user* session: Telegram forbids bots from
+        # calling messages.GetHistory (BOT_METHOD_INVALID). The bot client
+        # still handles commands, live channel posts and file delivery.
+        self.history_client = history_client or client
         self.db = db
         self.tmdb = tmdb
         self.clf = Classifier(db)
@@ -93,7 +97,7 @@ class Indexer:
             try:
                 while True:
                     batch = []
-                    async for msg in self.client.get_chat_history(
+                    async for msg in self.history_client.get_chat_history(
                         chat_id, offset_id=offset_id, limit=BATCH
                     ):
                         batch.append(msg)
@@ -113,8 +117,13 @@ class Indexer:
                     await asyncio.sleep(0.2)
             except Exception as e:
                 log.warning("scan of %s failed: %r", chat_id, e)
-                self.db.set_source(chat_id, status="error", error=f"{type(e).__name__}: {e}")
-                return {"scanned": done, "new": new, "error": str(e)}
+                err = str(e)
+                if "BOT_METHOD_INVALID" in err or "GetHistory" in err:
+                    err = ("history_unavailable: Telegram does not allow bots to read "
+                           "channel history. Set SESSION_STRING (a user session) to enable "
+                           "history scans; new posts are still indexed live.")
+                self.db.set_source(chat_id, status="error", error=f"{type(e).__name__}: {err}")
+                return {"scanned": done, "new": new, "error": err}
             self.db.set_source(chat_id, status="idle")
             return {"scanned": done, "new": new}
 

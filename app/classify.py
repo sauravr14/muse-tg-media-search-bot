@@ -91,10 +91,11 @@ class Classifier:
         )
         if row:
             return dict(row)
-        cur = self.db.execute(
-            "INSERT INTO seasons(title_id, season_no) VALUES(?,?)", (title_id, season_no)
+        self.db.execute(
+            "INSERT OR IGNORE INTO seasons(title_id, season_no) VALUES(?,?)", (title_id, season_no)
         )
-        return dict(self.db.query_one("SELECT * FROM seasons WHERE id=?", (cur.lastrowid,)))
+        return dict(self.db.query_one(
+            "SELECT * FROM seasons WHERE title_id=? AND season_no=?", (title_id, season_no)))
 
     def get_or_create_episode(self, title_id: int, season_id: int, ep_no: int,
                                ep_title: str = "") -> dict:
@@ -103,11 +104,12 @@ class Classifier:
         )
         if row:
             return dict(row)
-        cur = self.db.execute(
-            "INSERT INTO episodes(title_id, season_id, ep_no, ep_title) VALUES(?,?,?,?)",
+        self.db.execute(
+            "INSERT OR IGNORE INTO episodes(title_id, season_id, ep_no, ep_title) VALUES(?,?,?,?)",
             (title_id, season_id, ep_no, ep_title),
         )
-        return dict(self.db.query_one("SELECT * FROM episodes WHERE id=?", (cur.lastrowid,)))
+        return dict(self.db.query_one(
+            "SELECT * FROM episodes WHERE season_id=? AND ep_no=?", (season_id, ep_no)))
 
     # -- main entry ------------------------------------------------------------
     def ingest(self, p: ParsedName, file_meta: dict, tmdb_meta: dict | None = None) -> dict:

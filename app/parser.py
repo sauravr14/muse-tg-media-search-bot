@@ -35,6 +35,19 @@ SOURCE_PATTERNS = [
     (re.compile(r"DVDScr|DVDRip", re.I), "DVD"),
     (re.compile(r"CAM|HDCAM|TS|TeleSync", re.I), "CAM"),
 ]
+# theatre prints — flagged, filtered by the "clean prints" toggle
+CAM_PATTERNS = [
+    re.compile(r"\bHDCAM\b", re.I),
+    re.compile(r"\bCAMRIP\b", re.I),
+    re.compile(r"\bCAM\b", re.I),
+    re.compile(r"\bHDTS\b", re.I),
+    re.compile(r"\bTELESYNC\b", re.I),
+    re.compile(r"\bTSRIP\b", re.I),
+    re.compile(r"\bPREDVD\b", re.I),
+    re.compile(r"\bHDTC\b", re.I),
+    re.compile(r"(?<![A-Za-z])TS(?![A-Za-z])"),
+    re.compile(r"(?<![A-Za-z])TC(?![A-Za-z])"),
+]
 # S01E02, S1E2, s01e02
 SE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
 # season-pack markers: "S01 COMBINED", "Season 1 Complete", "[E01-04]"
@@ -124,6 +137,7 @@ class ParsedName:
     codec: str = ""
     is_pack: bool = False  # season pack (episode is None)
     pack_label: str = ""  # "E01–E04" | "Complete"
+    is_cam: bool = False  # theatre print (HDCAM/CAM/HDTS/PreDVD/...)
     extra: dict = field(default_factory=dict)
 
 
@@ -166,6 +180,10 @@ def parse_filename(raw: str) -> ParsedName:
         if rx.search(name):
             p.quality = val
             break
+    for rx in CAM_PATTERNS:
+        if rx.search(name):
+            p.is_cam = True
+            break
 
     # series markers (checked before year so S01E02 isn't mangled)
     if not p.is_pack:
@@ -200,8 +218,10 @@ def parse_filename(raw: str) -> ParsedName:
     name = re.sub(r"\s*[\(\[][^\)\]]*$", " ", name)
     # leading site database ids: "1354295 Outlander 2008"
     name = re.sub(r"^\d{6,}\s+", " ", name)
-    # drop leftover quality/codec/source tokens
+    # drop leftover quality/codec/source/cam tokens
     for rx, _ in RES_PATTERNS + CODEC_PATTERNS + SOURCE_PATTERNS:
+        name = rx.sub(" ", name)
+    for rx in CAM_PATTERNS:
         name = rx.sub(" ", name)
     name = TAG_STRIP_RE.sub(" ", name)
     name = HEX_RE.sub(" ", name)

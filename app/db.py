@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS files (
     episode_id  INTEGER REFERENCES episodes(id) ON DELETE SET NULL,
     season_id   INTEGER REFERENCES seasons(id) ON DELETE SET NULL,
     pack_label  TEXT NOT NULL DEFAULT '',
+    is_cam      INTEGER NOT NULL DEFAULT 0,
     file_name   TEXT NOT NULL,
     norm_name   TEXT NOT NULL DEFAULT '',
     resolution  TEXT NOT NULL DEFAULT '',
@@ -164,6 +165,9 @@ class DB:
             if "pack_label" not in cols:
                 conn.execute("ALTER TABLE files ADD COLUMN pack_label TEXT "
                              "NOT NULL DEFAULT ''")
+            if "is_cam" not in cols:
+                conn.execute("ALTER TABLE files ADD COLUMN is_cam INTEGER "
+                             "NOT NULL DEFAULT 0")
             conn.commit()
 
     # -- generic helpers -------------------------------------------------

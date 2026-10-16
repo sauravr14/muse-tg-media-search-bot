@@ -37,10 +37,27 @@
     view.innerHTML = `<div class="grid">${'<div class="skel" style="aspect-ratio:2/3"></div>'.repeat(n || 6)}</div>`;
   }
   const api = async (path) => {
-    const r = await fetch(path);
+    const sep = path.includes("?") ? "&" : "?";
+    const r = await fetch(path + (camOn ? sep + "hide_cam=1" : ""));
     if (!r.ok) throw new Error("HTTP " + r.status);
     return r.json();
   };
+
+  // theatre-print filter: hides HDCAM/CAM/HDTS/PreDVD etc. app-wide
+  let camOn = false;
+  try { camOn = localStorage.getItem("camFilter") === "1"; } catch (e) {}
+  function renderCamToggle() {
+    const b = document.getElementById("camToggle");
+    if (!b) return;
+    b.classList.toggle("on", camOn);
+    b.innerHTML = camOn ? "✨ Clean only" : "🎭 All prints";
+  }
+  function setCam(on) {
+    camOn = on;
+    try { localStorage.setItem("camFilter", on ? "1" : "0"); } catch (e) {}
+    renderCamToggle();
+    route();
+  }
 
   function card(t) {
     return `<div class="card" data-id="${t.id}">
@@ -250,6 +267,17 @@
   searchInput.addEventListener("input", onSearchInput);
   clearBtn.addEventListener("click", () => {
     searchInput.value = ""; clearBtn.hidden = true; route();
+  });
+  renderCamToggle();
+  document.getElementById("camToggle").addEventListener("click", () => setCam(!camOn));
+  document.getElementById("camInfo").addEventListener("click", () => {
+    document.getElementById("camModal").hidden = false;
+  });
+  document.getElementById("camModalClose").addEventListener("click", () => {
+    document.getElementById("camModal").hidden = true;
+  });
+  document.getElementById("camModal").addEventListener("click", (e) => {
+    if (e.target.id === "camModal") e.target.hidden = true;
   });
   window.addEventListener("hashchange", route);
 

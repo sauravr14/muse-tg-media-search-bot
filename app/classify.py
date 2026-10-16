@@ -146,10 +146,10 @@ class Classifier:
             episode_id = ep["id"]
 
         cur = db.execute(
-            "INSERT INTO files(title_id, episode_id, season_id, pack_label, file_name, norm_name, resolution,"
+            "INSERT INTO files(title_id, episode_id, season_id, pack_label, is_cam, file_name, norm_name, resolution,"
             " quality, codec, size, duration, mime, tg_chat_id, tg_msg_id, caption,"
-            " msg_date, indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (title_id, episode_id, season_id, pack_label, file_meta["file_name"], p.norm_title, p.resolution,
+            " msg_date, indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (title_id, episode_id, season_id, pack_label, 1 if p.is_cam else 0, file_meta["file_name"], p.norm_title, p.resolution,
              p.quality, p.codec, file_meta.get("size", 0), file_meta.get("duration", 0),
              file_meta.get("mime", ""), file_meta["tg_chat_id"], file_meta["tg_msg_id"],
              file_meta.get("caption", ""), file_meta.get("msg_date", 0), now),

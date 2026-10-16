@@ -65,6 +65,10 @@ def _file_dict(f) -> dict:
             "duration": f["duration"], "pack_label": f["pack_label"] or ""}
 
 
+CLEAN_ONLY = (" AND EXISTS (SELECT 1 FROM files f WHERE f.title_id=titles.id"
+                " AND f.is_cam=0 AND f.status='ok')")
+
+
 def _title_card(t) -> dict:
     return {"id": t["id"], "kind": t["kind"], "title": t["title"],
             "year": t["year"], "poster": t["poster"], "rating": t["rating"],
@@ -89,7 +93,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
     # -- public catalog -----------------------------------------------------------
     @app.get("/api/search")
     async def search(request: Request, q: str = Query("", max_length=120),
-                     kind: str = "", page: int = 1):
+                     kind: str = "", page: int = 1, hide_cam: int = 0):
         if not limiter.check(request.client.host if request.client else "?"):
             raise HTTPException(429, "slow down")
         q = q.strip()
@@ -103,6 +107,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
                 "SELECT t.* FROM titles_fts f JOIN titles t ON t.id=f.rowid "
                 "WHERE titles_fts MATCH ?"
                 + (" AND t.kind=? " if kind in ("movie", "series") else "")
+                + (CLEAN_ONLY.replace("titles.id", "t.id") if hide_cam else "")
                 + " ORDER BY t.popularity DESC NULLS LAST, t.last_file_at DESC"
                 " LIMIT ? OFFSET ?",
                 tuple([match] + ([kind] if kind in ("movie", "series") else []) + [per, off]))
@@ -111,18 +116,19 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
         return {"results": [_title_card(t) for t in rows], "page": page}
 
     @app.get("/api/recent")
-    async def recent(kind: str = "", limit: int = 24):
+    async def recent(kind: str = "", limit: int = 24, hide_cam: int = 0):
         limit = min(max(limit, 1), 60)
+        where = " WHERE kind=? " if kind in ("movie", "series") else " WHERE 1=1 "
         rows = db.query(
-            "SELECT * FROM titles"
-            + (" WHERE kind=? " if kind in ("movie", "series") else "")
+            "SELECT * FROM titles" + where
+            + (CLEAN_ONLY if hide_cam else "")
             + " ORDER BY last_file_at DESC LIMIT ?",
             tuple(([kind] if kind in ("movie", "series") else []) + [limit]))
         return {"results": [_title_card(t) for t in rows]}
 
     @app.get("/api/browse")
     async def browse(kind: str = "", sort: str = "recent",
-                     page: int = 1, per: int = 30):
+                     page: int = 1, per: int = 30, hide_cam: int = 0):
         """Paginated full catalog for the Movies/Series tabs."""
         sorts = {
             "recent": "last_file_at DESC",
@@ -133,8 +139,10 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
         order = sorts.get(sort, sorts["recent"])
         per = min(max(per, 1), 60)
         page = max(page, 1)
-        where = "WHERE kind=? " if kind in ("movie", "series") else ""
+        where = "WHERE kind=? " if kind in ("movie", "series") else "WHERE 1=1 "
         params: list = [kind] if kind in ("movie", "series") else []
+        if hide_cam:
+            where += CLEAN_ONLY
         total = db.query_one(f"SELECT COUNT(*) c FROM titles {where}",
                              tuple(params))["c"]
         rows = db.query(
@@ -144,7 +152,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
                 "per": per, "total": total, "has_more": page * per < total}
 
     @app.get("/api/title/{title_id}")
-    async def title_detail(title_id: int):
+    async def title_detail(title_id: int, hide_cam: int = 0):
         t = db.query_one("SELECT * FROM titles WHERE id=?", (title_id,))
         if not t:
             raise HTTPException(404, "not found")
@@ -155,7 +163,9 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
         if t["kind"] == "movie":
             files = db.query(
                 "SELECT * FROM files WHERE title_id=? AND episode_id IS NULL "
-                "AND season_id IS NULL AND status='ok' ORDER BY " + RES_ORDER + " DESC", (title_id,))
+                "AND season_id IS NULL AND status='ok'"
+                + (" AND is_cam=0" if hide_cam else "")
+                + " ORDER BY " + RES_ORDER + " DESC", (title_id,))
             out["versions"] = [_file_dict(f) for f in files]
         else:
             seasons = []
@@ -166,7 +176,8 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
                                   (se["id"],)):
                     files = db.query(
                         "SELECT * FROM files WHERE episode_id=? AND status='ok' "
-                        "ORDER BY " + RES_ORDER + " DESC", (e["id"],))
+                        + (" AND is_cam=0" if hide_cam else "")
+                        + " ORDER BY " + RES_ORDER + " DESC", (e["id"],))
                     eps.append({"ep_no": e["ep_no"], "title": e["ep_title"],
                                 "air_date": e["air_date"], "overview": e["overview"],
                                 "versions": [_file_dict(f) for f in files]})
@@ -175,7 +186,8 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
                                 "packs": [_file_dict(f) for f in db.query(
                                     "SELECT * FROM files WHERE season_id=? "
                                     "AND episode_id IS NULL AND status='ok' "
-                                    "ORDER BY " + RES_ORDER + " DESC", (se["id"],))]})
+                                    + (" AND is_cam=0" if hide_cam else "")
+                                    + " ORDER BY " + RES_ORDER + " DESC", (se["id"],))]})
             out["seasons"] = seasons
         return out
 

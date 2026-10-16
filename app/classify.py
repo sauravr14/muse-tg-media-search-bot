@@ -146,7 +146,7 @@ class Classifier:
             episode_id = ep["id"]
 
         cur = db.execute(
-            "INSERT INTO files(title_id, episode_id, season_id, pack_label, is_cam, file_name, norm_name, resolution,"
+            "INSERT OR IGNORE INTO files(title_id, episode_id, season_id, pack_label, is_cam, file_name, norm_name, resolution,"
             " quality, codec, size, duration, mime, tg_chat_id, tg_msg_id, caption,"
             " msg_date, indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (title_id, episode_id, season_id, pack_label, 1 if p.is_cam else 0, file_meta["file_name"], p.norm_title, p.resolution,

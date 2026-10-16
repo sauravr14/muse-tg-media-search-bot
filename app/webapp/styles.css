@@ -72,6 +72,15 @@ body {
   background: var(--card); color: var(--muted); font-weight: 600; white-space: nowrap;
 }
 .season-tabs button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.sortbar { display: flex; gap: 8px; overflow-x: auto; padding: 4px 2px 10px; }
+.sortbar button {
+  padding: 8px 14px; border-radius: 20px; border: 1px solid #2a2a38;
+  background: var(--card); color: var(--muted); font-weight: 600;
+  white-space: nowrap; font-size: 13px; cursor: pointer;
+}
+.sortbar button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.more-wrap { text-align: center; padding: 16px 0 8px; }
+.count { color: var(--muted); font-weight: 400; font-size: 13px; }
 .ep { background: var(--card); border: 1px solid #22222e; border-radius: 12px; margin: 8px 0; }
 .ep-head { padding: 12px 14px; font-weight: 700; cursor: pointer; display: flex; justify-content: space-between; }
 .ep-body { padding: 0 14px 12px; }

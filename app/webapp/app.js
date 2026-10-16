@@ -72,15 +72,59 @@
     } catch (e) { view.innerHTML = `<div class="empty">Couldn't load. <button class="btn ghost" onclick="location.reload()">Retry</button></div>`; }
   }
 
-  async function browse(kind) {
-    setTab(kind === "movie" ? "movies" : "series"); skeletons(6);
+  const SORTS = [["recent", "🆕 Recent"], ["az", "🔤 A–Z"],
+                 ["rating", "⭐ Top rated"], ["year", "📅 Newest"]];
+  let browseState = {kind: "", sort: "recent", page: 1, hasMore: false, loading: false};
+
+  async function browse(kind, resetSort) {
+    setTab(kind === "movie" ? "movies" : "series");
+    if (resetSort || browseState.kind !== kind)
+      browseState = {kind, sort: resetSort || browseState.sort, page: 1, hasMore: false, loading: false};
+    const st = browseState;
+    skeletons(6);
     try {
-      const d = await api(`/api/recent?kind=${kind}&limit=30`);
-      view.innerHTML = d.results.length
-        ? `<div class="grid">${d.results.map(card).join("")}</div>`
-        : `<div class="empty">No ${kind === "movie" ? "movies" : "series"} yet.</div>`;
-      bindCards();
+      const d = await api(`/api/browse?kind=${kind}&sort=${st.sort}&page=1&per=30`);
+      st.page = 2; st.hasMore = d.has_more;
+      renderBrowse(d);
     } catch (e) { view.innerHTML = `<div class="empty">Couldn't load.</div>`; }
+  }
+
+  function renderBrowse(d) {
+    const st = browseState;
+    const label = st.kind === "movie" ? "Movies" : "Series";
+    if (!d.results.length && st.page === 2) {
+      view.innerHTML = `<div class="empty">No ${label.toLowerCase()} yet.</div>`;
+      return;
+    }
+    let h = `<div class="section-title">${label} <span class="count">${d.total}</span></div>`;
+    h += `<div class="sortbar">` + SORTS.map(([k, l]) =>
+      `<button data-sort="${k}" class="${st.sort === k ? "active" : ""}">${l}</button>`).join("") + `</div>`;
+    h += `<div class="grid" id="bgrid">${d.results.map(card).join("")}</div>`;
+    if (d.has_more) h += `<div class="more-wrap"><button class="btn ghost" id="more">Load more</button></div>`;
+    view.innerHTML = h;
+    bindCards();
+    view.querySelectorAll("[data-sort]").forEach((b) =>
+      b.addEventListener("click", () => {
+        if (b.dataset.sort !== browseState.sort) browse(browseState.kind, b.dataset.sort);
+      }));
+    const more = document.getElementById("more");
+    if (more) more.addEventListener("click", loadMore);
+  }
+
+  async function loadMore() {
+    const st = browseState;
+    if (st.loading || !st.hasMore) return;
+    st.loading = true;
+    const btn = document.getElementById("more");
+    if (btn) btn.textContent = "Loading…";
+    try {
+      const d = await api(`/api/browse?kind=${st.kind}&sort=${st.sort}&page=${st.page}&per=30`);
+      st.page += 1; st.hasMore = d.has_more;
+      document.getElementById("bgrid").insertAdjacentHTML("beforeend", d.results.map(card).join(""));
+      bindCards();
+      if (btn) { if (st.hasMore) btn.textContent = "Load more"; else btn.remove(); }
+    } catch (e) { if (btn) btn.textContent = "Retry"; }
+    st.loading = false;
   }
 
   let searchTimer = null;

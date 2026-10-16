@@ -120,6 +120,29 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
             tuple(([kind] if kind in ("movie", "series") else []) + [limit]))
         return {"results": [_title_card(t) for t in rows]}
 
+    @app.get("/api/browse")
+    async def browse(kind: str = "", sort: str = "recent",
+                     page: int = 1, per: int = 30):
+        """Paginated full catalog for the Movies/Series tabs."""
+        sorts = {
+            "recent": "last_file_at DESC",
+            "az": "title COLLATE NOCASE ASC",
+            "rating": "rating DESC NULLS LAST, popularity DESC NULLS LAST",
+            "year": "year DESC NULLS LAST, title COLLATE NOCASE ASC",
+        }
+        order = sorts.get(sort, sorts["recent"])
+        per = min(max(per, 1), 60)
+        page = max(page, 1)
+        where = "WHERE kind=? " if kind in ("movie", "series") else ""
+        params: list = [kind] if kind in ("movie", "series") else []
+        total = db.query_one(f"SELECT COUNT(*) c FROM titles {where}",
+                             tuple(params))["c"]
+        rows = db.query(
+            f"SELECT * FROM titles {where}ORDER BY {order} LIMIT ? OFFSET ?",
+            tuple(params + [per, (page - 1) * per]))
+        return {"results": [_title_card(t) for t in rows], "page": page,
+                "per": per, "total": total, "has_more": page * per < total}
+
     @app.get("/api/title/{title_id}")
     async def title_detail(title_id: int):
         t = db.query_one("SELECT * FROM titles WHERE id=?", (title_id,))

@@ -107,13 +107,27 @@ class TMDB:
 
     async def match(self, p: ParsedName) -> dict | None:
         """Return a normalized metadata dict or None when no confident match."""
+        # try the full title, then progressively drop trailing junk words
+        # ("The Crown Willsmania" -> "The Crown")
+        words = p.title.split()
+        queries = [" ".join(words)]
+        for drop in (1, 2):
+            if len(words) - drop >= 2:
+                queries.append(" ".join(words[:-drop]))
+        for q in dict.fromkeys(queries):
+            meta = await self._match_query(q, p)
+            if meta:
+                return meta
+        return None
+
+    async def _match_query(self, query: str, p: ParsedName) -> dict | None:
         kind = "movie" if p.kind == "movie" else "tv"
         data = await self._get(
-            f"/search/{kind}", {"query": p.title, **({"year": p.year} if p.year else {})}
+            f"/search/{kind}", {"query": query, **({"year": p.year} if p.year else {})}
         )
         if not data or not data.get("results"):
             return None
-        want = normalize_title(p.title)
+        want = normalize_title(query)
         best, best_s = None, 0.0
         for item in data["results"][:10]:
             cand = item.get("title") or item.get("name") or ""

@@ -50,6 +50,7 @@ CAM_PATTERNS = [
 ]
 # S01E02, S1E2, s01e02
 SE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
+SE_SPACED_RE = re.compile(r"\b[Ss](\d{1,2})\s+[Ee](\d{1,3})\b")
 # season-pack markers: "S01 COMBINED", "Season 1 Complete", "[E01-04]"
 PACK_RE = re.compile(r"\b(COMBINED|COMPLETE)\b", re.I)
 PACK_RANGE_RE = re.compile(r"[\(\[\{]\s*[Ee](\d{1,3})\s*[-–_\s]\s*(?:[Ee])?(\d{1,3})\s*[\)\]\}]")
@@ -187,7 +188,8 @@ def parse_filename(raw: str) -> ParsedName:
 
     # series markers (checked before year so S01E02 isn't mangled)
     if not p.is_pack:
-        m = SE_RE.search(name) or X_RE.search(name) or SEASON_EP_WORDS_RE.search(name)
+        m = (SE_RE.search(name) or SE_SPACED_RE.search(name) or X_RE.search(name)
+             or SEASON_EP_WORDS_RE.search(name))
         if m:
             p.kind = "series"
             p.season = int(m.group(1))
@@ -226,23 +228,26 @@ def parse_filename(raw: str) -> ParsedName:
     name = TAG_STRIP_RE.sub(" ", name)
     name = HEX_RE.sub(" ", name)
     name = HASHY_RE.sub(" ", name)
-    if p.year:
-        # a year was found: trailing bare numbers are usually junk
-        # ("Film 1992 ... 247"), but a single 1-9 can be the sequel number
-        # ("Meatballs 2") and a leading number the title ("21 Jump Street")
-        m = re.search(r"((?:\s*\b\d{1,4}\b)+)\s*$", name)
-        if m:
-            toks = m.group(1).split()
-            if any(len(t) >= 2 or t == "0" or len(toks) > 1 for t in toks):
-                name = name[: m.start()].strip()
     # trailing site-tag separator junk: "The Furious ... MoviesMod.At"
     # (a leading "At" can be legit: "At Close Range" — only strip trailing)
     name = re.sub(r"\s+\b[Aa][Tt]\b\s*$", " ", name)
     # truncated tag letter: "... 10bit N" (was "NF")
     name = re.sub(r"\s+[A-Z]\s*$", " ", name)
-    name = re.sub(r"\b(Season|Episode|Ep|Dual|Audio|Hindi|English|Engli|Eng|"
+    name = re.sub(r"\b(Season|Series|Episode|Ep|Dual|Audio|Hindi|English|Engli|Eng|"
                 r"Tam|Tel|Mal|Kan|Multi|ESub)\b", " ", name, flags=re.I)
+    # site suffix: "MoviesMod Com" (was ".com")
+    name = re.sub(r"\s+\bCom\b\s*$", " ", name, flags=re.I)
     name = RELEASE_GROUPS.sub("", name)
+    if p.year:
+        # a year was found: trailing bare numbers are usually junk
+        # ("Film 1992 ... 247", "Stranger Things ... 04"), but a single 1-9
+        # can be the sequel number ("Meatballs 2") and a leading number the
+        # title ("21 Jump Street")
+        m = re.search(r"((?:\s*\b\d{1,4}\b)+)\s*$", name)
+        if m:
+            toks = m.group(1).split()
+            if any(len(t) >= 2 or t == "0" or len(toks) > 1 for t in toks):
+                name = name[: m.start()].strip()
     name = re.sub(r"\s+", " ", name).strip(" -")
 
     p.title = name.strip().title() if name.strip() else _strip_ext(raw).strip()

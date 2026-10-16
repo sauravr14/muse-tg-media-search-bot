@@ -39,7 +39,7 @@ SOURCE_PATTERNS = [
 SE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
 # season-pack markers: "S01 COMBINED", "Season 1 Complete", "[E01-04]"
 PACK_RE = re.compile(r"\b(COMBINED|COMPLETE)\b", re.I)
-PACK_RANGE_RE = re.compile(r"[\(\[]\s*[Ee](\d{1,3})\s*[-–]\s*(?:[Ee])?(\d{1,3})\s*[\)\]]")
+PACK_RANGE_RE = re.compile(r"[\(\[\{]\s*[Ee](\d{1,3})\s*[-–_\s]\s*(?:[Ee])?(\d{1,3})\s*[\)\]\}]")
 SEASON_NUM_RE = re.compile(r"\b[Ss](\d{1,2})\b")
 SEASON_WORD_RE = re.compile(r"\b[Ss]eason\s+(\d{1,2})\b", re.I)
 
@@ -90,6 +90,8 @@ TAG_STRIP_RE = re.compile(
     r"NF|AMZN|DSNP|HULU|ATVP|HBO|PCOK|CRIT|"
     r"\bHQ\b|\bHD\b|"
     r"HEVX|JHS|"
+    r"\b\d+\s*CH\b|"
+    r"\bPSAOyeSale\b|\bHarsh\b|\bPSA\b|"
     r"AAC|AC3|EAC3|DTS(?:-HD)?|DDP?\s*2\s*0|DDP?\s*5\s*1|\b5\s*1\b|\b2\s*0\b|ATMOS|TRUEHD|"
     r"H\s*26[45]\b|"
     r"ESUBS?|SUBS|SUBBED|DUBBED|DUAL|MULTI|"
@@ -191,8 +193,9 @@ def parse_filename(raw: str) -> ParsedName:
             p.episode = int(m.group(1))
             name = name[: m.start()] + " " + name[m.end():]
 
-    # drop anything in brackets/parens (release info, not title)
+    # drop anything in brackets/parens/braces (release info, not title)
     name = re.sub(r"[\(\[].*?[\)\]]", " ", name)
+    name = re.sub(r"\{.*?\}", " ", name)
     # also a trailing unclosed bracket: "Title Hq [Tam Tel"
     name = re.sub(r"\s*[\(\[][^\)\]]*$", " ", name)
     # leading site database ids: "1354295 Outlander 2008"
@@ -215,6 +218,8 @@ def parse_filename(raw: str) -> ParsedName:
     # trailing site-tag separator junk: "The Furious ... MoviesMod.At"
     # (a leading "At" can be legit: "At Close Range" — only strip trailing)
     name = re.sub(r"\s+\b[Aa][Tt]\b\s*$", " ", name)
+    # truncated tag letter: "... 10bit N" (was "NF")
+    name = re.sub(r"\s+[A-Z]\s*$", " ", name)
     name = re.sub(r"\b(Season|Episode|Ep|Dual|Audio|Hindi|English|Engli|Eng|"
                 r"Tam|Tel|Mal|Kan|Multi|ESub)\b", " ", name, flags=re.I)
     name = RELEASE_GROUPS.sub("", name)

@@ -153,6 +153,27 @@ class ParserTest(unittest.TestCase):
         p = parse_filename("At Close Range 1986 1080p.mkv")
         self.assertEqual(p.title, "At Close Range")
 
+    def test_curly_brace_pack_range(self):
+        p = parse_filename("13_Reasons_Why_2017_S01_{E01_06}_Combined_720p_10bit_NF_WEBRip_HEVC.mkv")
+        self.assertEqual(p.title, "13 Reasons Why")
+        self.assertTrue(p.is_pack)
+        self.assertEqual(p.pack_label, "E01\u2013E06")
+        self.assertEqual(p.season, 1)
+
+    def test_curly_brace_pack_range_dash(self):
+        p = parse_filename("13 Reasons Why (2017) S02 {E01-06} Combined 720p 10bit N.mkv")
+        self.assertEqual(p.title, "13 Reasons Why")
+        self.assertEqual(p.pack_label, "E01\u2013E06")
+
+    def test_audio_channel_stripped(self):
+        p = parse_filename("12_Monkeys_S01_COMBiNED_720p_WEB_DL_2CH_x265_HEVC_PSAOyeSale.mkv")
+        self.assertEqual(p.title, "12 Monkeys")
+        self.assertTrue(p.is_pack)
+
+    def test_release_group_suffix_stripped(self):
+        p = parse_filename("12_Monkeys_S02_COMBiNED_720p_WEB_DL_2CH_x265_HEVC_ESub_Harsh.mkv")
+        self.assertEqual(p.title, "12 Monkeys")
+
 if __name__ == "__main__":
     unittest.main()
 

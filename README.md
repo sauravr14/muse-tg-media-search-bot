@@ -52,7 +52,11 @@ Never commit real values — `.env` is git-ignored.
 
 **Everyone:** `/start` (+ Mini App button), `/search <name>`, `/recent`, `/movies`, `/series`, `/help`, `/id` — or just type a name.
 
-**Admins:** `/addchannel <id|@username|invite-link>`, `/rmchannel <id>`, `/channels`, `/index`, `/reparse`, `/stats`. Forward any channel post to the bot and it asks **"Index this channel? [Yes/No]"** to start a scan.
+**Admins:** `/addchannel <id|@username|invite-link>`, `/rmchannel <id>`, `/channels`, `/index`, `/reparse`, `/setskip`, `/stats`. Forward any channel post to the bot and it asks **"Index this channel? [Yes/No]"** to start a scan.
+
+`/setskip` controls how many messages are skipped at the start of a scan: `/setskip` shows current values, `/setskip <number>` sets it for all sources, `/setskip <channel_id> <number>` for one channel.
+
+Files you receive self-destruct: every delivered file is followed by a warning ("⏳ The file will be deleted in 10 minutes. Forward the files to your saved messages.") and the bot deletes the file 10 minutes later. Pending deletions survive restarts.
 
 ## Mini App on Vercel (HTTPS for Telegram)
 

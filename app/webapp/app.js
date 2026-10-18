@@ -36,11 +36,18 @@
   function skeletons(n) {
     view.innerHTML = `<div class="grid">${'<div class="skel" style="aspect-ratio:2/3"></div>'.repeat(n || 6)}</div>`;
   }
-  const api = async (path) => {
+  const api = async (path, ms) => {
     const sep = path.includes("?") ? "&" : "?";
-    const r = await fetch(path + (camOn ? sep + "hide_cam=1" : ""));
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    return r.json();
+    // hard timeout: a hung request must fail fast instead of leaving
+    // skeleton cards on screen forever
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), ms || 20000);
+    try {
+      const r = await fetch(path + (camOn ? sep + "hide_cam=1" : ""),
+                            {signal: ctl.signal});
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    } finally { clearTimeout(t); }
   };
 
   // theatre-print filter: hides HDCAM/CAM/HDTS/PreDVD etc. app-wide
@@ -226,15 +233,33 @@
   function bindGet() {
     view.querySelectorAll("[data-file]").forEach((b) =>
       b.addEventListener("click", async () => {
+        if (b.disabled) return;
         b.disabled = true;
+        const old = b.textContent; b.textContent = "Sending…";
         try {
-          const d = await api("/api/deeplink/file/" + b.dataset.file);
-          if (tg) {
-            tg.openTelegramLink(d.url);
-            // hand the user to the bot chat where the file lands
-            setTimeout(() => { try { tg.close(); } catch (e) {} }, 1200);
-          } else location.href = d.url;
-        } catch (e) { toast("Couldn't prepare the file link."); b.disabled = false; }
+          // ask the backend to deliver straight to the user's DM —
+          // no fragile deep-link hop, works every tap
+          const ctl = new AbortController();
+          const t = setTimeout(() => ctl.abort(), 30000);
+          const r = await fetch("/api/getfile", {
+            method: "POST",
+            headers: {"Content-Type": "application/json",
+                      "x-telegram-init-data": tg ? tg.initData : ""},
+            body: JSON.stringify({file_id: +b.dataset.file}),
+            signal: ctl.signal,
+          }).finally(() => clearTimeout(t));
+          if (!r.ok) {
+            const msg = await r.text();
+            throw new Error(msg.includes("not_started")
+              ? "not_started" : msg);
+          }
+          toast("📩 File sent to your chat!");
+        } catch (e) {
+          toast(e.message === "not_started"
+            ? "Open the bot chat and press START first, then tap Get again."
+            : "Couldn't send the file. Try again.");
+        }
+        b.disabled = false; b.textContent = old;
       }));
   }
 

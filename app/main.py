@@ -46,7 +46,7 @@ async def amain() -> None:
     bot.indexer = indexer
 
     await bot.start()
-    app = create_app(cfg, db, bot_username=bot.username)
+    app = create_app(cfg, db, bot_username=bot.username, bot=bot)
 
     server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=cfg.port,
                                            log_level="warning"))

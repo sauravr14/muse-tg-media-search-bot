@@ -150,13 +150,16 @@ class Indexer:
                         continue
                     # one DB transaction per batch: ~7 commits/file -> 1 commit/batch
                     with self.db.transaction():
-                        for msg in msgs:
+                        for i, msg in enumerate(msgs):
                             done += 1
                             if msg is None or getattr(msg, "empty", False):
                                 continue
                             r = await self.ingest_message(msg)
                             if r and not r.get("duplicate"):
                                 new += 1
+                            # let the bot/API breathe between files
+                            if i % 25 == 24:
+                                await asyncio.sleep(0)
                         self.db.set_source(chat_id, last_msg_id=min(cur - 1, hi))
                     cur += BATCH
                     await asyncio.sleep(0.4)

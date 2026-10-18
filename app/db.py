@@ -120,6 +120,8 @@ CREATE TABLE IF NOT EXISTS files (
     UNIQUE(tg_chat_id, tg_msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_files_title ON files(title_id);
+CREATE INDEX IF NOT EXISTS idx_files_title_ep ON files(title_id, episode_id);
+CREATE INDEX IF NOT EXISTS idx_files_title_season ON files(title_id, season_id);
 CREATE INDEX IF NOT EXISTS idx_files_episode ON files(episode_id);
 CREATE INDEX IF NOT EXISTS idx_files_recent ON files(indexed_at DESC);
 

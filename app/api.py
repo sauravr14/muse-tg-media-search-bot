@@ -48,9 +48,16 @@ class RateLimiter:
     def __init__(self, per_min: int = 60):
         self.per_min = per_min
         self._hits: dict[str, list[float]] = {}
+        self._prune_at = 0.0
 
     def check(self, ip: str) -> bool:
         now = time.time()
+        # periodically drop IPs whose hits all expired (unbounded dict = memory leak)
+        if now >= self._prune_at:
+            self._prune_at = now + 300
+            self._hits = {k: [t for t in v if now - t < 60]
+                          for k, v in self._hits.items()}
+            self._hits = {k: v for k, v in self._hits.items() if v}
         hits = [t for t in self._hits.get(ip, []) if now - t < 60]
         if len(hits) >= self.per_min:
             return False

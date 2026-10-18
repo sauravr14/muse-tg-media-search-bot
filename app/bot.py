@@ -209,8 +209,11 @@ class MediaBot:
                 "/search <name> — search the catalog\n"
                 "/recent — recently added\n"
                 "/movies · /series — browse\n\n"
+                "Admin: /addchannel · /rmchannel · /channels · /index · "
+                "/reparse · /setskip · /stats\n\n"
                 "Results group all qualities (480p/720p/1080p) under one title. "
-                "Tap a quality button to get the file.",
+                "Tap a quality button to get the file — it self-destructs in 10 minutes, "
+                "so forward it to your saved messages.",
                 parse_mode=ParseMode.HTML)
 
         @c.on_message(filters.private & filters.command("search"))
@@ -229,8 +232,8 @@ class MediaBot:
                 await m.reply_text("Nothing indexed yet.")
                 return
             await m.reply_text("<b>🆕 Recently added</b>", parse_mode=ParseMode.HTML)
-            for t in rows:
-                await self._send_title_card(m.chat.id, t, with_versions=False)
+            await asyncio.gather(
+                *[self._send_title_card(m.chat.id, t, with_versions=False) for t in rows])
 
         @c.on_message(filters.private & filters.command(["movies", "series"]))
         async def browse(_, m: Message):
@@ -382,6 +385,56 @@ class MediaBot:
                                "I'll report here when it's done.")
             asyncio.create_task(self._reparse_report(m.chat.id))
 
+        @c.on_message(filters.private & filters.command("setskip") & filters.user(admin_ids))
+        async def setskip(_, m: Message):
+            """Skip the first N messages of a channel when scanning.
+
+            /setskip                  — show current values
+            /setskip <number>         — set for all sources
+            /setskip <channel_id> <number> — set for one source
+            Applies to fresh scans (before last_msg_id passes the skip point).
+            """
+            args = m.text.split()[1:]
+            if not args:
+                rows = self.db.list_sources()
+                if not rows:
+                    await m.reply_text("No sources configured.")
+                    return
+                lines = ["<b>⏭ Skip settings</b> (messages skipped at scan start)"]
+                for s in rows:
+                    lines.append(f"• <code>{s['chat_id']}</code> "
+                                 f"{html.escape(s['title'] or '')} — "
+                                 f"<b>{s['skip_first'] or 0}</b>")
+                await m.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+                return
+            if len(args) == 1:
+                try:
+                    n = int(args[0])
+                except ValueError:
+                    await m.reply_text("Usage: /setskip <number> "
+                                       "or /setskip <channel_id> <number>")
+                    return
+                if n < 0:
+                    await m.reply_text("Number must be 0 or more.")
+                    return
+                self.db.execute("UPDATE sources SET skip_first=?", (n,))
+                await m.reply_text(f"✅ Skip set to <b>{n}</b> for all sources.",
+                                   parse_mode=ParseMode.HTML)
+                return
+            try:
+                cid, n = int(args[0]), int(args[1])
+            except ValueError:
+                await m.reply_text("Usage: /setskip <number> "
+                                   "or /setskip <channel_id> <number>")
+                return
+            if n < 0:
+                await m.reply_text("Number must be 0 or more.")
+                return
+            self.db.execute("UPDATE sources SET skip_first=? WHERE chat_id=?",
+                            (n, cid))
+            await m.reply_text(f"✅ Skip set to <b>{n}</b> for <code>{cid}</code>.",
+                               parse_mode=ParseMode.HTML)
+
         @c.on_message(filters.private & filters.command("stats") & filters.user(admin_ids))
         async def stats(_, m: Message):
             s = self.db.stats()
@@ -404,8 +457,8 @@ class MediaBot:
                 chat_id, f"No results for <b>{html.escape(q)}</b>.\nTry another spelling.",
                 parse_mode=ParseMode.HTML)
             return
-        for t in rows:
-            await self._send_title_card(chat_id, t)
+        # send cards concurrently instead of one round-trip at a time
+        await asyncio.gather(*[self._send_title_card(chat_id, t) for t in rows])
 
     async def _show_seasons(self, q: CallbackQuery, title_id: int):
         t = self.db.query_one("SELECT * FROM titles WHERE id=?", (title_id,))
@@ -484,12 +537,41 @@ class MediaBot:
             caption = f"🎬 <b>{html.escape(f['file_name'])}</b>"
             if f["resolution"]:
                 caption += f" · {f['resolution']}"
-            await msg.copy(chat_id, caption=caption, parse_mode=ParseMode.HTML)
+            sent = await msg.copy(chat_id, caption=caption, parse_mode=ParseMode.HTML)
+            warn = await self.client.send_message(
+                chat_id,
+                "⏳ The file will be deleted in 10 minutes. "
+                "Forward the files to your saved messages.")
+            self._schedule_delete(chat_id, [sent.id, warn.id], delay=600)
         except Exception as e:
             log.warning("deliver failed: %r", e)
             await self.client.send_message(
                 chat_id, "Couldn't fetch that file — the bot may not be admin "
                          "in the source channel.")
+
+    # -- self-destructing deliveries -----------------------------------------
+    def _schedule_delete(self, chat_id: int, msg_ids: list[int], delay: float):
+        """Delete messages after `delay` seconds. Survives restarts via DB."""
+        delete_at = time.time() + delay
+        for mid in msg_ids:
+            self.db.add_pending_delete(chat_id, mid, delete_at)
+        asyncio.create_task(self._auto_delete(chat_id, msg_ids, delay))
+
+    async def _auto_delete(self, chat_id: int, msg_ids: list[int], delay: float):
+        await asyncio.sleep(delay)
+        try:
+            await self.client.delete_messages(chat_id, msg_ids)
+        except Exception as e:
+            log.warning("auto-delete failed: %r", e)
+        for mid in msg_ids:
+            self.db.remove_pending_delete(chat_id, mid)
+
+    async def _recover_pending_deletes(self):
+        """Re-schedule deletions that were pending when the bot restarted."""
+        for row in self.db.list_pending_deletes():
+            delay = max(0.0, row["delete_at"] - time.time())
+            asyncio.create_task(
+                self._auto_delete(row["chat_id"], [row["msg_id"]], delay))
 
     async def _prompt_index(self, notify_chat: int, chat_id, top_id: int, title: str):
         """Access-test the channel, then ask the admin to confirm indexing."""
@@ -588,6 +670,7 @@ class MediaBot:
         self.username = me.username or ""
         log.info("bot @%s started", self.username)
         await self._set_menu_button()
+        asyncio.create_task(self._recover_pending_deletes())
 
     async def stop(self):
         try:

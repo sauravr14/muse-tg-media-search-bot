@@ -82,7 +82,7 @@ def _title_card(t) -> dict:
             "genres": _uj(t["genres"], []), "overview": (t["overview"] or "")[:220]}
 
 
-def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
+def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI:
     app = FastAPI(title="Media Library API")
     limiter = RateLimiter()
 
@@ -129,9 +129,33 @@ def create_app(cfg: Config, db: DB, bot_username: str = "") -> FastAPI:
         rows = db.query(
             "SELECT * FROM titles" + where
             + (CLEAN_ONLY if hide_cam else "")
-            + " ORDER BY last_file_at DESC LIMIT ?",
+            # titles with posters first — keeps Recently Added looking clean
+            + " ORDER BY (poster != '') DESC, last_file_at DESC LIMIT ?",
             tuple(([kind] if kind in ("movie", "series") else []) + [limit]))
         return {"results": [_title_card(t) for t in rows]}
+
+    @app.post("/api/getfile")
+    async def getfile(request: Request):
+        """Mini App Get button: bot delivers the file straight to the user's DM.
+
+        Needs a valid Telegram WebApp initData (proves the Telegram user id).
+        No deep-link round-trip, so it can't silently fail like ?start= links.
+        """
+        if bot is None:
+            raise HTTPException(503, "bot not ready")
+        init_data = request.headers.get("x-telegram-init-data", "")
+        data = validate_init_data(init_data, cfg.bot_token) if init_data else None
+        user_id = (data or {}).get("user_id")
+        if not user_id:
+            raise HTTPException(401, "open this app from Telegram")
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "bad request")
+        ok, msg = await bot.deliver_to_user(int(user_id), body.get("file_id"))
+        if not ok:
+            raise HTTPException(400, msg)
+        return {"ok": True}
 
     @app.get("/api/browse")
     async def browse(kind: str = "", sort: str = "recent",

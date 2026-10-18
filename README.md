@@ -9,11 +9,11 @@ web UI that opens inside Telegram.
 ## Features
 
 - **Channel indexing** — historical backfill (resumable, idempotent) + live indexing of new posts. Bot-token only, no user session needed.
-- **Smart grouping** — `Inception.2010.480p/720p/1080p` → one movie card; `Breaking.Bad.S01E01/E02` → one series → seasons → episodes → qualities.
+- **Smart title cleanup** — the filename parser strips release tags, codecs, site names, audio tags, hashes/UUIDs and malformed brackets (`The Pianist 2002 REMASTERED 720p 10Bit BluRay NF Engli` → `The Pianist` 2002). Titles only accepted after a TMDB score check, so junk never pollutes the catalog. An **OpenRouter LLM fallback** handles the titles the parser can't: only TMDB-rejected titles go to the LLM, every guess is re-validated against TMDB, and guesses are cached by filename hash so you never pay twice. Needs `OPENROUTER_API_KEY`; model via `LLM_MODEL` (default `liquid/lfm-2.5-2.6b:free`, which works on OpenRouter's free tier — set `openai/gpt-4o-mini` if you have paid credits).
 - **TMDB metadata** — posters, backdrops, overview, genres, ratings, episode titles. Cached server-side; API key never reaches the frontend.
 - **Bot search** — plain text = search; results with posters; tap a quality to get the file copied into your chat; series browser (seasons → episodes → qualities); deep links (`t.me/<bot>?start=file_<id>`).
-- **Mini App** — dark-first responsive SPA: search with debounce, recently-added grids, movie/series detail pages, season tabs. Opens inside Telegram.
-- **Admin** — bot commands (`/addchannel`, `/index`, `/stats`, …) + a protected `/app/admin.html` page (retitle, hide files, review unmatched).
+- **Mini App** — dark-first responsive SPA: search with debounce, recently-added grids, full-catalog **Browse** (Movies/Series tabs, 30/page + Load more, 4 sort orders: Recent, A–Z, Top rated, Year), movie/series detail pages with season tabs, quality grouping and season packs. **Clean-prints toggle** (🎭 All prints → glowing ✨ Clean only, top-right + ⓘ info popup, choice remembered in localStorage) hides theatre prints — HDCAM, CAM, CAMRIP, HDTS, TS, TELESYNC, TSRIP, PreDVD, HDTC, TC — across home, search, browse and detail pages (`hide_cam=1` on the API). Opens inside Telegram; the **Get** button opens the bot deep link and closes the Mini App so the file lands in chat.
+- **Admin** — bot commands (`/addchannel`, `/index`, `/stats`, `/reparse`, …) + a protected `/app/admin.html` page (retitle, hide files, review unmatched).
 - **Single container** — bot + API in one process; SQLite (WAL) so there is nothing else to run. Runs on a low-memory VPS, Koyeb, or Render.
 
 ## Quick start (VPS with Docker)
@@ -40,6 +40,8 @@ Set `MINI_APP_URL` to the public URL of `/app/` (e.g. `https://media.example.com
 | `API_ID` / `API_HASH` | yes | From [my.telegram.org](https://my.telegram.org) → API development tools (required for MTProto auth, even with a bot token) |
 | `ADMIN_USER_IDS` | yes | Comma-separated Telegram user ids (bot admin commands + web admin) |
 | `TMDB_API_KEY` | no | From [themoviedb.org](https://www.themoviedb.org/settings/api) — without it, posters are placeholders |
+| `OPENROUTER_API_KEY` | no | For the AI title-cleanup fallback — omit to run parser + TMDB only |
+| `LLM_MODEL` | no | Default `liquid/lfm-2.5-2.6b:free` (works on OpenRouter's free tier); use `openai/gpt-4o-mini` with paid credits |
 | `MINI_APP_URL` | yes | Public URL of the Mini App, ending in `/app/` |
 | `DATABASE_PATH` | no | Default `/app/data/catalog.db` in Docker |
 | `PORT` | no | Default `8000` |
@@ -48,9 +50,9 @@ Never commit real values — `.env` is git-ignored.
 
 ## Bot commands
 
-**Everyone:** `/start` (+ Mini App button), `/search <name>`, `/recent`, `/movies`, `/series`, `/help` — or just type a name.
+**Everyone:** `/start` (+ Mini App button), `/search <name>`, `/recent`, `/movies`, `/series`, `/help`, `/id` — or just type a name.
 
-**Admins:** `/addchannel <id|@username>`, `/rmchannel <id>`, `/channels`, `/index`, `/stats`.
+**Admins:** `/addchannel <id|@username|invite-link>`, `/rmchannel <id>`, `/channels`, `/index`, `/reparse`, `/stats`. Forward any channel post to the bot and it asks **"Index this channel? [Yes/No]"** to start a scan.
 
 ## Mini App on Vercel (HTTPS for Telegram)
 
@@ -80,8 +82,9 @@ app/
   bot.py       # bot commands, search cards, callbacks, file delivery (msg.copy)
   indexer.py   # historical backfill (checkpointed) + live channel handler + TMDB enricher
   classify.py  # files -> canonical titles / seasons / episodes
-  parser.py    # filename -> title/year/resolution/SxxEyy/codec
+  parser.py    # filename -> title/year/resolution/SxxEyy/codec, cam-print detection
   tmdb.py      # TMDB client, cached in DB, failures never break indexing
+  llm.py       # OpenRouter title-cleanup fallback (free-tier friendly), guesses cached + TMDB-validated
   api.py       # FastAPI: /api/*, WebApp initData validation, admin API
   db.py        # SQLite schema (titles, seasons, episodes, files, sources, tmdb_cache) + FTS5
   webapp/      # Mini App SPA (index.html, app.js, styles.css) + admin.html

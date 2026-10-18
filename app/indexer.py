@@ -127,6 +127,10 @@ class Indexer:
                 self.note_seen(chat_id, top_id)
             hi = top_id or self.max_seen(chat_id)
             lo = (src["last_msg_id"] or 0) + 1
+            # /setskip: ignore the first N messages of a channel on fresh scans
+            skip = src["skip_first"] or 0
+            if skip:
+                lo = max(lo, skip + 1)
             if hi < lo:
                 return {"scanned": 0, "new": 0, "note": "nothing new to scan"}
             self.db.set_source(chat_id, status="scanning", error="")
@@ -144,15 +148,17 @@ class Indexer:
                     except FloodWait as e:
                         await asyncio.sleep(e.value + 1)
                         continue
-                    for msg in msgs:
-                        done += 1
-                        if msg is None or getattr(msg, "empty", False):
-                            continue
-                        r = await self.ingest_message(msg)
-                        if r and not r.get("duplicate"):
-                            new += 1
+                    # one DB transaction per batch: ~7 commits/file -> 1 commit/batch
+                    with self.db.transaction():
+                        for msg in msgs:
+                            done += 1
+                            if msg is None or getattr(msg, "empty", False):
+                                continue
+                            r = await self.ingest_message(msg)
+                            if r and not r.get("duplicate"):
+                                new += 1
+                        self.db.set_source(chat_id, last_msg_id=min(cur - 1, hi))
                     cur += BATCH
-                    self.db.set_source(chat_id, last_msg_id=min(cur - 1, hi))
                     await asyncio.sleep(0.4)
             except Exception as e:
                 log.warning("scan of %s failed: %r", chat_id, e)
@@ -190,7 +196,8 @@ class Indexer:
                         "duration": f["duration"] or 0, "mime": f["mime"] or "",
                         "tg_chat_id": f["tg_chat_id"], "tg_msg_id": f["tg_msg_id"],
                         "caption": f["caption"] or "", "msg_date": f["msg_date"] or 0}
-                res = self.clf.ingest(p, meta)
+                with self.db.transaction():
+                    res = self.clf.ingest(p, meta)
                 n += 1
                 if res.get("duplicate"):
                     continue

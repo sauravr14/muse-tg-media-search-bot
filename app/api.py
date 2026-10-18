@@ -199,26 +199,32 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                 + " ORDER BY " + RES_ORDER + " DESC", (title_id,))
             out["versions"] = [_file_dict(f) for f in files]
         else:
+            cam = " AND is_cam=0" if hide_cam else ""
+            # ONE query for every file of this title, grouped in Python.
+            # (was: 2 queries per episode -> 18s for Game of Thrones)
+            by_ep: dict[int, list] = {}
+            packs_by_season: dict[int, list] = {}
+            for f in db.query(
+                    "SELECT * FROM files WHERE title_id=? AND status='ok'" + cam
+                    + " ORDER BY " + RES_ORDER + " DESC", (title_id,)):
+                if f["episode_id"]:
+                    by_ep.setdefault(f["episode_id"], []).append(f)
+                elif f["season_id"]:
+                    packs_by_season.setdefault(f["season_id"], []).append(f)
             seasons = []
             for se in db.query("SELECT * FROM seasons WHERE title_id=? ORDER BY season_no",
                                (title_id,)):
                 eps = []
                 for e in db.query("SELECT * FROM episodes WHERE season_id=? ORDER BY ep_no",
                                   (se["id"],)):
-                    files = db.query(
-                        "SELECT * FROM files WHERE episode_id=? AND status='ok' "
-                        + (" AND is_cam=0" if hide_cam else "")
-                        + " ORDER BY " + RES_ORDER + " DESC", (e["id"],))
+                    vers = by_ep.get(e["id"], [])
                     eps.append({"ep_no": e["ep_no"], "title": e["ep_title"],
                                 "air_date": e["air_date"], "overview": e["overview"],
-                                "versions": [_file_dict(f) for f in files]})
+                                "versions": [_file_dict(f) for f in vers]})
                 seasons.append({"season_no": se["season_no"], "poster": se["poster"],
                                 "overview": se["overview"], "episodes": eps,
-                                "packs": [_file_dict(f) for f in db.query(
-                                    "SELECT * FROM files WHERE season_id=? "
-                                    "AND episode_id IS NULL AND status='ok' "
-                                    + (" AND is_cam=0" if hide_cam else "")
-                                    + " ORDER BY " + RES_ORDER + " DESC", (se["id"],))]})
+                                "packs": [_file_dict(f)
+                                          for f in packs_by_season.get(se["id"], [])]})
             out["seasons"] = seasons
         return out
 

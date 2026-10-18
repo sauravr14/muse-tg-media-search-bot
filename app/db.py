@@ -5,6 +5,7 @@ through this module; all queries are parameterized.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
@@ -21,6 +22,7 @@ CREATE TABLE IF NOT EXISTS sources (
     username    TEXT NOT NULL DEFAULT '',
     enabled     INTEGER NOT NULL DEFAULT 1,
     last_msg_id INTEGER NOT NULL DEFAULT 0,
+    skip_first  INTEGER NOT NULL DEFAULT 0,
     status      TEXT NOT NULL DEFAULT 'idle',
     error       TEXT NOT NULL DEFAULT '',
     updated_at  REAL NOT NULL DEFAULT 0
@@ -131,6 +133,17 @@ CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- messages the bot must delete after the self-destruct timer expires
+-- (survives restarts: pending rows are re-scheduled on boot)
+CREATE TABLE IF NOT EXISTS pending_deletes (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id   INTEGER NOT NULL,
+    msg_id    INTEGER NOT NULL,
+    delete_at REAL NOT NULL,
+    UNIQUE(chat_id, msg_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_deletes_due ON pending_deletes(delete_at);
 """
 
 
@@ -139,7 +152,7 @@ class DB:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()  # reentrant: transaction() + execute() nest
         self._init()
 
     def _conn(self) -> sqlite3.Connection:
@@ -158,6 +171,10 @@ class DB:
             conn = self._conn()
             conn.executescript(SCHEMA)
             # lightweight migrations for existing DBs
+            src_cols = {r[1] for r in conn.execute("PRAGMA table_info(sources)")}
+            if "skip_first" not in src_cols:
+                conn.execute("ALTER TABLE sources ADD COLUMN skip_first INTEGER "
+                             "NOT NULL DEFAULT 0")
             cols = {r[1] for r in conn.execute("PRAGMA table_info(files)")}
             if "season_id" not in cols:
                 conn.execute("ALTER TABLE files ADD COLUMN season_id INTEGER "
@@ -171,10 +188,36 @@ class DB:
             conn.commit()
 
     # -- generic helpers -------------------------------------------------
+    def _in_tx(self) -> bool:
+        return bool(getattr(self._local, "in_tx", False))
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Batch many writes into a single commit.
+
+        During big scans each file otherwise costs ~7 separate commits;
+        wrapping a batch in one transaction is the single biggest indexing
+        speedup. Nested use is safe (inner blocks join the outer one).
+        """
+        if self._in_tx():
+            yield self._conn()
+            return
+        with self._write_lock:
+            self._local.in_tx = True
+            try:
+                yield self._conn()
+                self._conn().commit()
+            except Exception:
+                self._conn().rollback()
+                raise
+            finally:
+                self._local.in_tx = False
+
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._write_lock:
             cur = self._conn().execute(sql, params)
-            self._conn().commit()
+            if not self._in_tx():
+                self._conn().commit()
             return cur
 
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -216,6 +259,20 @@ class DB:
 
     def remove_source(self, chat_id: int) -> None:
         self.execute("DELETE FROM sources WHERE chat_id=?", (chat_id,))
+
+    # -- self-destructing deliveries --------------------------------------
+    def add_pending_delete(self, chat_id: int, msg_id: int, delete_at: float) -> None:
+        self.execute(
+            "INSERT OR IGNORE INTO pending_deletes(chat_id, msg_id, delete_at)"
+            " VALUES(?,?,?)", (chat_id, msg_id, delete_at))
+
+    def remove_pending_delete(self, chat_id: int, msg_id: int) -> None:
+        self.execute("DELETE FROM pending_deletes WHERE chat_id=? AND msg_id=?",
+                     (chat_id, msg_id))
+
+    def list_pending_deletes(self) -> list[sqlite3.Row]:
+        return self.query("SELECT chat_id, msg_id, delete_at FROM pending_deletes"
+                          " ORDER BY delete_at")
 
     # -- stats ------------------------------------------------------------
     def stats(self) -> dict:

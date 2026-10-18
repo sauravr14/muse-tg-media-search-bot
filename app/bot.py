@@ -227,7 +227,8 @@ class MediaBot:
         @c.on_message(filters.private & filters.command("recent"))
         async def recent(_, m: Message):
             rows = self.db.query(
-                "SELECT * FROM titles ORDER BY last_file_at DESC LIMIT 8")
+                "SELECT * FROM titles ORDER BY (poster != '') DESC, "
+                "last_file_at DESC LIMIT 8")
             if not rows:
                 await m.reply_text("Nothing indexed yet.")
                 return
@@ -520,34 +521,51 @@ class MediaBot:
             pass
         await q.answer()
 
-    async def _deliver_file(self, chat_id: int, file_id: str, user_id: int):
+    async def deliver_to_user(self, user_id: int, file_id) -> tuple[bool, str]:
+        """Copy a catalog file straight into a user's DM.
+
+        Used by the Mini App backend (no deep-link round-trip needed).
+        Returns (ok, message). Fails cleanly if the user never started the bot.
+        """
         try:
             fid = int(file_id)
-        except ValueError:
-            return
+        except (ValueError, TypeError):
+            return False, "bad file id"
         f = self.db.query_one("SELECT * FROM files WHERE id=?", (fid,))
         if not f:
-            await self.client.send_message(chat_id, "File not found.")
-            return
+            return False, "File not found."
         try:
             msg = await self.client.get_messages(f["tg_chat_id"], f["tg_msg_id"])
             if not msg or msg.empty:
-                await self.client.send_message(chat_id, "Source file unavailable.")
-                return
+                return False, "Source file unavailable."
             caption = f"🎬 <b>{html.escape(f['file_name'])}</b>"
             if f["resolution"]:
                 caption += f" · {f['resolution']}"
-            sent = await msg.copy(chat_id, caption=caption, parse_mode=ParseMode.HTML)
+            sent = await msg.copy(user_id, caption=caption, parse_mode=ParseMode.HTML)
             warn = await self.client.send_message(
-                chat_id,
+                user_id,
                 "⏳ The file will be deleted in 10 minutes. "
                 "Forward the files to your saved messages.")
-            self._schedule_delete(chat_id, [sent.id, warn.id], delay=600)
+            self._schedule_delete(user_id, [sent.id, warn.id], delay=600)
+            return True, "sent"
         except Exception as e:
-            log.warning("deliver failed: %r", e)
-            await self.client.send_message(
-                chat_id, "Couldn't fetch that file — the bot may not be admin "
-                         "in the source channel.")
+            log.warning("deliver_to_user failed: %r", e)
+            name = type(e).__name__
+            if name in ("PeerIdInvalid", "UserIsBlocked", "InputUserDeactivated"):
+                return False, "not_started"
+            return False, f"{name}: {e}"[:200]
+
+    async def _deliver_file(self, chat_id: int, file_id: str, user_id: int):
+        ok, msg = await self.deliver_to_user(chat_id, file_id)
+        if not ok:
+            if msg == "not_started":
+                text = ("👋 Press <b>START</b> below first, then tap Get again.")
+            elif msg in ("File not found.", "Source file unavailable."):
+                text = msg
+            else:
+                text = ("Couldn't fetch that file — the bot may not be admin "
+                        "in the source channel.")
+            await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML)
 
     # -- self-destructing deliveries -----------------------------------------
     def _schedule_delete(self, chat_id: int, msg_ids: list[int], delay: float):

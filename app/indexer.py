@@ -124,6 +124,74 @@ class Indexer:
                                "first (required for private channels).")
             return False, f"{name}: {e}"
 
+    async def _msg_exists(self, chat_id: int, mid: int) -> bool:
+        try:
+            m = await asyncio.wait_for(self.client.get_messages(chat_id, mid),
+                                       timeout=GET_TIMEOUT)
+        except Exception:
+            return False
+        return m is not None and not getattr(m, "empty", False)
+
+    async def _batch(self, chat_id: int, ids: list[int]) -> list | None:
+        try:
+            return await asyncio.wait_for(self.client.get_messages(chat_id, ids),
+                                          timeout=GET_TIMEOUT)
+        except Exception:
+            return None
+
+    async def _exists_above(self, chat_id: int, mid: int) -> bool:
+        """Neighbourhood check: did a doubling probe just land in a deletion
+        gap while higher messages still exist?"""
+        msgs = await self._batch(chat_id, list(range(max(1, mid - 50), mid + 51)))
+        return any(m is not None and not getattr(m, "empty", False)
+                   and getattr(m, "id", 0) > mid for m in msgs or [])
+
+    async def probe_top_id(self, chat_id: int) -> int:
+        """Find the highest existing message id in a channel.
+
+        Used for fresh sources that were added via /addchannel without a
+        forwarded post (so no top_id is known). Doubling search for an empty
+        upper bound, binary search to narrow it, then an upward batch scan
+        (tolerates deletion gaps) for the exact top. Returns 0 if the top
+        can't be determined.
+        """
+        if not await self._msg_exists(chat_id, 1):
+            return 0
+        lo, hi = 1, 2
+        while hi < 100_000_000:
+            if await self._msg_exists(chat_id, hi):
+                lo, hi = hi, hi * 2
+            elif await self._exists_above(chat_id, hi):
+                hi *= 2  # hi sits in a deletion gap; keep lo, widen upward
+            else:
+                break
+        # binary search for the rightmost existing id in [lo, hi]
+        # (approximate under deletion gaps — the upward scan corrects it)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if await self._msg_exists(chat_id, mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        # upward batch scan from the candidate; two consecutive all-empty
+        # batches mean we've passed the top
+        top, empty_streak, cur = lo, 0, lo + 1  # lo is known to exist
+        for _ in range(30):
+            msgs = await self._batch(chat_id, list(range(cur, cur + 100)))
+            if msgs is None:
+                break
+            real = [m.id for m in msgs
+                    if m is not None and not getattr(m, "empty", False)]
+            if real:
+                top = max(top, max(real))
+                empty_streak = 0
+            else:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+            cur += 100
+        return top
+
     async def scan_source(self, chat_id: int, top_id: int = 0,
                         progress_cb=None) -> dict:
         """Scan message IDs (checkpoint+1 .. top_id) in batches via GetMessages.
@@ -147,11 +215,21 @@ class Indexer:
             if skip:
                 lo = max(lo, skip + 1)
             if hi < lo:
-                # Up to date as far as we know — clear any stale error so the
-                # supervisor and /channels stop reporting a dead failure.
-                if (src["status"] or "") == "error":
-                    self.db.set_source(chat_id, status="idle", error="")
-                return {"scanned": 0, "new": 0, "note": "nothing new to scan"}
+                # Fresh source with no known top (added via /addchannel, never
+                # forwarded): probe the channel's top message id so the scan
+                # can start without needing a forwarded post.
+                if not top_id and not (src["last_msg_id"] or 0) \
+                        and not self.max_seen(chat_id):
+                    probed = await self.probe_top_id(chat_id)
+                    if probed:
+                        self.note_seen(chat_id, probed)
+                        hi = probed
+                if hi < lo:
+                    # Up to date as far as we know — clear any stale error so the
+                    # supervisor and /channels stop reporting a dead failure.
+                    if (src["status"] or "") == "error":
+                        self.db.set_source(chat_id, status="idle", error="")
+                    return {"scanned": 0, "new": 0, "note": "nothing new to scan"}
             self.db.set_source(chat_id, status="scanning", error="")
             self._heartbeat(chat_id)
             ok, reason = await self.access_test(chat_id)

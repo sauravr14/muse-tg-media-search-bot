@@ -18,6 +18,7 @@ RES_PATTERNS = [
     (re.compile(r"\b4k\b|\bUHD\b", re.I), "2160p"),
     (re.compile(r"\b1080p\b", re.I), "1080p"),
     (re.compile(r"\b720p\b", re.I), "720p"),
+    (re.compile(r"\b540p\b", re.I), "540p"),
     (re.compile(r"\b480p\b", re.I), "480p"),
     (re.compile(r"\b360p\b", re.I), "360p"),
 ]
@@ -33,7 +34,9 @@ SOURCE_PATTERNS = [
     (re.compile(r"HDRip", re.I), "HDRip"),
     (re.compile(r"HDTV", re.I), "HDTV"),
     (re.compile(r"DVDScr|DVDRip", re.I), "DVD"),
-    (re.compile(r"CAM|HDCAM|TS|TeleSync", re.I), "CAM"),
+    # NB: TS needs guards — a bare "TS" alternative eats the TS in "DTS"
+    # ("The Matrix DTS" -> "The Matrix D") and mislabels quality as CAM
+    (re.compile(r"\bCAM\b|\bHDCAM\b|(?<![A-Za-z])TS(?![A-Za-z])|TeleSync", re.I), "CAM"),
 ]
 # theatre prints — flagged, filtered by the "clean prints" toggle
 CAM_PATTERNS = [
@@ -90,9 +93,25 @@ SEASON_EP_WORDS_RE = re.compile(
 # trailing E02 (episode-only, e.g. "Show Name E02 720p")
 EP_ONLY_RE = re.compile(r"[Ee](\d{1,3})\b")
 
+# file sizes are never part of the title ("Vivah (2006) ... 3.2GB ..." ->
+# "Vivah", not "Vivah 3 2Gb"). Applied BEFORE separator flattening so
+# "3.2GB" is still one token.
+SIZE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*[GM]B\b", re.I)
+
 RELEASE_GROUPS = re.compile(
-    r"-(YTS|YIFY|RARBG|ETRG|PSA|GalaxyRG|TGx|ION10|NTb|SPARKS|FGT|HDT|EbP|PAHE|"
-    r"inFaMoUs|DEFLATE|MEMENTO|W4NK3R|SMB|T0M|CtrlHD|TERMiNAL|EPSiLON)$",
+    r"\b(YTS|YIFY|RARBG|ETRG|PSA|GalaxyRG|TGx|ION10|NTb|SPARKS|FGT|HDT|EbP|PAHE|"
+    r"inFaMoUs|DEFLATE|MEMENTO|W4NK3R|SMB|T0M|CtrlHD|TERMiNAL|EPSiLON|"
+    r"PRiEST|PMI?|IBUDDHU|LOKiHD)\s*$",
+    re.I,
+)
+# site watermarks that cling to the end of filenames ("... ESub mkvCinemas",
+# "... Bluray - Bhaiyajihub"). Only stripped as trailing tokens, so a real
+# word elsewhere in a title is never eaten.
+SITE_NAMES = re.compile(
+    r"\s+\b(mkvCinemas|Bhaiyajihub|BollyFlix|BollYFlix|MoviesMod|MoviesDa|"
+    r"1TamilBlasters|TamilBlasters|TamilGun|TamilYogi|FilmyZilla|FilmyFly|"
+    r"VegaMovies|HDHub4u|9xMovies|7StarHD|SkymoviesHD|Extramovies|"
+    r"KuttyMovies|Isaimini|Tamilyogi|Telly)\b\s*$",
     re.I,
 )
 
@@ -107,8 +126,10 @@ TAG_STRIP_RE = re.compile(
     r"\b\d+\s*CH\b|"
     r"\bPSAOyeSale\b|\bHarsh\b|\bPSA\b|"
     r"AAC|AC3|EAC3|DTS(?:-HD)?|DDP?\s*2\s*0|DDP?\s*5\s*1|\b5\s*1\b|\b2\s*0\b|ATMOS|TRUEHD|"
+    r"AAC\s*5\s*1|"
     r"H\s*26[45]\b|"
     r"ESUBS?|SUBS|SUBBED|DUBBED|DUAL|MULTI|"
+    r"\bHR\b|\bOTT\b|"
     r"MP4|MKV|AVI|M4V|WMV|FLV|WEBM|"
     r"CIMA4U|MYCIMA(?:\s*(?:TV|ME|TO|WORLD))?|EGYBEST|EGYDEAD(?:\s*COM)?|"
     r"AKWAM|FASELHD?|ALIRAQI|JOPULGA|OSN|SHAHID|"
@@ -130,21 +151,25 @@ _CHANNEL_TOKENS = {"hw", "mm", "fbm", "mallu", "movie", "movies"}
 
 
 def _strip_channel_watermark(name: str) -> str:
-    """Strip a leading channel watermark: "@Fbm Hw", "@Mm", "@Mallu Movies".
+    """Strip channel watermarks: "@Fbm Hw", "#Nexleech", mid-name "@xyz".
 
-    Removes the @handle and any following watermark tokens. Only the
-    curated vocabulary above is ever eaten, so real titles are safe:
-    "@Mm It 2017" -> "It 2017", "@Fbm Hw The Matrix" -> "The Matrix".
-    Only applies when the name starts with "@" (after optional space).
+    Leading "@handle"/"#tag" are removed with any following watermark
+    tokens ("@Mallu Movies ..."). "@handles" appearing later in the name
+    ("Movie @channel 2020") are also stripped, but only when the "@"
+    starts a token — "user@example.com" is left alone.
+    Only the curated vocabulary above is ever eaten after a leading
+    handle, so real titles are safe: "@Mm It 2017" -> "It 2017".
     """
-    m = re.match(r"\s*@\w+\s*", name)
-    if not m:
-        return name
-    toks = name[m.end():].split()
-    i = 0
-    while i < len(toks) - 1 and toks[i].lower() in _CHANNEL_TOKENS:
-        i += 1
-    return " ".join(toks[i:])
+    m = re.match(r"\s*[@#]\w+\s*", name)
+    if m:
+        toks = name[m.end():].split()
+        i = 0
+        while i < len(toks) - 1 and toks[i].lower() in _CHANNEL_TOKENS:
+            i += 1
+        name = " ".join(toks[i:])
+    # mid-name handles: "Vivah @bhaiyajihub 2006" -> "Vivah 2006"
+    name = re.sub(r"(?<!\S)@\w+", " ", name)
+    return name
 
 
 @dataclass
@@ -182,6 +207,9 @@ def parse_filename(raw: str) -> ParsedName:
     name = _strip_ext(raw.strip())
     # UUIDs must go before separators are flattened ("a-b-c" -> "a b c")
     name = UUID_RE.sub(" ", name)
+    # file sizes ("3.2GB", "700MB") are never part of the title — strip
+    # before separators are flattened so "3.2GB" is still one token
+    name = SIZE_RE.sub(" ", name)
     # pack episode range like [E01-04]: read before "-" is flattened
     rm = PACK_RANGE_RE.search(name)
     pack_range = (int(rm.group(1)), int(rm.group(2))) if rm else None
@@ -259,11 +287,18 @@ def parse_filename(raw: str) -> ParsedName:
     name = re.sub(r"\s+\b[Aa][Tt]\b\s*$", " ", name)
     # truncated tag letter: "... 10bit N" (was "NF")
     name = re.sub(r"\s+[A-Z]\s*$", " ", name)
-    name = re.sub(r"\b(Season|Series|Episode|Ep|Dual|Audio|Hindi|English|Engli|Eng|"
+    name = re.sub(r"\b(Season|Series|Episode|Ep|Dual|Audio|Hindi|Hin|English|Engli|Eng|"
                 r"Tam|Tel|Mal|Kan|Multi|ESub)\b", " ", name, flags=re.I)
     # site suffix: "MoviesMod Com" (was ".com")
     name = re.sub(r"\s+\bCom\b\s*$", " ", name, flags=re.I)
-    name = RELEASE_GROUPS.sub("", name)
+    # trailing release-group / site watermarks, applied until stable so
+    # chained suffixes ("... x264 LOKiHD Telly") are fully stripped
+    for _ in range(3):
+        new_name = RELEASE_GROUPS.sub("", name)
+        new_name = SITE_NAMES.sub("", new_name)
+        if new_name == name:
+            break
+        name = new_name
     if p.year:
         # a year was found: trailing bare numbers are usually junk
         # ("Film 1992 ... 247", "Stranger Things ... 04"), but a single 1-9
@@ -275,6 +310,8 @@ def parse_filename(raw: str) -> ParsedName:
             if any(len(t) >= 2 or t == "0" or len(toks) > 1 for t in toks):
                 name = name[: m.start()].strip()
     name = re.sub(r"\s+", " ", name).strip(" -")
+    # leading emoji / punctuation junk from captions ("🎬 Vivah" -> "Vivah")
+    name = re.sub(r"^[^\w\s]+", "", name).strip()
 
     p.title = name.strip().title() if name.strip() else _strip_ext(raw).strip()
     p.norm_title = normalize_title(p.title)

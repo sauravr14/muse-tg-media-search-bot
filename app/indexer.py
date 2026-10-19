@@ -78,6 +78,8 @@ class Indexer:
         self._scan_lock = asyncio.Lock()
         self._enrich_queue: asyncio.Queue[int] = asyncio.Queue()
         self._running = False
+        # live scan progress for the /indexstatus panel (None when idle)
+        self.current_scan: dict | None = None
 
     # -- ingestion ---------------------------------------------------------
     async def ingest_message(self, msg) -> dict | None:
@@ -238,6 +240,14 @@ class Indexer:
                 return {"scanned": 0, "new": 0, "error": reason}
             done = new = 0
             cur = lo
+            total = hi - lo + 1
+            # live state for the /indexstatus panel
+            self.current_scan = {
+                "chat_id": chat_id,
+                "title": src["title"] or str(chat_id),
+                "done": 0, "total": total, "new": 0,
+                "started_at": time.time(),
+            }
             try:
                 while cur <= hi:
                     batch_end = min(cur + BATCH - 1, hi)
@@ -278,8 +288,9 @@ class Indexer:
                         # checkpoint = last message id of the completed batch
                         self.db.set_source(chat_id, last_msg_id=batch_end)
                     self._heartbeat(chat_id)
+                    self.current_scan.update(done=done, new=new)
                     if progress_cb:
-                        progress_cb(done, hi - lo + 1)
+                        progress_cb(done, total)
                     cur = batch_end + 1
                     await asyncio.sleep(0.4)
             except Exception as e:
@@ -287,6 +298,8 @@ class Indexer:
                 self.db.set_source(chat_id, status="error",
                                    error=f"{type(e).__name__}: {e}")
                 return {"scanned": done, "new": new, "error": str(e)}
+            finally:
+                self.current_scan = None
             self.db.set_source(chat_id, status="idle", last_msg_id=hi)
             return {"scanned": done, "new": new}
 

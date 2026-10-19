@@ -412,6 +412,31 @@ class MediaBot:
             else:
                 await m.reply_text("Panel not ready yet — try again in a few seconds.")
 
+        @c.on_message(filters.private & filters.command("stopindex") & filters.user(admin_ids))
+        async def stopindex(_, m: Message):
+            """Stop the running scan (/stopindex [channel_id]); the scan
+            finishes its current batch, keeps its checkpoint, and stays
+            idle until you start it again."""
+            args = m.text.split()[1:]
+            target = None
+            if args:
+                try:
+                    target = int(args[0])
+                except ValueError:
+                    await m.reply_text("Usage: /stopindex [channel_id]")
+                    return
+            else:
+                cur = self.indexer.current_scan
+                target = cur["chat_id"] if cur else None
+            if target is None:
+                await m.reply_text("No scan is running right now.")
+                return
+            self.indexer.request_stop(target)
+            src = self.db.get_source(target) or {}
+            name = src.get("title") or str(target)
+            await m.reply_text(f"🛑 Stopping the scan of <b>{html.escape(name)}</b> — "
+                               f"it will halt after its current batch and keep its checkpoint.")
+
         @c.on_message(filters.private & filters.command("reparse") & filters.user(admin_ids))
         async def reparse(_, m: Message):
             await m.reply_text("🔄 Re-parsing all filenames and regrouping titles — "
@@ -735,9 +760,11 @@ class MediaBot:
                 skipped = res.get("poison_skipped", 0)
                 skip_note = (f" ({skipped} unresolvable message ranges skipped — "
                              f"Telegram never answered for them)") if skipped else ""
+                stopped_note = (" — 🛑 stopped by admin, checkpoint kept; "
+                                "it won't resume on its own.") if res.get("note") == "stopped by admin" else ""
                 text = (f"✅ Scan of <b>{html.escape(name)}</b> done — "
                         f"{res.get('scanned', 0):,} messages checked, "
-                        f"{res.get('new', 0):,} new files indexed.{skip_note}")
+                        f"{res.get('new', 0):,} new files indexed.{skip_note}{stopped_note}")
             if status_msg is not None:
                 try:
                     await status_msg.edit_text(text, parse_mode=ParseMode.HTML)

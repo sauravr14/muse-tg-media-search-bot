@@ -181,12 +181,12 @@ class ParserTest(unittest.TestCase):
 
     def test_channel_watermark_handle_only(self):
         p = parse_filename("@Mm Race 3 Pro 900Mb 2018.mkv")
-        self.assertEqual(p.title, "Race 3 Pro 900Mb")
+        self.assertEqual(p.title, "Race 3 Pro")
         self.assertEqual(p.year, 2018)
 
     def test_channel_watermark_channel_word(self):
         p = parse_filename("@Mallu Movies Race 2008 700Mb.mkv")
-        self.assertEqual(p.title, "Race 700Mb")
+        self.assertEqual(p.title, "Race")
         self.assertEqual(p.year, 2008)
 
     def test_channel_watermark_short_title_protected(self):
@@ -206,11 +206,77 @@ class ParserTest(unittest.TestCase):
 
     def test_no_watermark_untouched(self):
         # no @handle: parser must not touch the title
-        # (note: "Mutants" is avoided — a pre-existing quirk strips "ts"
-        # via the CAM source pattern, unrelated to this change)
         p = parse_filename("The Dark Knight 2008 720p.mkv")
         self.assertEqual(p.title, "The Dark Knight")
         self.assertEqual(p.year, 2008)
+
+    def test_ts_inside_word_not_stripped(self):
+        # "Mutants" keeps its "ts" — the CAM source pattern only matches
+        # standalone TS, not the TS inside DTS/Mutants
+        p = parse_filename("Mutants 2009 720p BluRay.mkv")
+        self.assertEqual(p.title, "Mutants")
+        p = parse_filename("The Matrix 1999 1080p BluRay DTS x264.mkv")
+        self.assertEqual(p.title, "The Matrix")
+        self.assertEqual(p.quality, "BluRay")
+
+    def test_file_size_not_in_title(self):
+        p = parse_filename("Vivah (2006) Hindi 1080p BluRay 3.2GB ESub [BollYFlix].mkv")
+        self.assertEqual(p.title, "Vivah")
+        self.assertEqual(p.year, 2006)
+        p = parse_filename("Vivah (2006) Hindi 720p BluRay 1.2GB [BollyFlix].mkv")
+        self.assertEqual(p.title, "Vivah")
+        p = parse_filename("Some Movie 2020 700MB 480p.mkv")
+        self.assertEqual(p.title, "Some Movie")
+
+    def test_underscore_separators(self):
+        p = parse_filename("Vivah_2006_BluRay_REMASTERED_720p_Hindi_AAC_5_1_x264_ESub_mkvCinemas.mkv")
+        self.assertEqual(p.title, "Vivah")
+        self.assertEqual(p.year, 2006)
+
+    def test_site_suffix_stripped(self):
+        cases = {
+            "Vivah 2006 Hindi 720p AMZN WEBRip x264 - LOKiHD - Telly.mkv": "Vivah",
+            "Vivah.(2006).Hindi.1080p.BluRay-IBUDDHU.mkv": "Vivah",
+            "@bhaiyajihub Vivah (2006) 480p Hindi Bluray - Bhaiyajihub.mp4": "Vivah",
+            "Movie 2020 1080p BluRay x264-YTS.mkv": "Movie",
+            "Movie 2020 1080p WEB-DL x264-PRiEST.mkv": "Movie",
+        }
+        for raw, exp in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(parse_filename(raw).title, exp)
+
+    def test_hashtag_watermark_stripped(self):
+        p = parse_filename("#Nexleech_Vivah_2006_BluRay_REMASTERED_Hindi_480p_ESub_mkvCinemas.mkv")
+        self.assertEqual(p.title, "Vivah")
+        self.assertEqual(p.year, 2006)
+
+    def test_midname_handle_stripped(self):
+        p = parse_filename("Vivah @bhaiyajihub 2006 720p BluRay.mkv")
+        self.assertEqual(p.title, "Vivah")
+        # but an email-like token is left alone
+        p = parse_filename("user@example.com file 2020 720p.mkv")
+        self.assertIn("Example", p.title)
+
+    def test_release_tag_soup(self):
+        # 540p/HR/OTT/AAC5.1/PMI all stripped -> variants merge to one title
+        for raw in [
+            "Vivaha.Avahanam.2023.540p.HR.OTT.WEB-DL.AAC5.1.H.264-PMI.mkv",
+            "Vivaha.Avahanam.2023.720p.HR.OTT.WEB-DL.AAC5.1.H.264-PMI.mkv",
+            "Vivaha.Avahanam.2023.1080p.HR.OTT.WEB-DL.AAC5.1.H.264-PM.mkv",
+        ]:
+            with self.subTest(raw=raw):
+                p = parse_filename(raw)
+                self.assertEqual(p.title, "Vivaha Avahanam")
+                self.assertEqual(p.year, 2023)
+
+    def test_hin_language_code_stripped(self):
+        p = parse_filename("@Jesseverse Vivaha Bhojanambu 2021 Hin Tel Esub 480p WebRip.mkv")
+        self.assertEqual(p.title, "Vivaha Bhojanambu")
+        self.assertEqual(p.year, 2021)
+
+    def test_leading_emoji_stripped(self):
+        p = parse_filename("🎬 Vivah (2006) Hindi 1080p BluRay.mkv")
+        self.assertEqual(p.title, "Vivah")
 
 if __name__ == "__main__":
     unittest.main()

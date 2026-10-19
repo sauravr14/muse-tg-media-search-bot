@@ -186,6 +186,37 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(row["last_msg_id"], 150)
 
 
+class ProbeTopIdTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = DB(os.path.join(self.tmp, "t.db"))
+        self.chat_id = -1002001978984
+        self.db.upsert_source(self.chat_id, "JEROM DB", "")
+        # channel with 12,345 messages and a few deleted near the top
+        self.msgs = {i: make_msg(i, self.chat_id) for i in range(1, 12346)}
+        for d in (12344, 12340, 7000):
+            self.msgs[d] = SimpleNamespace(empty=True, id=d)
+        self.client = FakeClient(self.msgs)
+        self.idx = Indexer(self.client, self.db, TMDB(self.db, ""))
+
+    def test_probe_finds_top(self):
+        top = asyncio.run(self.idx.probe_top_id(self.chat_id))
+        self.assertEqual(top, 12345)
+
+    def test_fresh_source_scans_without_forward(self):
+        """A source added via /addchannel (no top_id, no max_seen) probes
+        its own top and scans the full history."""
+        res = asyncio.run(self.idx.scan_source(self.chat_id))
+        self.assertNotIn("error", res)
+        self.assertEqual(res["scanned"], 12345)
+        self.assertEqual(res["new"], 12342)  # 3 deleted
+        row = self.db.query_one(
+            "SELECT last_msg_id, status FROM sources WHERE chat_id=?",
+            (self.chat_id,))
+        self.assertEqual(row["last_msg_id"], 12345)
+        self.assertEqual(row["status"], "idle")
+
+
 class ForwardedFilterTest(unittest.TestCase):
     def test_forward_date(self):
         m = SimpleNamespace(forward_date=123, forward_from_chat=None,

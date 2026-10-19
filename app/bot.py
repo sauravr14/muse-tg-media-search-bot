@@ -41,6 +41,22 @@ def _parse_post_link(text: str):
     return f"@{name}", msg_id
 
 
+async def _is_forwarded(_, __, m) -> bool:
+    # filters.forwarded only checks forward_date, which can be None/0 even
+    # when the message IS forwarded (seen in the wild on Pyrogram builds).
+    # Check every origin attribute so forwarded channel posts are never
+    # silently missed by the index flow.
+    return bool(
+        getattr(m, "forward_date", None)
+        or getattr(m, "forward_from_chat", None)
+        or getattr(m, "forward_from", None)
+        or getattr(m, "forward_sender_name", None)
+    )
+
+
+is_forwarded = filters.create(_is_forwarded)
+
+
 def _fmt_size(n: int) -> str:
     n = n or 0
     for unit in ("B", "KB", "MB", "GB"):
@@ -252,7 +268,10 @@ class MediaBot:
             await m.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
         # ---- forward a channel post (or send a t.me post link) to index it ----
-        @c.on_message(filters.private & filters.forwarded & filters.user(admin_ids))
+        # NOTE: uses the robust is_forwarded check (all origin attributes),
+        # not filters.forwarded — forward_date alone can be None/0 on some
+        # Pyrogram builds and the forward would be silently ignored.
+        @c.on_message(filters.private & is_forwarded & filters.user(admin_ids))
         async def forward_index(_, m: Message):
             fwd = m.forward_from_chat
             fwd_id = m.forward_from_message_id
@@ -624,27 +643,91 @@ class MediaBot:
     async def _index_yes(self, q: CallbackQuery, chat_id: int, top_id: int):
         chat = self.db.query_one("SELECT title FROM sources WHERE chat_id=?", (chat_id,))
         title = (chat["title"] if chat else None) or str(chat_id)
-        await q.answer("Indexing started!")
+        queued = self.indexer._scan_lock.locked()
+        await q.answer("Indexing queued — starts when the current scan finishes."
+                       if queued else "Indexing started!")
         try:
             await q.message.edit_text(
                 f"✅ Indexing <b>{html.escape(title)}</b> from message 1 to {top_id}…\n"
+                + ("⏳ Another scan is running — yours is queued and starts "
+                   "automatically when it finishes.\n" if queued else "") +
                 f"I'll ping you when the scan finishes.",
                 parse_mode=ParseMode.HTML)
         except Exception:
             pass
-        asyncio.create_task(self._scan_with_report(q.message.chat.id, chat_id,
-                                                   title, top_id))
+        task = asyncio.create_task(self._scan_with_report(q.message.chat.id, chat_id,
+                                                          title, top_id))
+        task.add_done_callback(
+            lambda t: self._scan_task_done(t, q.message.chat.id, title))
+
+    def _scan_task_done(self, task: asyncio.Task, notify_chat: int, name: str) -> None:
+        """Last-resort net: a scan task must never die silently."""
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            log.error("scan task for %s crashed: %r", name, exc)
+            try:
+                coro = self.client.send_message(
+                    notify_chat,
+                    f"⚠️ Scan of <b>{html.escape(name)}</b> crashed unexpectedly: "
+                    f"<code>{html.escape(str(exc)[:200])}</code>\n"
+                    "It will be retried automatically.",
+                    parse_mode=ParseMode.HTML)
+                asyncio.create_task(coro)
+            except Exception:
+                pass
 
     async def _scan_with_report(self, notify_chat: int, chat_id: int, name: str,
                                 top_id: int = 0):
-        res = await self.indexer.scan_source(chat_id, top_id=top_id)
+        status_msg = None
+        last_edit = 0.0
+
+        def _progress(done: int, total: int):
+            # called from the scan loop; schedule a throttled progress edit
+            nonlocal last_edit
+            now = time.time()
+            if now - last_edit < 30 and done < total:
+                return
+            last_edit = now
+            if status_msg is not None:
+                pct = int(done * 100 / total) if total else 0
+                coro = status_msg.edit_text(
+                    f"⏳ Indexing <b>{html.escape(name)}</b>… "
+                    f"{done:,}/{total:,} messages ({pct}%)",
+                    parse_mode=ParseMode.HTML)
+                asyncio.create_task(coro)
+
+        try:
+            status_msg = await self.client.send_message(
+                notify_chat, f"⏳ Indexing <b>{html.escape(name)}</b>…",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            status_msg = None
+        res = await self.indexer.scan_source(chat_id, top_id=top_id,
+                                             progress_cb=_progress)
         try:
             if res.get("error"):
-                text = f"⚠️ Scan of <b>{html.escape(name)}</b> hit an error: {html.escape(str(res['error'])[:200])}"
+                if res.get("note") == "busy":
+                    text = (f"⏳ <b>{html.escape(name)}</b>: another scan is still "
+                            f"running — this one will start automatically.")
+                else:
+                    text = (f"⚠️ Scan of <b>{html.escape(name)}</b> hit an error: "
+                            f"{html.escape(str(res['error'])[:200])}\n"
+                            f"Checked {res.get('scanned', 0):,} messages, "
+                            f"indexed {res.get('new', 0):,} new files. "
+                            f"It will resume automatically.")
             else:
                 text = (f"✅ Scan of <b>{html.escape(name)}</b> done — "
-                        f"{res.get('scanned', 0)} messages checked, "
-                        f"{res.get('new', 0)} new files indexed.")
+                        f"{res.get('scanned', 0):,} messages checked, "
+                        f"{res.get('new', 0):,} new files indexed.")
+            if status_msg is not None:
+                try:
+                    await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
+                    return
+                except Exception:
+                    pass
             await self.client.send_message(notify_chat, text, parse_mode=ParseMode.HTML)
         except Exception as e:
             log.warning("scan report failed: %r", e)

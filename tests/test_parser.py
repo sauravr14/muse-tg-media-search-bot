@@ -174,6 +174,44 @@ class ParserTest(unittest.TestCase):
         p = parse_filename("12_Monkeys_S02_COMBiNED_720p_WEB_DL_2CH_x265_HEVC_ESub_Harsh.mkv")
         self.assertEqual(p.title, "12 Monkeys")
 
+    def test_channel_watermark_handle_and_code(self):
+        p = parse_filename("@Fbm Hw Teenage Mutant Ninja Turtles 1990 720p.mkv")
+        self.assertEqual(p.title, "Teenage Mutant Ninja Turtles")
+        self.assertEqual(p.year, 1990)
+
+    def test_channel_watermark_handle_only(self):
+        p = parse_filename("@Mm Race 3 Pro 900Mb 2018.mkv")
+        self.assertEqual(p.title, "Race 3 Pro 900Mb")
+        self.assertEqual(p.year, 2018)
+
+    def test_channel_watermark_channel_word(self):
+        p = parse_filename("@Mallu Movies Race 2008 700Mb.mkv")
+        self.assertEqual(p.title, "Race 700Mb")
+        self.assertEqual(p.year, 2008)
+
+    def test_channel_watermark_short_title_protected(self):
+        p = parse_filename("@Mm It 2017 720p.mkv")
+        self.assertEqual(p.title, "It")
+        self.assertEqual(p.year, 2017)
+
+    def test_channel_watermark_short_title_up_protected(self):
+        p = parse_filename("@Mm Up 2009 BluRay.mkv")
+        self.assertEqual(p.title, "Up")
+        self.assertEqual(p.year, 2009)
+
+    def test_channel_watermark_dotted(self):
+        p = parse_filename("@Fbm.Hw.The.Matrix.1999.1080p.mkv")
+        self.assertEqual(p.title, "The Matrix")
+        self.assertEqual(p.year, 1999)
+
+    def test_no_watermark_untouched(self):
+        # no @handle: parser must not touch the title
+        # (note: "Mutants" is avoided — a pre-existing quirk strips "ts"
+        # via the CAM source pattern, unrelated to this change)
+        p = parse_filename("The Dark Knight 2008 720p.mkv")
+        self.assertEqual(p.title, "The Dark Knight")
+        self.assertEqual(p.year, 2008)
+
 if __name__ == "__main__":
     unittest.main()
 

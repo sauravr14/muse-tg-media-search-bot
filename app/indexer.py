@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from types import SimpleNamespace
 
 from pyrogram.errors import FloodWait
 
@@ -32,6 +33,12 @@ GET_TIMEOUT = 90
 # A batch that times out this many times in a row aborts the scan; the
 # supervisor retries it later instead of spinning forever.
 MAX_BATCH_RETRIES = 5
+# When a batch hangs, bisect it with short timeouts to route around
+# poisoned ID ranges (Telegram sometimes never answers for certain
+# messages). Sub-ranges at/below this size that still hang are skipped
+# and recorded for a later retry instead of wedging the scan.
+POISON_LEAF = 8
+POISON_TIMEOUT = 15
 # Supervisor cadence and stall threshold.
 SUPERVISOR_INTERVAL = 300
 STALL_AFTER = 1200
@@ -141,6 +148,60 @@ class Indexer:
         except Exception:
             return None
 
+    def _note_poison(self, chat_id: int, lo: int, hi: int) -> None:
+        """Record an ID range Telegram won't serve, for a later retry."""
+        import json
+        key = f"poison:{chat_id}"
+        try:
+            ranges = json.loads(self.db.get_kv(key) or "[]")
+        except Exception:
+            ranges = []
+        ranges.append([lo, hi])
+        self.db.set_kv(key, json.dumps(ranges[-50:]))
+        self._poison_count = getattr(self, "_poison_count", 0) + 1
+
+    async def _fetch_ids(self, chat_id: int, ids: list, timeout: float) -> list:
+        """Fetch one ID batch, routing around poisoned sub-ranges.
+
+        If the whole batch hangs, first probe a single ID: if that hangs
+        too the outage is systemic -> raise so the caller retries/aborts.
+        Otherwise bisect with short timeouts; sub-ranges at/below
+        POISON_LEAF that still hang are skipped (returned as empties) and
+        recorded, so the scan always makes progress.
+        FloodWait and OSError propagate for the caller's retry handling.
+        """
+        try:
+            res = await asyncio.wait_for(self.client.get_messages(chat_id, ids),
+                                         timeout=timeout)
+            return list(res)
+        except FloodWait:
+            raise
+        except asyncio.TimeoutError:
+            pass  # NOTE: must precede OSError — TimeoutError subclasses it
+        except OSError:
+            raise
+        # The batch hung. Probe one ID to distinguish a poisoned range
+        # from a systemic outage.
+        try:
+            await asyncio.wait_for(self.client.get_messages(chat_id, ids[0]),
+                                   timeout=POISON_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise  # systemic: single ID hangs too -> caller retries/aborts
+        except (FloodWait, OSError):
+            raise
+        except Exception:
+            pass
+        if len(ids) <= POISON_LEAF:
+            lo, hi = ids[0], ids[-1]
+            log.warning("scan of %s: ids %s-%s unresolvable, skipping",
+                        chat_id, lo, hi)
+            self._note_poison(chat_id, lo, hi)
+            return [SimpleNamespace(empty=True) for _ in ids]
+        mid = len(ids) // 2
+        left = await self._fetch_ids(chat_id, ids[:mid], POISON_TIMEOUT)
+        right = await self._fetch_ids(chat_id, ids[mid:], POISON_TIMEOUT)
+        return left + right
+
     async def _exists_above(self, chat_id: int, mid: int) -> bool:
         """Neighbourhood check: did a doubling probe just land in a deletion
         gap while higher messages still exist?"""
@@ -241,6 +302,7 @@ class Indexer:
             done = new = 0
             cur = lo
             total = hi - lo + 1
+            self._poison_count = 0  # poisoned sub-ranges skipped this scan
             # live state for the /indexstatus panel
             self.current_scan = {
                 "chat_id": chat_id,
@@ -255,9 +317,8 @@ class Indexer:
                     msgs = None
                     for attempt in range(MAX_BATCH_RETRIES):
                         try:
-                            msgs = await asyncio.wait_for(
-                                self.client.get_messages(chat_id, ids),
-                                timeout=GET_TIMEOUT)
+                            msgs = await self._fetch_ids(chat_id, ids,
+                                                         GET_TIMEOUT)
                             break
                         except FloodWait as e:
                             await asyncio.sleep(e.value + 1)
@@ -297,11 +358,13 @@ class Indexer:
                 log.warning("scan of %s failed: %r", chat_id, e)
                 self.db.set_source(chat_id, status="error",
                                    error=f"{type(e).__name__}: {e}")
-                return {"scanned": done, "new": new, "error": str(e)}
+                return {"scanned": done, "new": new, "error": str(e),
+                        "poison_skipped": getattr(self, "_poison_count", 0)}
             finally:
                 self.current_scan = None
             self.db.set_source(chat_id, status="idle", last_msg_id=hi)
-            return {"scanned": done, "new": new}
+            return {"scanned": done, "new": new,
+                    "poison_skipped": getattr(self, "_poison_count", 0)}
 
     def _heartbeat(self, chat_id: int) -> None:
         self.db.set_kv(f"scan_hb:{chat_id}", str(time.time()))

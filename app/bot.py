@@ -80,6 +80,7 @@ class MediaBot:
         self.client = Client("mediabot", api_id=cfg.api_id, api_hash=cfg.api_hash,
                              bot_token=cfg.bot_token, in_memory=True)
         self.username = ""
+        self.panel = None  # IndexPanel, attached in main.py once indexer exists
         self._spam: dict[int, float] = {}
         self._register()
 
@@ -318,6 +319,11 @@ class MediaBot:
                 elif data.startswith("idx_yes:"):
                     _, cid, top = data.split(":")
                     await self._index_yes(q, int(cid), int(top))
+                elif data.startswith("ip:"):
+                    if self.panel:
+                        await self.panel.on_button(q)
+                    else:
+                        await q.answer("Panel not ready yet.")
                 elif data == "idx_no":
                     await q.answer("Cancelled")
                     try:
@@ -398,6 +404,13 @@ class MediaBot:
             await m.reply_text("🔄 Full scan started in the background — "
                                "I'll report here when it's done.")
             asyncio.create_task(self._index_all_report(m.chat.id))
+
+        @c.on_message(filters.private & filters.command("indexstatus") & filters.user(admin_ids))
+        async def indexstatus(_, m: Message):
+            if self.panel:
+                await self.panel.show(m)
+            else:
+                await m.reply_text("Panel not ready yet — try again in a few seconds.")
 
         @c.on_message(filters.private & filters.command("reparse") & filters.user(admin_ids))
         async def reparse(_, m: Message):

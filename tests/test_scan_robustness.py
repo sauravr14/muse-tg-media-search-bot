@@ -174,6 +174,33 @@ class ScanRobustnessTest(unittest.TestCase):
         self.assertEqual(row["status"], "idle")
         self.assertEqual(row["error"], "")
 
+    def test_stopindex_halts_scan_keeps_checkpoint(self):
+        """/stopindex stops the scan after its current batch: status stays
+        idle (supervisor won't restart it) and the checkpoint is kept."""
+        async def run():
+            task = asyncio.create_task(
+                self.idx.scan_source(self.chat_id, top_id=250))
+            # let the first batch finish, then ask for a stop
+            while not self.db.query_one(
+                    "SELECT last_msg_id FROM sources WHERE chat_id=?",
+                    (self.chat_id,))["last_msg_id"]:
+                await asyncio.sleep(0.01)
+            self.idx.request_stop(self.chat_id)
+            return await task
+        # slow the loop down a little so the stop lands mid-scan
+        with patch.object(indexer_mod, "BATCH", 50):
+            res = asyncio.run(run())
+        self.assertEqual(res.get("note"), "stopped by admin")
+        self.assertNotIn("error", res)
+        row = self.db.query_one(
+            "SELECT status, last_msg_id FROM sources WHERE chat_id=?",
+            (self.chat_id,))
+        self.assertEqual(row["status"], "idle")
+        # checkpoint kept at a completed batch, scan did not run to the end
+        self.assertGreater(row["last_msg_id"], 0)
+        self.assertLess(row["last_msg_id"], 250)
+        self.assertFalse(self.idx._scan_lock.locked())
+
 
 class SupervisorTest(unittest.TestCase):
     def setUp(self):

@@ -27,6 +27,14 @@ log = logging.getLogger("mediabot.indexer")
 
 MEDIA_TYPES = ("video", "document")
 BATCH = 100
+# Network guard: a hung Telegram connection must never wedge the scan lock.
+GET_TIMEOUT = 90
+# A batch that times out this many times in a row aborts the scan; the
+# supervisor retries it later instead of spinning forever.
+MAX_BATCH_RETRIES = 5
+# Supervisor cadence and stall threshold.
+SUPERVISOR_INTERVAL = 300
+STALL_AFTER = 1200
 
 
 def _file_meta_from_msg(msg) -> dict | None:
@@ -99,12 +107,15 @@ class Indexer:
     async def access_test(self, chat_id) -> tuple[bool, str]:
         """Single GetMessages probe. Returns (ok, reason)."""
         try:
-            m = await self.client.get_messages(chat_id, 1)
+            m = await asyncio.wait_for(self.client.get_messages(chat_id, 1),
+                                       timeout=GET_TIMEOUT)
             _ = m.empty  # touch it
             return True, ""
         except FloodWait as e:
             await asyncio.sleep(e.value + 1)
             return await self.access_test(chat_id)
+        except asyncio.TimeoutError:
+            return False, "Telegram timed out — try again in a bit."
         except Exception as e:
             name = type(e).__name__
             if name in ("ChannelInvalid", "ChannelPrivate", "UsernameInvalid",
@@ -113,11 +124,15 @@ class Indexer:
                                "first (required for private channels).")
             return False, f"{name}: {e}"
 
-    async def scan_source(self, chat_id: int, top_id: int = 0) -> dict:
+    async def scan_source(self, chat_id: int, top_id: int = 0,
+                        progress_cb=None) -> dict:
         """Scan message IDs (checkpoint+1 .. top_id) in batches via GetMessages.
 
         top_id comes from a forwarded post or t.me link. Falls back to the
         highest ID seen via live posts/forwards. Resumable and idempotent.
+
+        progress_cb(done, total) is called after each completed batch so the
+        caller can report progress on long scans.
         """
         async with self._scan_lock:
             src = self.db.query_one("SELECT * FROM sources WHERE chat_id=?", (chat_id,))
@@ -132,8 +147,13 @@ class Indexer:
             if skip:
                 lo = max(lo, skip + 1)
             if hi < lo:
+                # Up to date as far as we know — clear any stale error so the
+                # supervisor and /channels stop reporting a dead failure.
+                if (src["status"] or "") == "error":
+                    self.db.set_source(chat_id, status="idle", error="")
                 return {"scanned": 0, "new": 0, "note": "nothing new to scan"}
             self.db.set_source(chat_id, status="scanning", error="")
+            self._heartbeat(chat_id)
             ok, reason = await self.access_test(chat_id)
             if not ok:
                 self.db.set_source(chat_id, status="error", error=reason)
@@ -142,12 +162,29 @@ class Indexer:
             cur = lo
             try:
                 while cur <= hi:
-                    ids = list(range(cur, min(cur + BATCH - 1, hi) + 1))
-                    try:
-                        msgs = await self.client.get_messages(chat_id, ids)
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value + 1)
-                        continue
+                    batch_end = min(cur + BATCH - 1, hi)
+                    ids = list(range(cur, batch_end + 1))
+                    msgs = None
+                    for attempt in range(MAX_BATCH_RETRIES):
+                        try:
+                            msgs = await asyncio.wait_for(
+                                self.client.get_messages(chat_id, ids),
+                                timeout=GET_TIMEOUT)
+                            break
+                        except FloodWait as e:
+                            await asyncio.sleep(e.value + 1)
+                        except (asyncio.TimeoutError, OSError) as e:
+                            # hung/flaky connection: back off and retry the
+                            # same batch instead of dying or wedging the lock
+                            log.warning("scan of %s: batch %s-%s %s (try %d/%d)",
+                                        chat_id, cur, batch_end,
+                                        type(e).__name__, attempt + 1,
+                                        MAX_BATCH_RETRIES)
+                            await asyncio.sleep(5 * (attempt + 1))
+                    if msgs is None:
+                        raise RuntimeError(
+                            f"batch {cur}-{batch_end} failed {MAX_BATCH_RETRIES}x; "
+                            "will resume from checkpoint")
                     # one DB transaction per batch: ~7 commits/file -> 1 commit/batch
                     with self.db.transaction():
                         for i, msg in enumerate(msgs):
@@ -160,8 +197,12 @@ class Indexer:
                             # let the bot/API breathe between files
                             if i % 25 == 24:
                                 await asyncio.sleep(0)
-                        self.db.set_source(chat_id, last_msg_id=min(cur - 1, hi))
-                    cur += BATCH
+                        # checkpoint = last message id of the completed batch
+                        self.db.set_source(chat_id, last_msg_id=batch_end)
+                    self._heartbeat(chat_id)
+                    if progress_cb:
+                        progress_cb(done, hi - lo + 1)
+                    cur = batch_end + 1
                     await asyncio.sleep(0.4)
             except Exception as e:
                 log.warning("scan of %s failed: %r", chat_id, e)
@@ -170,6 +211,57 @@ class Indexer:
                 return {"scanned": done, "new": new, "error": str(e)}
             self.db.set_source(chat_id, status="idle", last_msg_id=hi)
             return {"scanned": done, "new": new}
+
+    def _heartbeat(self, chat_id: int) -> None:
+        self.db.set_kv(f"scan_hb:{chat_id}", str(time.time()))
+
+    def _last_heartbeat(self, chat_id: int) -> float:
+        v = self.db.get_kv(f"scan_hb:{chat_id}")
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def scan_supervisor(self) -> None:
+        """Background loop: retry scans that died or stalled.
+
+        A scan that ends in status='error' (e.g. 'Connection lost' on a flaky
+        network) is resumed from its checkpoint. A scan stuck in
+        status='scanning' with no heartbeat for STALL_AFTER seconds is treated
+        as dead and retried too. Runs until stop() is called.
+        """
+        self._running = True
+        log.info("scan supervisor started (every %ds)", SUPERVISOR_INTERVAL)
+        while self._running:
+            try:
+                await self._supervisor_tick()
+            except Exception as e:
+                log.warning("supervisor tick failed: %r", e)
+            for _ in range(SUPERVISOR_INTERVAL):
+                if not self._running:
+                    break
+                await asyncio.sleep(1)
+
+    async def _supervisor_tick(self) -> None:
+        """One pass over sources: resume errored scans, reboot stalled ones."""
+        for src in self.db.list_sources():
+            if not self._running:
+                break
+            if not src["enabled"]:
+                continue
+            status = src["status"] or ""
+            if status == "error":
+                log.info("supervisor: resuming errored scan of %s (%s)",
+                         src["chat_id"], (src["error"] or "")[:80])
+                await self.scan_source(src["chat_id"])
+            elif status == "scanning":
+                idle_for = time.time() - self._last_heartbeat(src["chat_id"])
+                if idle_for > STALL_AFTER:
+                    log.warning("supervisor: scan of %s stalled %.0fs, retrying",
+                                src["chat_id"], idle_for)
+                    self.db.set_source(src["chat_id"], status="error",
+                                       error=f"stalled: no progress for {int(idle_for)}s")
+                    await self.scan_source(src["chat_id"])
 
     async def scan_all(self) -> None:
         for src in self.db.list_sources():

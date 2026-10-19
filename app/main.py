@@ -53,12 +53,16 @@ async def amain() -> None:
     enrich_task = asyncio.create_task(indexer.enricher_loop(), name="enricher")
     # resume interrupted scans quietly in the background
     scan_task = asyncio.create_task(indexer.scan_all(), name="resume-scan")
+    # keep retrying scans that die or stall (flaky network), forever
+    supervisor_task = asyncio.create_task(indexer.scan_supervisor(),
+                                          name="scan-supervisor")
     try:
         await server.serve()
     finally:
         indexer.stop()
         enrich_task.cancel()
         scan_task.cancel()
+        supervisor_task.cancel()
         await bot.stop()
         await tmdb.close()
         if llm:

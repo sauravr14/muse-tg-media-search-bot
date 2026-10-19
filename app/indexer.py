@@ -87,6 +87,12 @@ class Indexer:
         self._running = False
         # live scan progress for the /indexstatus panel (None when idle)
         self.current_scan: dict | None = None
+        # admin-requested stops, checked per batch (/stopindex)
+        self._stop_ids: set[int] = set()
+
+    def request_stop(self, chat_id: int) -> None:
+        """Ask the running scan of chat_id to stop after its current batch."""
+        self._stop_ids.add(chat_id)
 
     # -- ingestion ---------------------------------------------------------
     async def ingest_message(self, msg) -> dict | None:
@@ -303,6 +309,7 @@ class Indexer:
             cur = lo
             total = hi - lo + 1
             self._poison_count = 0  # poisoned sub-ranges skipped this scan
+            self._stop_ids.discard(chat_id)  # stale stop from an older scan
             # live state for the /indexstatus panel
             self.current_scan = {
                 "chat_id": chat_id,
@@ -312,6 +319,10 @@ class Indexer:
             }
             try:
                 while cur <= hi:
+                    if chat_id in self._stop_ids:
+                        self._stop_ids.discard(chat_id)
+                        log.info("scan of %s stopped by admin at %s", chat_id, cur)
+                        break
                     batch_end = min(cur + BATCH - 1, hi)
                     ids = list(range(cur, batch_end + 1))
                     msgs = None
@@ -362,9 +373,14 @@ class Indexer:
                         "poison_skipped": getattr(self, "_poison_count", 0)}
             finally:
                 self.current_scan = None
-            self.db.set_source(chat_id, status="idle", last_msg_id=hi)
-            return {"scanned": done, "new": new,
-                    "poison_skipped": getattr(self, "_poison_count", 0)}
+            stopped = cur <= hi  # loop exited early via /stopindex
+            self.db.set_source(chat_id, status="idle",
+                               last_msg_id=hi if not stopped else cur - 1)
+            res = {"scanned": done, "new": new,
+                   "poison_skipped": getattr(self, "_poison_count", 0)}
+            if stopped:
+                res["note"] = "stopped by admin"
+            return res
 
     def _heartbeat(self, chat_id: int) -> None:
         self.db.set_kv(f"scan_hb:{chat_id}", str(time.time()))

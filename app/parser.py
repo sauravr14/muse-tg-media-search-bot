@@ -122,6 +122,29 @@ HEX_RE = re.compile(r"\b[0-9a-fA-F]{8,}\b")
 # long alphanumeric tokens with 3+ digits: hashes, not titles ("Nz87Gp0H5Au").
 # Real titles with digits ("21JumpStreet", "Se7en") have <3 digits.
 HASHY_RE = re.compile(r"\b(?=[A-Za-z0-9]{10,})(?:[A-Za-z]*\d){3,}[A-Za-z0-9]*\b")
+# channel watermark tokens that may follow an @handle
+# ("@Fbm Hw ...", "@Mallu Movies ..."). Articles and short real words
+# ("The", "It", "Up") are deliberately NOT in here, so short real
+# titles can never be eaten.
+_CHANNEL_TOKENS = {"hw", "mm", "fbm", "mallu", "movie", "movies"}
+
+
+def _strip_channel_watermark(name: str) -> str:
+    """Strip a leading channel watermark: "@Fbm Hw", "@Mm", "@Mallu Movies".
+
+    Removes the @handle and any following watermark tokens. Only the
+    curated vocabulary above is ever eaten, so real titles are safe:
+    "@Mm It 2017" -> "It 2017", "@Fbm Hw The Matrix" -> "The Matrix".
+    Only applies when the name starts with "@" (after optional space).
+    """
+    m = re.match(r"\s*@\w+\s*", name)
+    if not m:
+        return name
+    toks = name[m.end():].split()
+    i = 0
+    while i < len(toks) - 1 and toks[i].lower() in _CHANNEL_TOKENS:
+        i += 1
+    return " ".join(toks[i:])
 
 
 @dataclass
@@ -165,6 +188,9 @@ def parse_filename(raw: str) -> ParsedName:
     # flatten separators FIRST so \b-anchored patterns work on
     # underscore/dot filenames ("Lanterns_2026_S01E01_720p")
     name = re.sub(r"[._\-+]+", " ", name)
+    # channel watermarks ("@Fbm Hw Teenage Mutant Ninja Turtles") — strip
+    # before any other parsing so TMDB matching sees the real title
+    name = _strip_channel_watermark(name)
 
     # season packs ("S01 COMBINED", "[E01-04]") before series markers
     name = _detect_pack(name, p, pack_range)

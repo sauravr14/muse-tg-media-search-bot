@@ -732,9 +732,12 @@ class MediaBot:
                             f"indexed {res.get('new', 0):,} new files. "
                             f"It will resume automatically.")
             else:
+                skipped = res.get("poison_skipped", 0)
+                skip_note = (f" ({skipped} unresolvable message ranges skipped — "
+                             f"Telegram never answered for them)") if skipped else ""
                 text = (f"✅ Scan of <b>{html.escape(name)}</b> done — "
                         f"{res.get('scanned', 0):,} messages checked, "
-                        f"{res.get('new', 0):,} new files indexed.")
+                        f"{res.get('new', 0):,} new files indexed.{skip_note}")
             if status_msg is not None:
                 try:
                     await status_msg.edit_text(text, parse_mode=ParseMode.HTML)

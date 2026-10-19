@@ -71,19 +71,56 @@ class ScanRobustnessTest(unittest.TestCase):
         self.idx._running = True  # _supervisor_tick checks this flag
 
     def test_hung_connection_does_not_wedge_forever(self):
-        """A hung get_messages hits the timeout, retries, then aborts the
-        scan with status=error instead of holding the scan lock forever."""
+        """A hung get_messages is routed around: poisoned ranges are
+        bisected down to skippable leaves, the scan completes, and the
+        skipped ranges are recorded instead of holding the scan lock."""
         # hang only batch fetches (multi-id); let the access probe through
         self.client.fail_on(lambda ids: len(ids) > 1, "hang")
         with patch.object(indexer_mod, "GET_TIMEOUT", 0.05), \
+             patch.object(indexer_mod, "POISON_TIMEOUT", 0.05), \
              patch.object(indexer_mod, "MAX_BATCH_RETRIES", 2):
             res = asyncio.run(self.idx.scan_source(self.chat_id, top_id=250))
-        self.assertIn("error", res)
+        self.assertNotIn("error", res)
+        self.assertGreater(res["poison_skipped"], 0)
         row = self.db.query_one("SELECT status FROM sources WHERE chat_id=?",
                                 (self.chat_id,))
-        self.assertEqual(row["status"], "error")
+        self.assertEqual(row["status"], "idle")
         # lock must be free for the next scan
         self.assertFalse(self.idx._scan_lock.locked())
+        # poisoned ranges recorded for a later retry
+        import json
+        ranges = json.loads(self.db.get_kv(f"poison:{self.chat_id}"))
+        self.assertTrue(ranges)
+
+    def test_systemic_hang_still_aborts(self):
+        """If even single IDs hang (systemic outage, not a poisoned range),
+        _fetch_ids raises so the caller retries/aborts instead of
+        silently skipping everything."""
+        self.client.fail_on(lambda ids: True, "hang")
+        with patch.object(indexer_mod, "GET_TIMEOUT", 0.05), \
+             patch.object(indexer_mod, "POISON_TIMEOUT", 0.05):
+            with self.assertRaises(asyncio.TimeoutError):
+                asyncio.run(self.idx._fetch_ids(self.chat_id, [5, 6, 7], 0.05))
+
+    def test_poisoned_subrange_skipped_rest_indexed(self):
+        """Only the poisoned sub-range is skipped; everything else indexes
+        normally and the checkpoint still advances past it."""
+        def poisoned(ids):
+            return len(ids) > 1 and any(120 <= i <= 140 for i in ids)
+        self.client.fail_on(poisoned, "hang")
+        # singles always work (like the real Telegram behavior)
+        with patch.object(indexer_mod, "GET_TIMEOUT", 0.05), \
+             patch.object(indexer_mod, "POISON_TIMEOUT", 0.05):
+            res = asyncio.run(self.idx.scan_source(self.chat_id, top_id=250))
+        self.assertNotIn("error", res)
+        self.assertGreater(res["poison_skipped"], 0)
+        # most files indexed despite the dead zone
+        self.assertGreater(res["new"], 200)
+        row = self.db.query_one(
+            "SELECT last_msg_id, status FROM sources WHERE chat_id=?",
+            (self.chat_id,))
+        self.assertEqual(row["last_msg_id"], 250)
+        self.assertEqual(row["status"], "idle")
 
     def test_flaky_batch_retried_then_succeeds(self):
         """Transient OSErrors are retried within the batch; the scan

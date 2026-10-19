@@ -44,6 +44,8 @@ async def amain() -> None:
         log.info("LLM title fallback enabled (%s)", cfg.llm_model)
     indexer = Indexer(bot.client, db, tmdb, llm=llm)
     bot.indexer = indexer
+    from .panel import IndexPanel
+    bot.panel = IndexPanel(bot.client, db, indexer)
 
     await bot.start()
     app = create_app(cfg, db, bot_username=bot.username, bot=bot)

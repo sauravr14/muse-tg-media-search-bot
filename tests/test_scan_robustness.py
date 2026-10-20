@@ -388,3 +388,39 @@ class CleanupCatalogTest(unittest.TestCase):
         self.assertEqual(self.db.query_one(
             "SELECT COUNT(*) c FROM files WHERE title_id=?",
             (self.other_id,))["c"], 1)
+
+    def test_cleanup_reaches_files_beyond_first_page(self):
+        """Cleanup pages through the whole catalog by id: a junk-grouped
+        file sitting past the first 500-file page is still moved, and its
+        emptied junk title is removed."""
+        now = time.time()
+        with self.db.transaction():
+            cur = self.db.execute(
+                "INSERT INTO titles(kind, title, norm_title, year, "
+                "added_at, updated_at) VALUES('movie', 'Bulk Movie', "
+                "'bulk movie', 2020, ?, ?)", (now, now))
+            bulk_id = cur.lastrowid
+            cur = self.db.execute(
+                "INSERT INTO titles(kind, title, norm_title, year, "
+                "added_at, updated_at) VALUES('movie', 'Bulk Movie 700Mb', "
+                "'bulk movie 700mb', 2020, ?, ?)", (now, now))
+            junk2_id = cur.lastrowid
+            for i in range(599):
+                self.db.execute(
+                    "INSERT INTO files(title_id, file_name, tg_chat_id, "
+                    "tg_msg_id, indexed_at, status) VALUES(?, "
+                    "'Bulk.Movie.2020.1080p.mkv', ?, ?, ?, 'ok')",
+                    (bulk_id, self.chat_id, 1000 + i, now))
+            # the junk-grouped file lands beyond the first page of 500
+            self.db.execute(
+                "INSERT INTO files(title_id, file_name, tg_chat_id, "
+                "tg_msg_id, indexed_at, status) VALUES(?, "
+                "'Bulk.Movie.2020.720p.mkv', ?, ?, ?, 'ok')",
+                (junk2_id, self.chat_id, 9999, now))
+        res = asyncio.run(self.idx.cleanup_catalog())
+        self.assertGreaterEqual(res["moved"], 2)  # setUp junk + this one
+        self.assertIsNone(self.db.query_one(
+            "SELECT id FROM titles WHERE id=?", (junk2_id,)))
+        f = self.db.query_one(
+            "SELECT title_id FROM files WHERE tg_msg_id=9999")
+        self.assertEqual(f["title_id"], bulk_id)

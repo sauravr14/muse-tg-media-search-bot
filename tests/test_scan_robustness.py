@@ -122,6 +122,26 @@ class ScanRobustnessTest(unittest.TestCase):
         self.assertEqual(row["last_msg_id"], 250)
         self.assertEqual(row["status"], "idle")
 
+    def test_poisoned_singles_hang_too_scan_still_crosses(self):
+        """Real Cinemania behaviour: single-ID fetches inside the dead
+        zone hang as well, so probing ids[0] of the hanging range can
+        never work. The scan must probe a known-good ID outside the
+        range, bisect past the zone, and still advance the checkpoint."""
+        self.client.fail_on(
+            lambda ids: any(120 <= i <= 140 for i in ids), "hang")
+        with patch.object(indexer_mod, "GET_TIMEOUT", 0.05), \
+             patch.object(indexer_mod, "POISON_TIMEOUT", 0.05):
+            res = asyncio.run(self.idx.scan_source(self.chat_id, top_id=250))
+        self.assertNotIn("error", res)
+        self.assertGreater(res["poison_skipped"], 0)
+        # only the leaves overlapping the zone are lost
+        self.assertGreater(res["new"], 200)
+        row = self.db.query_one(
+            "SELECT last_msg_id, status FROM sources WHERE chat_id=?",
+            (self.chat_id,))
+        self.assertEqual(row["last_msg_id"], 250)
+        self.assertEqual(row["status"], "idle")
+
     def test_flaky_batch_retried_then_succeeds(self):
         """Transient OSErrors are retried within the batch; the scan
         completes and indexes everything."""

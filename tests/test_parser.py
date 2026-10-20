@@ -228,6 +228,19 @@ class ParserTest(unittest.TestCase):
         p = parse_filename("Some Movie 2020 700MB 480p.mkv")
         self.assertEqual(p.title, "Some Movie")
 
+    def test_file_size_glued_to_separators(self):
+        # "_450MB" has no \b before the digits ("_" is a word char),
+        # so the size pattern must be separator-aware on both sides
+        p = parse_filename("Vivaha_Bhojanambu_2021_HQ_HDRip_x264_Telugu_Kannada_450MB.mkv")
+        self.assertEqual(p.title, "Vivaha Bhojanambu Telugu Kannada")
+        p = parse_filename("Movie_2020_700MB_480p.mkv")
+        self.assertEqual(p.title, "Movie")
+        p = parse_filename("Movie.2020.1.2GB.1080p.mkv")
+        self.assertEqual(p.title, "Movie")
+        # ...but a size glued to letters is not a size token
+        p = parse_filename("ABC450MB 2020 720p.mkv")
+        self.assertIn("450", p.title)
+
     def test_underscore_separators(self):
         p = parse_filename("Vivah_2006_BluRay_REMASTERED_720p_Hindi_AAC_5_1_x264_ESub_mkvCinemas.mkv")
         self.assertEqual(p.title, "Vivah")

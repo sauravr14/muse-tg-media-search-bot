@@ -95,8 +95,12 @@ EP_ONLY_RE = re.compile(r"[Ee](\d{1,3})\b")
 
 # file sizes are never part of the title ("Vivah (2006) ... 3.2GB ..." ->
 # "Vivah", not "Vivah 3 2Gb"). Applied BEFORE separator flattening so
-# "3.2GB" is still one token.
-SIZE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*[GM]B\b", re.I)
+# "3.2GB" is still one token. The lookbehind allows separator-glued
+# sizes ("Movie_2021_700MB.mkv") — a bare \b fails there because "_"
+# is a word character, so "_450MB" has no boundary before the digits.
+# (?<![^\s_.+-]) / (?![^\s_.+-]) = surrounded by separators/spaces or
+# string edges, fixed-width (a bare \b fails on "_450MB").
+SIZE_RE = re.compile(r"(?<![^\s_.+-])\d+(?:\.\d+)?\s*[GM]B(?![^\s_.+-])", re.I)
 
 RELEASE_GROUPS = re.compile(
     r"\b(YTS|YIFY|RARBG|ETRG|PSA|GalaxyRG|TGx|ION10|NTb|SPARKS|FGT|HDT|EbP|PAHE|"

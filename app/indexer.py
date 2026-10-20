@@ -464,6 +464,11 @@ class Indexer:
                 with self.db.transaction():
                     res = self.clf.ingest(p, meta)
                 n += 1
+                # yield to the event loop: without this the rebuild starves
+                # the bot/API for hours (observed 2026-10-20: healthz and
+                # /api timed out for the whole reparse)
+                if n % 50 == 49:
+                    await asyncio.sleep(0)
                 if res.get("duplicate"):
                     continue
                 if (f["tg_chat_id"], f["tg_msg_id"]) in hidden:

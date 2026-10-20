@@ -41,14 +41,21 @@ class Classifier:
             for r in rows:
                 if r["year"] == p.year:
                     return dict(r)
-        # FTS fallback for minor spelling differences
+        # FTS fallback for minor differences (e.g. word order). The phrase
+        # query also matches titles that merely START with the parsed title
+        # — e.g. a leftover junk title "... 700Mb" — which used to capture
+        # clean files right back onto the junk title. Accept a hit only
+        # when its norm_title is exactly the same words: never a superset.
         if not rows:
+            want = sorted(p.norm_title.split())
             fts = db.query(
                 "SELECT t.* FROM titles_fts f JOIN titles t ON t.id=f.rowid "
                 "WHERE titles_fts MATCH ? LIMIT 5",
                 (f'"{p.norm_title}"',),
             )
             for r in fts:
+                if sorted((r["norm_title"] or "").split()) != want:
+                    continue
                 if r["kind"] == p.kind and (not p.year or r["year"] in (p.year, None)):
                     return dict(r)
         return None

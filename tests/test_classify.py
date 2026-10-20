@@ -60,6 +60,23 @@ class ClassifyTest(unittest.TestCase):
         self.assertTrue(r2["duplicate"])
         self.assertEqual(r1["file_id"], r2["file_id"])
 
+    def test_fts_fallback_never_captures_onto_junk_title(self):
+        """A leftover junk title whose norm merely STARTS WITH the clean
+        title ("vivaha bhojanambu 700mb") must not recapture clean files
+        via the FTS phrase fallback — the file gets its own clean title."""
+        junk = parse_filename("Vivaha.Bhojanambu.2021.720p.mkv")
+        junk.title = "Vivaha Bhojanambu 700Mb"
+        junk.norm_title = "vivaha bhojanambu 700mb"
+        junk_row = self.clf.create_title(junk, None)
+        clean = parse_filename("Vivaha.Bhojanambu.2021.720p.mkv")
+        self.assertIsNone(self.clf.find_title(clean))
+        r = self.clf.ingest(clean, _file_meta(-1001, 99,
+                                              "Vivaha.Bhojanambu.2021.720p.mkv"))
+        self.assertNotEqual(r["title_id"], junk_row["id"])
+        row = self.db.query_one("SELECT norm_title FROM titles WHERE id=?",
+                                (r["title_id"],))
+        self.assertEqual(row["norm_title"], "vivaha bhojanambu")
+
     def test_duplicate_sources_kept(self):
         # same movie in two channels -> one title, two file rows
         for chat in (-1001, -1002):

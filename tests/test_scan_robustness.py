@@ -307,3 +307,64 @@ class ForwardedFilterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CleanupCatalogTest(unittest.TestCase):
+    """cleanup_catalog moves only files whose parse changed, preserves
+    good titles (posters/TMDB), and removes orphaned junk titles."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = DB(os.path.join(self.tmp, "t.db"))
+        self.chat_id = -1002001978984
+        self.db.upsert_source(self.chat_id, "JEROM DB", "")
+        self.idx = Indexer(FakeClient({}), self.db, TMDB(self.db, ""))
+        now = time.time()
+
+        def add_title(title, norm, year, poster=""):
+            cur = self.db.execute(
+                "INSERT INTO titles(kind, title, norm_title, year, poster, "
+                "added_at, updated_at) VALUES('movie', ?, ?, ?, ?, ?, ?)",
+                (title, norm, year, poster, now, now))
+            return cur.lastrowid
+
+        def add_file(title_id, msg_id, file_name, status="ok"):
+            self.db.execute(
+                "INSERT INTO files(title_id, file_name, tg_chat_id, tg_msg_id, "
+                "indexed_at, status) VALUES(?, ?, ?, ?, ?, ?)",
+                (title_id, file_name, self.chat_id, msg_id, now, status))
+
+        # junk title from the old parser, holding a Vivah file
+        self.junk_id = add_title("Vivah 3 2Gb", "vivah 3 2gb", 2006)
+        add_file(self.junk_id, 1,
+                 "Vivah (2006) Hindi 1080p BluRay 3.2GB ESub [BollYFlix].mkv")
+        # the correct title already exists, with a TMDB match + poster
+        self.good_id = add_title("Vivah", "vivah", 2006, poster="http://p/x.jpg")
+        self.db.execute("UPDATE titles SET tmdb_id=999 WHERE id=?",
+                        (self.good_id,))
+        add_file(self.good_id, 2, "Vivah.2006.720p.BluRay.mkv")
+        # an unrelated correct title that must be left alone
+        self.other_id = add_title("Inception", "inception", 2010,
+                                  poster="http://p/i.jpg")
+        add_file(self.other_id, 3, "Inception.2010.1080p.BluRay.mkv")
+
+    def test_cleanup_moves_only_changed_files(self):
+        res = asyncio.run(self.idx.cleanup_catalog())
+        self.assertEqual(res["moved"], 1)
+        self.assertEqual(res["kept"], 2)
+        self.assertEqual(res["orphans_removed"], 1)
+        # junk title gone
+        self.assertIsNone(self.db.query_one(
+            "SELECT id FROM titles WHERE id=?", (self.junk_id,)))
+        # both Vivah files now under the good title, poster preserved
+        files = self.db.query(
+            "SELECT tg_msg_id FROM files WHERE title_id=?", (self.good_id,))
+        self.assertEqual({f["tg_msg_id"] for f in files}, {1, 2})
+        t = self.db.query_one("SELECT poster, tmdb_id FROM titles WHERE id=?",
+                              (self.good_id,))
+        self.assertEqual(t["poster"], "http://p/x.jpg")
+        self.assertEqual(t["tmdb_id"], 999)
+        # unrelated title untouched
+        self.assertEqual(self.db.query_one(
+            "SELECT COUNT(*) c FROM files WHERE title_id=?",
+            (self.other_id,))["c"], 1)

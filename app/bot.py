@@ -443,6 +443,13 @@ class MediaBot:
                                "I'll report here when it's done.")
             asyncio.create_task(self._reparse_report(m.chat.id))
 
+        @c.on_message(filters.private & filters.command("cleanup") & filters.user(admin_ids))
+        async def cleanup(_, m: Message):
+            await m.reply_text("🧹 Cleaning up mis-grouped files — only files whose "
+                               "title changed under the current parser get moved; "
+                               "posters and matches stay intact. I'll report when done.")
+            asyncio.create_task(self._cleanup_report(m.chat.id))
+
         @c.on_message(filters.private & filters.command("setskip") & filters.user(admin_ids))
         async def setskip(_, m: Message):
             """Skip the first N messages of a channel when scanning.
@@ -788,6 +795,20 @@ class MediaBot:
             await self.client.send_message(notify_chat, text, parse_mode=ParseMode.HTML)
         except Exception as e:
             log.warning("reparse report failed: %r", e)
+
+    async def _cleanup_report(self, notify_chat: int):
+        try:
+            res = await self.indexer.cleanup_catalog()
+            text = (f"✅ Cleanup done: <b>{res['moved']:,}</b> files moved to their "
+                    f"correct titles, <b>{res['orphans_removed']:,}</b> empty junk "
+                    f"titles removed, <b>{res['kept']:,}</b> files already correct.")
+        except Exception as e:
+            log.warning("cleanup failed: %r", e)
+            text = f"⚠️ Cleanup failed: {html.escape(str(e)[:200])}"
+        try:
+            await self.client.send_message(notify_chat, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("cleanup report failed: %r", e)
 
     async def _index_all_report(self, notify_chat: int):
         lines = []

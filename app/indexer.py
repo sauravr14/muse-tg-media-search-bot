@@ -532,49 +532,73 @@ class Indexer:
         their correct title. Matching files — and their titles' posters /
         TMDB matches — are untouched, unlike rebuild_catalog which wipes
         everything. Titles left with no files are removed (seasons and
-        episodes cascade). Holds the scan lock; yields so the bot and
-        Mini App stay responsive."""
+        episodes cascade). Holds the scan lock.
+
+        Responsiveness contract (learned the hard way on 2026-10-20: the
+        first version loaded all ~496k rows at once and yielded only every
+        50 files; on a full-size catalog each stretch ran seconds-long, the
+        bot/API/Telegram-ping starved for ~2h and the app looked dead).
+        This version pages through files by id in small chunks and yields
+        to the event loop after EVERY file, and logs progress so a stall
+        is visible in the container logs."""
         from .parser import parse_filename
         async with self._scan_lock:
-            rows = self.db.query(
-                "SELECT f.*, t.norm_title AS cur_norm, t.year AS cur_year, "
-                "t.kind AS cur_kind FROM files f "
-                "LEFT JOIN titles t ON t.id = f.title_id")
+            top = self.db.query_one("SELECT MAX(id) AS m FROM files")
+            max_id = top["m"] or 0  # snapshot: re-inserted files get new
+            # ids above this and are not revisited in the same run
             moved = kept = 0
-            for i, f in enumerate(rows):
-                if i % 50 == 49:
+            last_id = 0
+            while last_id < max_id:
+                rows = self.db.query(
+                    "SELECT f.*, t.norm_title AS cur_norm, t.year AS cur_year, "
+                    "t.kind AS cur_kind FROM files f "
+                    "LEFT JOIN titles t ON t.id = f.title_id "
+                    "WHERE f.id > ? AND f.id <= ? ORDER BY f.id LIMIT 500",
+                    (last_id, max_id))
+                if not rows:
+                    break
+                for f in rows:
+                    last_id = f["id"]
+                    p = parse_filename(f["file_name"] or "")
+                    if p.title:
+                        if (p.norm_title == f["cur_norm"]
+                                and p.year == f["cur_year"]
+                                and p.kind == f["cur_kind"]):
+                            kept += 1
+                        else:
+                            hidden = f["status"] == "hidden"
+                            self.db.execute("DELETE FROM files WHERE id=?",
+                                            (f["id"],))
+                            meta = {"file_name": f["file_name"],
+                                    "size": f["size"] or 0,
+                                    "duration": f["duration"] or 0,
+                                    "mime": f["mime"] or "",
+                                    "tg_chat_id": f["tg_chat_id"],
+                                    "tg_msg_id": f["tg_msg_id"],
+                                    "caption": f["caption"] or "",
+                                    "msg_date": f["msg_date"] or 0}
+                            with self.db.transaction():
+                                res = self.clf.ingest(p, meta)
+                            moved += 1
+                            if not res.get("duplicate"):
+                                if hidden:
+                                    self.db.execute(
+                                        "UPDATE files SET status='hidden' "
+                                        "WHERE id=?", (res["file_id"],))
+                                title = self.db.query_one(
+                                    "SELECT id, tmdb_id FROM titles WHERE id=?",
+                                    (res["title_id"],))
+                                if title and not title["tmdb_id"]:
+                                    try:
+                                        self._enrich_queue.put_nowait(
+                                            title["id"])
+                                    except asyncio.QueueFull:
+                                        pass
+                    # breathe on EVERY file, not every 50: on a 500MB
+                    # catalog even a short stretch starves the loop
                     await asyncio.sleep(0)
-                p = parse_filename(f["file_name"] or "")
-                if not p.title:
-                    continue
-                if (p.norm_title == f["cur_norm"] and p.year == f["cur_year"]
-                        and p.kind == f["cur_kind"]):
-                    kept += 1
-                    continue
-                hidden = f["status"] == "hidden"
-                self.db.execute("DELETE FROM files WHERE id=?", (f["id"],))
-                meta = {"file_name": f["file_name"], "size": f["size"] or 0,
-                        "duration": f["duration"] or 0, "mime": f["mime"] or "",
-                        "tg_chat_id": f["tg_chat_id"], "tg_msg_id": f["tg_msg_id"],
-                        "caption": f["caption"] or "",
-                        "msg_date": f["msg_date"] or 0}
-                with self.db.transaction():
-                    res = self.clf.ingest(p, meta)
-                moved += 1
-                if res.get("duplicate"):
-                    continue
-                if hidden:
-                    self.db.execute(
-                        "UPDATE files SET status='hidden' WHERE id=?",
-                        (res["file_id"],))
-                title = self.db.query_one(
-                    "SELECT id, tmdb_id FROM titles WHERE id=?",
-                    (res["title_id"],))
-                if title and not title["tmdb_id"]:
-                    try:
-                        self._enrich_queue.put_nowait(title["id"])
-                    except asyncio.QueueFull:
-                        pass
+                log.info("catalog cleanup: %d/%d files checked (%d moved)",
+                         kept + moved, max_id, moved)
             orphans = self.db.execute(
                 "DELETE FROM titles WHERE id NOT IN "
                 "(SELECT DISTINCT title_id FROM files WHERE title_id IS NOT NULL)"

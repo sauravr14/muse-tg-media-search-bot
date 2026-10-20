@@ -291,6 +291,60 @@ class ParserTest(unittest.TestCase):
         p = parse_filename("🎬 Vivah (2006) Hindi 1080p BluRay.mkv")
         self.assertEqual(p.title, "Vivah")
 
+    def test_no_way_home_release_tag_family(self):
+        """Real filenames that used to splinter Spider-Man: No Way Home
+        into ~28 titles: ORG/BMS/HYBRID/BCORE tags, truncated tokens
+        (HEV, BluRa, Web D, AAC_5), glued channel brands, split-archive
+        part markers and version tags all strip to the one title."""
+        cases = [
+            "Spider_Man_No_Way_Home_2021_720p_10bit_BluRay_x265_HEVC_Org_BMS.mkv",
+            "Spider_Man:_No_Way_Home_2021_Extended_Cut_HYBRID_IMAX_1080p_x265.mkv",
+            "Spider_Man:_No_Way_Home_2021_720p_BluRay_10bit_HEVC_Hindi_AAC_5.mkv",
+            "@Gmovies_Hub_|Spider_Man_No_Way_Home_2021_WebRip_EXTENDED_Hin_Eng.mkv",
+            "@Gmovies_Hub_Spider_Man_No_Way_Home_2021_BluRay_Hindi_Cam_+_English_ORG.mkv",
+            "@VIP_MOVIES_BACKUPSpider Man: No Way Home @VIP_MOVIES_BACKUP.mkv",
+            "Spider_Man_No_Way_Home_2021_1080p_BCORE_IMAX_WEBRip_x265_10bit_Hindi.mkv",
+            "Spider-Man - No Way Home (2021) 1080p UHD HDR10 DV BluRa.mkv",
+            "[MM] Spider-Man No Way Home (2021) Blu-Ray - 720p - HEV.mkv",
+            "Spider-Man: No.Way.Home.2021.720p.SonyLiv.WEB-DL.HINDI-M.mkv",
+            "Spider-Man: No.Way.Home.2021.1080p.SonyLiv.WEB-D.part001.mkv",
+            "Spider_Man_No_Way_Home_2021_Hindi_English_720p_V2_HQ_HD_CAM_x264.mkv",
+            "Spider_Man_No_Way_Home_2021_720p_10bit_BRRip_Hin_Eng_x265_HEVC_KatmovieHD.mkv",
+            "TheMoviesBoss_Spider_Man_No_Way_Home_Extended_Version_2021_480p.mkv",
+            "Spider-Man - No Way Home (2021) 1080p 10bit 60FP.part001.mkv",
+            "Spider_Man_No_Way_Home_2021_EXTENDED_720p_10bit_WEBRip_x.mkv",
+            "Spider_man:_No_way_Home_2021_Hindi_ORG_English_ORG_BluRAY_720pHEVC",
+            "Spider_Man:_No_Way_Home_2021_720p_BluRay_ORG_Dual_Audio_Hindi_DD.mkv",
+            "Spider_Man_No_Way_Home_2022_English_BluRay_720p_@Gmovies_Hub.mkv",
+        ]
+        for name in cases:
+            with self.subTest(name=name):
+                p = parse_filename(name)
+                # norm_title is the grouping key (display titles may
+                # keep a ":" — "Spider Man: No Way Home")
+                self.assertEqual(p.norm_title, "spider man no way home")
+                self.assertEqual(p.kind, "movie")
+
+    def test_no_way_home_extended_2022_keeps_its_year(self):
+        # the extended-version re-release files genuinely claim 2022;
+        # the title cleans up but the year is data, not junk
+        p = parse_filename(
+            "Spider_Man_No_Way_Home_Extended_Version_2022_720p_10bit_DS4K_WEBRip.mkv")
+        self.assertEqual(p.norm_title, "spider man no way home")
+        self.assertEqual(p.year, 2022)
+
+    def test_new_strips_do_not_eat_real_titles(self):
+        # guards for the aggressive additions above
+        p = parse_filename("Uncut.Gems.2019.1080p.BluRay.x264.mkv")
+        self.assertEqual(p.title, "Uncut Gems")
+        p = parse_filename("Dune.Part.Two.2024.1080p.WEB-DL.mkv")
+        self.assertEqual(p.title, "Dune Part Two")
+        p = parse_filename("The.Version.1999.DVDRip.mkv")
+        self.assertEqual(p.title, "The Version")
+        # the intact "AAC 5.1" path must keep working end to end
+        p = parse_filename("Some.Movie.2020.720p.BluRay.AAC.5.1.x264.mkv")
+        self.assertEqual(p.title, "Some Movie")
+
 if __name__ == "__main__":
     unittest.main()
 

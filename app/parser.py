@@ -119,16 +119,34 @@ SITE_NAMES = re.compile(
     re.I,
 )
 
+# Channel brands that arrive glued to the filename with separators still
+# intact ("@Gmovies_Hub_Spider...", "@VIP_MOVIES_BACKUP...", "TheMoviesBoss_...")
+# must be stripped BEFORE separators are flattened: afterwards the handle
+# and the title are indistinguishable ("Gmovies Hub Spider Man...").
+# The leading "@" is consumed when present; no word boundary is required
+# after the brand, so a brand glued straight onto the title
+# ("@VIP_MOVIES_BACKUPSpider...") still strips cleanly.
+CHANNEL_BRANDS_RE = re.compile(
+    r"@?(?:gmovies[\s._-]*hub|vip[\s._-]*movies[\s._-]*backup|"
+    r"the[\s._-]*movies[\s._-]*boss|netflix[\s._-]*tudum|m2links)",
+    re.I,
+)
+
 # Release tags that are never part of the display title
 TAG_STRIP_RE = re.compile(
-    r"\b(REMASTERED|REMASTER|PROPER|REPACK|RERIP|UNRATED|EXTENDED|"
+    r"\b(REMASTERED|REMASTER|PROPER|REPACK|RERIP|UNRATED|EXTENDED\s+CUT|EXTENDED\s+VERSION|EXTENDED|"
     r"DIRECTORS?[.\s_-]*CUT|THEATRICAL|IMAX|"
+    r"ORG|BMS|HYBRID|BCORE|DS4K|KATMOVIES?HD|SONYLIV|"
+    r"PART\s?0\d\d|V\d|BLURA|HEV|WEB\s+D|"
+    r"(?:480|720|1080|2160)P(?:HEVC|X26[45]|H26[45]|10BIT)|"
+    r"\d{2,3}\s*FPS|\d{2,3}FP|"
     r"10BIT|8BIT|12BIT|HDR10PLUS|HDR10\+?|HDR|DV|SDR|"
     r"NF|AMZN|DSNP|HULU|ATVP|HBO|PCOK|CRIT|"
     r"\bHQ\b|\bHD\b|"
     r"HEVX|JHS|"
     r"\b\d+\s*CH\b|"
     r"\bPSAOyeSale\b|\bHarsh\b|\bPSA\b|"
+    r"AAC\s+5(?!\s*1)|DD\b|"
     r"AAC|AC3|EAC3|DTS(?:-HD)?|DDP?\s*2\s*0|DDP?\s*5\s*1|\b5\s*1\b|\b2\s*0\b|ATMOS|TRUEHD|"
     r"AAC\s*5\s*1|"
     r"H\s*26[45]\b|"
@@ -214,6 +232,9 @@ def parse_filename(raw: str) -> ParsedName:
     # file sizes ("3.2GB", "700MB") are never part of the title — strip
     # before separators are flattened so "3.2GB" is still one token
     name = SIZE_RE.sub(" ", name)
+    # glued channel brands ("@Gmovies_Hub_...", "@VIP_MOVIES_BACKUP...")
+    # while the separators that delimit them are still intact
+    name = CHANNEL_BRANDS_RE.sub(" ", name)
     # pack episode range like [E01-04]: read before "-" is flattened
     rm = PACK_RANGE_RE.search(name)
     pack_range = (int(rm.group(1)), int(rm.group(2))) if rm else None
@@ -289,8 +310,9 @@ def parse_filename(raw: str) -> ParsedName:
     # trailing site-tag separator junk: "The Furious ... MoviesMod.At"
     # (a leading "At" can be legit: "At Close Range" — only strip trailing)
     name = re.sub(r"\s+\b[Aa][Tt]\b\s*$", " ", name)
-    # truncated tag letter: "... 10bit N" (was "NF")
-    name = re.sub(r"\s+[A-Z]\s*$", " ", name)
+    # truncated tag letter: "... 10bit N" (was "NF"), "... WEBRip x"
+    # (was "x264") — case-insensitive, the flattened name is not cased yet
+    name = re.sub(r"\s+[A-Z]\s*$", " ", name, flags=re.I)
     name = re.sub(r"\b(Season|Series|Episode|Ep|Dual|Audio|Hindi|Hin|English|Engli|Eng|"
                 r"Tam|Tel|Mal|Kan|Multi|ESub)\b", " ", name, flags=re.I)
     # site suffix: "MoviesMod Com" (was ".com")

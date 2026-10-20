@@ -89,6 +89,11 @@ class Indexer:
         self.current_scan: dict | None = None
         # admin-requested stops, checked per batch (/stopindex)
         self._stop_ids: set[int] = set()
+        # An ID Telegram has served recently, per chat. Probing THIS id
+        # (instead of one inside a hanging range) tells a poisoned range
+        # apart from a systemic outage: the range is dead, the id answers.
+        self._known_good: dict[int, int] = {}
+        self._alive_at: dict[int, float] = {}
 
     def request_stop(self, chat_id: int) -> None:
         """Ask the running scan of chat_id to stop after its current batch."""
@@ -162,23 +167,63 @@ class Indexer:
             ranges = json.loads(self.db.get_kv(key) or "[]")
         except Exception:
             ranges = []
-        ranges.append([lo, hi])
-        self.db.set_kv(key, json.dumps(ranges[-50:]))
+        if [lo, hi] not in ranges:
+            ranges.append([lo, hi])
+            self.db.set_kv(key, json.dumps(ranges[-50:]))
         self._poison_count = getattr(self, "_poison_count", 0) + 1
+
+    async def _service_alive(self, chat_id: int) -> bool:
+        """True if Telegram answers at all for this chat right now.
+
+        Probes an ID OUTSIDE any hanging range — the last ID Telegram
+        served for this chat, falling back to ID 1. Probing inside the
+        range (the old approach) hangs on a fully poisoned range and was
+        indistinguishable from a total outage. Any answer counts, even an
+        RPC error or an empty message; only a timeout means "not alive".
+        A positive result is cached briefly so bisecting a dead zone
+        doesn't pay a probe per node. FloodWait/OSError propagate.
+        """
+        if time.time() - self._alive_at.get(chat_id, 0) < 30:
+            return True
+        probes = []
+        good = self._known_good.get(chat_id)
+        if good:
+            probes.append(good)
+        if 1 not in probes:
+            probes.append(1)
+        for pid in probes:
+            try:
+                await asyncio.wait_for(self.client.get_messages(chat_id, pid),
+                                       timeout=POISON_TIMEOUT)
+                self._alive_at[chat_id] = time.time()
+                return True
+            except FloodWait:
+                raise
+            except asyncio.TimeoutError:
+                continue  # try the next reference ID
+            except OSError:
+                raise
+            except Exception:
+                self._alive_at[chat_id] = time.time()
+                return True  # Telegram answered (with an error) -> alive
+        return False
 
     async def _fetch_ids(self, chat_id: int, ids: list, timeout: float) -> list:
         """Fetch one ID batch, routing around poisoned sub-ranges.
 
-        If the whole batch hangs, first probe a single ID: if that hangs
-        too the outage is systemic -> raise so the caller retries/aborts.
-        Otherwise bisect with short timeouts; sub-ranges at/below
-        POISON_LEAF that still hang are skipped (returned as empties) and
-        recorded, so the scan always makes progress.
+        If the batch hangs, check via _service_alive whether Telegram is
+        answering at all: if not, the outage is systemic -> raise so the
+        caller retries/aborts. If yes, the range itself is poisoned ->
+        bisect with short timeouts; sub-ranges at/below POISON_LEAF that
+        still hang are skipped (returned as empties) and recorded, so the
+        scan always makes progress past a dead zone.
         FloodWait and OSError propagate for the caller's retry handling.
         """
         try:
             res = await asyncio.wait_for(self.client.get_messages(chat_id, ids),
                                          timeout=timeout)
+            if ids:
+                self._known_good[chat_id] = ids[-1]
             return list(res)
         except FloodWait:
             raise
@@ -186,17 +231,9 @@ class Indexer:
             pass  # NOTE: must precede OSError — TimeoutError subclasses it
         except OSError:
             raise
-        # The batch hung. Probe one ID to distinguish a poisoned range
-        # from a systemic outage.
-        try:
-            await asyncio.wait_for(self.client.get_messages(chat_id, ids[0]),
-                                   timeout=POISON_TIMEOUT)
-        except asyncio.TimeoutError:
-            raise  # systemic: single ID hangs too -> caller retries/aborts
-        except (FloodWait, OSError):
-            raise
-        except Exception:
-            pass
+        if not await self._service_alive(chat_id):
+            raise asyncio.TimeoutError(
+                "Telegram not answering at all (systemic outage)")
         if len(ids) <= POISON_LEAF:
             lo, hi = ids[0], ids[-1]
             log.warning("scan of %s: ids %s-%s unresolvable, skipping",
@@ -283,6 +320,10 @@ class Indexer:
             skip = src["skip_first"] or 0
             if skip:
                 lo = max(lo, skip + 1)
+            # the checkpoint ID was served in an earlier scan, so it is a
+            # safe reference for _service_alive probes (never inside the
+            # range about to be fetched)
+            self._known_good.setdefault(chat_id, max(1, lo - 1))
             if hi < lo:
                 # Fresh source with no known top (added via /addchannel, never
                 # forwarded): probe the channel's top message id so the scan

@@ -9,6 +9,9 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
+# Optional speedups: TgCrypto makes MTProto encryption ~10x faster, uvloop speeds
+# up the event loop. Best-effort so a missing wheel never breaks the build.
+RUN pip install tgcrypto uvloop || echo "optional speedups skipped"
 
 COPY app ./app
 

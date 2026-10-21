@@ -424,3 +424,54 @@ class CleanupCatalogTest(unittest.TestCase):
         f = self.db.query_one(
             "SELECT title_id FROM files WHERE tg_msg_id=9999")
         self.assertEqual(f["title_id"], bulk_id)
+
+    def test_orphan_delete_has_cascade_indexes_and_chunks(self):
+        """Orphan-title removal must not starve the event loop.
+
+        On 2026-10-21 the single-shot orphan DELETE wedged the bot/API for
+        ~1h: FK cascades into seasons/episodes had no indexes on the child
+        columns, so every deleted title scanned the whole child tables.
+        Guard: the three cascade indexes exist, >2000 orphans are removed
+        across chunks, and seasons/episodes cascade with their title.
+        """
+        for name in ("idx_seasons_title", "idx_episodes_title",
+                     "idx_episodes_season"):
+            self.assertIsNotNone(self.db.query_one(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name=?", (name,)), f"missing index {name}")
+        now = time.time()
+        with self.db.transaction():
+            # orphan series title with a season + episode to cascade
+            cur = self.db.execute(
+                "INSERT INTO titles(kind, title, norm_title, year, "
+                "added_at, updated_at) VALUES('series', 'Orphan Show', "
+                "'orphan show', 2021, ?, ?)", (now, now))
+            series_id = cur.lastrowid
+            cur = self.db.execute(
+                "INSERT INTO seasons(title_id, season_no) VALUES(?, 1)",
+                (series_id,))
+            season_id = cur.lastrowid
+            self.db.execute(
+                "INSERT INTO episodes(title_id, season_id, ep_no) "
+                "VALUES(?, ?, 1)", (series_id, season_id))
+            # enough bare orphans to force the chunked path (>2000)
+            for i in range(2100):
+                self.db.execute(
+                    "INSERT INTO titles(kind, title, norm_title, year, "
+                    "added_at, updated_at) VALUES('movie', ?, ?, 2020, ?, ?)",
+                    (f"Orphan {i}", f"orphan {i}", now, now))
+        res = asyncio.run(self.idx.cleanup_catalog())
+        # setUp junk (1) + series (1) + 2100 bare orphans
+        self.assertEqual(res["orphans_removed"], 2102)
+        self.assertIsNone(self.db.query_one(
+            "SELECT id FROM titles WHERE id=?", (series_id,)))
+        self.assertIsNone(self.db.query_one(
+            "SELECT id FROM seasons WHERE id=?", (season_id,)))
+        self.assertEqual(self.db.query_one(
+            "SELECT COUNT(*) c FROM episodes WHERE title_id=?",
+            (series_id,))["c"], 0)
+        # good titles survive
+        self.assertIsNotNone(self.db.query_one(
+            "SELECT id FROM titles WHERE id=?", (self.good_id,)))
+        self.assertIsNotNone(self.db.query_one(
+            "SELECT id FROM titles WHERE id=?", (self.other_id,)))

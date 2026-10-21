@@ -25,6 +25,9 @@ def _seed(db: DB):
         clf.ingest(parse_filename(f"Inception.2010.{r}.mkv"), meta(-1001, 1 + i, f"Inception.2010.{r}.mkv"))
     for i, e in enumerate(["S01E01", "S01E02"]):
         clf.ingest(parse_filename(f"Dark.{e}.720p.mkv"), meta(-1001, 10 + i, f"Dark.{e}.720p.mkv"))
+    # public lists only show TMDB-matched titles with a poster
+    db.execute("UPDATE titles SET tmdb_id=id+1000, poster='https://image.tmdb.org/t/p/w500/x.jpg',"
+               " backdrop='https://image.tmdb.org/t/p/w500/b.jpg', overview='o'")
 
 
 def _signed_init_data(bot_token: str, user_id: int = 99) -> str:

@@ -124,6 +124,14 @@ CREATE INDEX IF NOT EXISTS idx_files_title_ep ON files(title_id, episode_id);
 CREATE INDEX IF NOT EXISTS idx_files_title_season ON files(title_id, season_id);
 CREATE INDEX IF NOT EXISTS idx_files_episode ON files(episode_id);
 CREATE INDEX IF NOT EXISTS idx_files_recent ON files(indexed_at DESC);
+-- FK-cascade indexes: deleting a title cascades into seasons/episodes.
+-- Without these, each deleted title triggers a full table scan of the
+-- child tables; the /cleanup orphan phase once starved the event loop
+-- for ~1h on a 542k-file catalog (2026-10-21). Created on next startup
+-- via CREATE INDEX IF NOT EXISTS.
+CREATE INDEX IF NOT EXISTS idx_seasons_title ON seasons(title_id);
+CREATE INDEX IF NOT EXISTS idx_episodes_title ON episodes(title_id);
+CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id);
 
 CREATE TABLE IF NOT EXISTS tmdb_cache (
     key         TEXT PRIMARY KEY,

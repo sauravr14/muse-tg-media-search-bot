@@ -232,7 +232,7 @@ class ParserTest(unittest.TestCase):
         # "_450MB" has no \b before the digits ("_" is a word char),
         # so the size pattern must be separator-aware on both sides
         p = parse_filename("Vivaha_Bhojanambu_2021_HQ_HDRip_x264_Telugu_Kannada_450MB.mkv")
-        self.assertEqual(p.title, "Vivaha Bhojanambu Telugu Kannada")
+        self.assertEqual(p.title, "Vivaha Bhojanambu")  # language tags after the year are junk
         p = parse_filename("Movie_2020_700MB_480p.mkv")
         self.assertEqual(p.title, "Movie")
         p = parse_filename("Movie.2020.1.2GB.1080p.mkv")

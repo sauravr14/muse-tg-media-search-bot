@@ -83,11 +83,12 @@ class Classifier:
             }
         cur = self.db.execute(
             "INSERT INTO titles(kind,title,norm_title,orig_title,alt_titles,year,tmdb_id,"
-            "poster,backdrop,overview,genres,rating,popularity,lang,added_at,updated_at,last_file_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "poster,backdrop,overview,genres,rating,popularity,lang,added_at,updated_at,"
+            "last_file_at,has_clean) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (row["kind"], row["title"], row["norm_title"], row["orig_title"], row["alt_titles"],
              row["year"], row["tmdb_id"], row["poster"], row["backdrop"], row["overview"],
-             row["genres"], row["rating"], row["popularity"], row["lang"], now, now, now),
+             row["genres"], row["rating"], row["popularity"], row["lang"], now, now, now,
+             0 if p.is_cam else 1),
         )
         return self.db.query_one("SELECT * FROM titles WHERE id=?", (cur.lastrowid,))  # type: ignore[return-value]
 
@@ -157,14 +158,17 @@ class Classifier:
         cur = db.execute(
             "INSERT OR IGNORE INTO files(title_id, episode_id, season_id, pack_label, is_cam, file_name, norm_name, resolution,"
             " quality, codec, size, duration, mime, tg_chat_id, tg_msg_id, caption,"
-            " msg_date, indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " msg_date, indexed_at, tg_file_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (title_id, episode_id, season_id, pack_label, 1 if p.is_cam else 0, file_meta["file_name"], p.norm_title, p.resolution,
              p.quality, p.codec, file_meta.get("size", 0), file_meta.get("duration", 0),
              file_meta.get("mime", ""), file_meta["tg_chat_id"], file_meta["tg_msg_id"],
-             file_meta.get("caption", ""), file_meta.get("msg_date", 0), now),
+             file_meta.get("caption", ""), file_meta.get("msg_date", 0), now,
+             file_meta.get("tg_file_id", "")),
         )
         db.execute(
-            "UPDATE titles SET last_file_at=?, updated_at=? WHERE id=?", (now, now, title_id)
+            "UPDATE titles SET last_file_at=?, updated_at=?, "
+            "has_clean=CASE WHEN ? THEN 1 ELSE has_clean END WHERE id=?",
+            (now, now, 0 if p.is_cam else 1, title_id)
         )
         return {"title_id": title_id, "episode_id": episode_id,
                 "file_id": cur.lastrowid, "duplicate": False}

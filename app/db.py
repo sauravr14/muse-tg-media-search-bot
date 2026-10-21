@@ -47,7 +47,10 @@ CREATE TABLE IF NOT EXISTS titles (
     added_at    REAL NOT NULL,
     updated_at  REAL NOT NULL,
     last_file_at REAL NOT NULL DEFAULT 0,
-    status      TEXT NOT NULL DEFAULT 'ok'
+    status      TEXT NOT NULL DEFAULT 'ok',
+    has_clean   INTEGER NOT NULL DEFAULT 1,
+    tmdb_tries  INTEGER NOT NULL DEFAULT 0,
+    tmdb_next_at REAL NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_titles_tmdb ON titles(tmdb_id) WHERE tmdb_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_titles_norm ON titles(norm_title, year);
@@ -57,7 +60,8 @@ CREATE INDEX IF NOT EXISTS idx_titles_recent ON titles(last_file_at DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS titles_fts USING fts5(
     title, orig_title, alt_titles, norm_title,
     content='titles', content_rowid='id',
-    tokenize='unicode61 remove_diacritics 2'
+    tokenize='unicode61 remove_diacritics 2',
+    prefix='2 3 4'
 );
 CREATE TRIGGER IF NOT EXISTS trg_titles_ai AFTER INSERT ON titles BEGIN
     INSERT INTO titles_fts(rowid, title, orig_title, alt_titles, norm_title)
@@ -117,6 +121,7 @@ CREATE TABLE IF NOT EXISTS files (
     msg_date    REAL NOT NULL DEFAULT 0,
     indexed_at  REAL NOT NULL,
     status      TEXT NOT NULL DEFAULT 'ok',
+    tg_file_id  TEXT NOT NULL DEFAULT '',
     UNIQUE(tg_chat_id, tg_msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_files_title ON files(title_id);
@@ -173,6 +178,13 @@ class DB:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            # big cache for the main (bot/indexer) thread, small for API
+            # worker threads so many threads can't exhaust a 1 GB VPS
+            main = threading.current_thread() is threading.main_thread()
+            conn.execute(f"PRAGMA cache_size=-{65536 if main else 8192}")
+            conn.execute("PRAGMA mmap_size=268435456")    # 256 MB memory-mapped reads
             self._local.conn = conn
         return conn
 
@@ -196,6 +208,76 @@ class DB:
                 conn.execute("ALTER TABLE files ADD COLUMN is_cam INTEGER "
                              "NOT NULL DEFAULT 0")
             conn.commit()
+            self._migrate_v2(conn)
+
+    def _migrate_v2(self, conn: sqlite3.Connection) -> None:
+        """Performance/reliability migration, idempotent (guarded per step).
+
+        - titles.has_clean / tmdb_tries / tmdb_next_at, files.tg_file_id
+        - partial indexes so Home/Browse/Search never scan the whole catalog
+        - FTS5 rebuilt with prefix indexes (fast type-ahead search)
+        - re-queue titles whose enrichment was wrongly parked for 7 days
+          (TMDB network errors used to count as 'tried') and clear LLM
+          cache entries that were poisoned by rate-limit failures.
+        """
+        tcols = {r[1] for r in conn.execute("PRAGMA table_info(titles)")}
+        if "has_clean" not in tcols:
+            conn.execute("ALTER TABLE titles ADD COLUMN has_clean INTEGER NOT NULL DEFAULT 1")
+            conn.execute(
+                "UPDATE titles SET has_clean = EXISTS("
+                "SELECT 1 FROM files f WHERE f.title_id=titles.id AND f.is_cam=0)")
+        if "tmdb_tries" not in tcols:
+            conn.execute("ALTER TABLE titles ADD COLUMN tmdb_tries INTEGER NOT NULL DEFAULT 0")
+        if "tmdb_next_at" not in tcols:
+            conn.execute("ALTER TABLE titles ADD COLUMN tmdb_next_at REAL NOT NULL DEFAULT 0")
+        fcols = {r[1] for r in conn.execute("PRAGMA table_info(files)")}
+        if "tg_file_id" not in fcols:
+            conn.execute("ALTER TABLE files ADD COLUMN tg_file_id TEXT NOT NULL DEFAULT ''")
+        conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_titles_home ON titles(kind, last_file_at DESC)
+            WHERE tmdb_id IS NOT NULL AND poster != '';
+        CREATE INDEX IF NOT EXISTS idx_titles_pop ON titles(popularity DESC)
+            WHERE tmdb_id IS NOT NULL AND poster != '';
+        CREATE INDEX IF NOT EXISTS idx_titles_rating ON titles(kind, rating DESC)
+            WHERE tmdb_id IS NOT NULL AND poster != '';
+        CREATE INDEX IF NOT EXISTS idx_titles_year ON titles(kind, year DESC)
+            WHERE tmdb_id IS NOT NULL AND poster != '';
+        CREATE INDEX IF NOT EXISTS idx_titles_az ON titles(kind, title COLLATE NOCASE)
+            WHERE tmdb_id IS NOT NULL AND poster != '';
+        CREATE INDEX IF NOT EXISTS idx_titles_unmatched ON titles(tmdb_next_at)
+            WHERE tmdb_id IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_files_title_clean ON files(title_id, is_cam, status);
+        """)
+        conn.commit()
+        if self._kv_conn(conn, "migr_fts_prefix") != "1":
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='titles_fts'").fetchone()
+            if sql and "prefix" not in (sql[0] or ""):
+                conn.executescript("""
+                DROP TRIGGER IF EXISTS trg_titles_ai;
+                DROP TRIGGER IF EXISTS trg_titles_ad;
+                DROP TRIGGER IF EXISTS trg_titles_au;
+                DROP TABLE IF EXISTS titles_fts;
+                """)
+                conn.executescript(SCHEMA)  # recreates FTS (+prefix) and triggers
+                conn.execute("INSERT INTO titles_fts(titles_fts) VALUES('rebuild')")
+            self._kv_set_conn(conn, "migr_fts_prefix", "1")
+        if self._kv_conn(conn, "migr_requeue_v2") != "1":
+            conn.execute("UPDATE titles SET tmdb_next_at=0, tmdb_tries=0 WHERE tmdb_id IS NULL")
+            conn.execute("DELETE FROM kv WHERE key LIKE 'tmdb_try:%'")
+            conn.execute("DELETE FROM kv WHERE key LIKE 'llm_guess:%' AND value='{}'")
+            self._kv_set_conn(conn, "migr_requeue_v2", "1")
+        conn.commit()
+
+    @staticmethod
+    def _kv_conn(conn: sqlite3.Connection, key: str) -> str:
+        row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        return row[0] if row else ""
+
+    @staticmethod
+    def _kv_set_conn(conn: sqlite3.Connection, key: str, value: str) -> None:
+        conn.execute("INSERT INTO kv(key,value) VALUES(?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
     # -- generic helpers -------------------------------------------------
     def _in_tx(self) -> bool:

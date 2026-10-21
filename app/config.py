@@ -33,6 +33,9 @@ class Config:
     )
     port: int = field(default_factory=lambda: _int("PORT", 8000))
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO"))
+    # comma-separated origins allowed to call the API directly (Mini App served
+    # from another domain). Default "*" is fine: the API holds no cookies.
+    cors_origins: str = field(default_factory=lambda: os.environ.get("CORS_ORIGINS", "*"))
 
     def __post_init__(self) -> None:
         raw = os.environ.get("ADMIN_USER_IDS", "")

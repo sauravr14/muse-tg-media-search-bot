@@ -599,10 +599,26 @@ class Indexer:
                     await asyncio.sleep(0)
                 log.info("catalog cleanup: %d/%d files checked (%d moved)",
                          kept + moved, max_id, moved)
-            orphans = self.db.execute(
-                "DELETE FROM titles WHERE id NOT IN "
-                "(SELECT DISTINCT title_id FROM files WHERE title_id IS NOT NULL)"
-            ).rowcount
+            # Orphan removal, chunked: on 2026-10-21 the single DELETE below
+            # starved the event loop for ~1h (bot + API dead) because the FK
+            # cascades into seasons/episodes had no indexes on the child
+            # columns — each deleted title scanned the whole child tables.
+            # idx_seasons_title / idx_episodes_title / idx_episodes_season fix
+            # the cost; chunking + yielding keeps even a slow phase from ever
+            # wedging the bot/API again. Each chunk is its own transaction,
+            # so an interrupted run keeps partial progress.
+            orphans = 0
+            while True:
+                n = self.db.execute(
+                    "DELETE FROM titles WHERE id IN ("
+                    "SELECT id FROM titles WHERE id NOT IN "
+                    "(SELECT DISTINCT title_id FROM files "
+                    "WHERE title_id IS NOT NULL) LIMIT 2000)"
+                ).rowcount
+                orphans += n
+                if n == 0:
+                    break
+                await asyncio.sleep(0)
             log.info("catalog cleanup: %d moved, %d kept, %d orphan titles removed",
                      moved, kept, orphans)
             return {"moved": moved, "kept": kept, "orphans_removed": orphans}

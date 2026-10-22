@@ -772,30 +772,41 @@ class Indexer:
                 (new_id, se["season_no"]))
             if tgt:
                 tgt_id = tgt["id"]
-                for ep in db.query("SELECT * FROM episodes WHERE season_id=?",
-                                   (se["id"],)):
-                    ex = db.query_one(
-                        "SELECT id FROM episodes WHERE season_id=? AND ep_no=?",
-                        (tgt_id, ep["ep_no"]))
-                    if ex:
-                        db.execute("UPDATE files SET episode_id=?, season_id=? "
-                                   "WHERE episode_id=?", (ex["id"], tgt_id, ep["id"]))
-                        db.execute("DELETE FROM episodes WHERE id=?", (ep["id"],))
-                    else:
-                        db.execute("UPDATE episodes SET season_id=?, title_id=? "
-                                   "WHERE id=?", (tgt_id, new_id, ep["id"]))
-                db.execute("UPDATE files SET season_id=? WHERE season_id=?",
+                # Set-based episode fold (was: one SELECT + up to two
+                # writes PER EPISODE — a few hundred episodes meant
+                # minutes inside a single merge on this disk):
+                # 1. files of episodes whose number exists in the target
+                #    season fold onto the target episode
+                db.execute(
+                    "UPDATE files SET episode_id = t.id, season_id = ?"
+                    " FROM episodes s"
+                    " JOIN episodes t ON t.season_id = ? AND t.ep_no = s.ep_no"
+                    " WHERE files.episode_id = s.id AND s.season_id = ?",
+                    (tgt_id, tgt_id, se["id"]))
+                # 2. episodes with no counterpart move over wholesale
+                db.execute(
+                    "UPDATE episodes SET season_id = ?, title_id = ?"
+                    " WHERE season_id = ? AND NOT EXISTS"
+                    " (SELECT 1 FROM episodes t WHERE t.season_id = ?"
+                    " AND t.ep_no = episodes.ep_no)",
+                    (tgt_id, new_id, se["id"], tgt_id))
+                # 3. only the folded (now file-less) duplicates remain
+                db.execute("DELETE FROM episodes WHERE season_id = ?",
+                           (se["id"],))
+                # 4. pack files (and any stragglers) follow the season
+                db.execute("UPDATE files SET season_id = ? WHERE season_id = ?",
                            (tgt_id, se["id"]))
-                db.execute("DELETE FROM seasons WHERE id=?", (se["id"],))
+                db.execute("DELETE FROM seasons WHERE id = ?", (se["id"],))
             else:
-                db.execute("UPDATE seasons SET title_id=? WHERE id=?",
+                db.execute("UPDATE seasons SET title_id = ? WHERE id = ?",
                            (new_id, se["id"]))
-                db.execute("UPDATE episodes SET title_id=? WHERE season_id=?",
+                db.execute("UPDATE episodes SET title_id = ? WHERE season_id = ?",
                            (new_id, se["id"]))
                 # pack files keep their season_id: the season row itself moved
-        db.execute("UPDATE files SET title_id=? WHERE title_id=?", (new_id, old_id))
-        db.execute("DELETE FROM titles WHERE id=?", (old_id,))
-        db.execute("UPDATE titles SET last_file_at=? WHERE id=?",
+        db.execute("UPDATE files SET title_id = ? WHERE title_id = ?",
+                   (new_id, old_id))
+        db.execute("DELETE FROM titles WHERE id = ?", (old_id,))
+        db.execute("UPDATE titles SET last_file_at = ? WHERE id = ?",
                    (time.time(), new_id))
         log.info("merged title %s into %s", old_id, new_id)
 

@@ -110,14 +110,17 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         # each term matches itself OR its singular form: FTS prefix
         # matching is one-directional, so "dragons" alone never matched
         # the title token "dragon" and the real House of the Dragon
-        # vanished from its own search
+        # vanished from its own search. Groups MUST be joined with an
+        # explicit AND: adjacent parenthesised groups are an FTS5 syntax
+        # error ("black panther" returned no results at all, 2026-10-22)
+        # and the except below silently turned that into an empty list.
         groups = []
         for t in terms:
             variants = {t}
             if t.endswith("s") and len(t) > 3:
                 variants.add(t[:-1])
             groups.append("(" + " OR ".join(f'"{v}"*' for v in sorted(variants)) + ")")
-        match = " ".join(groups)
+        match = " AND ".join(groups)
         per, off = 20, (max(page, 1) - 1) * 20
         try:
             rows = db.query(

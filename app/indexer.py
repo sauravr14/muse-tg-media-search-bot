@@ -755,7 +755,16 @@ class Indexer:
 
         Moves seasons/episodes/files over, merging same-numbered seasons and
         episodes, so no file loses its episode association. (A naive
-        DELETE FROM seasons would cascade and null out files.episode_id.)"""
+        DELETE FROM seasons would cascade and null out files.episode_id.)
+
+        Runs as ONE transaction: the per-episode moves used to commit
+        after every statement, so merging a long series meant hundreds
+        of fsyncs — the enricher sat inside a single merge for minutes
+        and the poster backlog barely moved (seen live 2026-10-22)."""
+        with self.db.transaction():
+            self._merge_titles_tx(old_id, new_id)
+
+    def _merge_titles_tx(self, old_id: int, new_id: int) -> None:
         db = self.db
         for se in db.query("SELECT * FROM seasons WHERE title_id=?", (old_id,)):
             tgt = db.query_one(
@@ -811,16 +820,23 @@ class Indexer:
              __import__("json").dumps(meta.get("genres", [])),
              meta.get("rating"), meta.get("popularity"), meta.get("lang", ""), now, row["id"]),
         )
-        # fill episode titles for series
+        # fill episode titles for series — capped and batched: episode
+        # names are garnish, and an uncapped fill once meant one TMDB
+        # call per episode (500+ for a long anime) inside a single enrich
         if meta["kind"] == "series" and meta.get("tmdb_id"):
+            fills = []
             for se in db.query("SELECT * FROM seasons WHERE title_id=?", (row["id"],)):
                 for ep in db.query("SELECT * FROM episodes WHERE season_id=?", (se["id"],)):
-                    if not ep["ep_title"]:
+                    if not ep["ep_title"] and len(fills) < 40:
                         name = await self.tmdb.episode_title(
                             meta["tmdb_id"], se["season_no"], ep["ep_no"])
                         if name:
-                            db.execute("UPDATE episodes SET ep_title=? WHERE id=?",
-                                       (name, ep["id"]))
+                            fills.append((name, ep["id"]))
+            if fills:
+                with db.transaction():
+                    for name, ep_id in fills:
+                        db.execute("UPDATE episodes SET ep_title=? WHERE id=?",
+                                   (name, ep_id))
 
     def stop(self) -> None:
         self._running = False

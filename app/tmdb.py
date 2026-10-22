@@ -30,22 +30,12 @@ def _img(path: str | None) -> str:
     return f"{IMG}{path}" if path else ""
 
 
-class TMDBError(Exception):
-    """Transient TMDB failure (network reset, 429, 5xx).
-
-    Distinct from "TMDB has no such title": callers must retry soon and must
-    NOT park the title for days (the old code did, so a single reset
-    connection left a title unmatched for a week)."""
-
-
 class TMDB:
     def __init__(self, db: DB, api_key: str, session: aiohttp.ClientSession | None = None):
         self.db = db
         self.api_key = api_key
         self._session = session
-        # a few requests in flight instead of one global lock; TMDB allows
-        # far more, this keeps us polite while matching ~4x faster
-        self._sem = asyncio.Semaphore(4)
+        self._lock = asyncio.Lock()
 
     async def _sess(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -81,38 +71,25 @@ class TMDB:
             return cached
         try:
             sess = await self._sess()
-            async with self._sem:
+            async with self._lock:  # gentle on TMDB rate limits
                 async with sess.get(
                     f"{API}{path}", params={"api_key": self.api_key, **params}
                 ) as resp:
-                    if resp.status == 404:
-                        return None  # definitive: no such record
                     if resp.status != 200:
                         log.warning("tmdb %s -> %s", path, resp.status)
-                        raise TMDBError(f"HTTP {resp.status}")
+                        return None
                     data = await resp.json()
-        except TMDBError:
-            raise
-        except Exception as e:  # reset / timeout / DNS: transient
+            self._cache_set(key, data)
+            return data
+        except Exception as e:  # never break indexing on TMDB trouble
             log.warning("tmdb %s failed: %r", path, e)
-            raise TMDBError(repr(e)) from e
-        self._cache_set(key, data)
-        return data
+            return None
 
     # -- matching ----------------------------------------------------------
-    MIN_SIM = 0.62  # title similarity floor, BEFORE any year/popularity bonus
-
-    @classmethod
-    def _score(cls, candidate_title: str, want: str, want_year: int | None,
-               cand_year: int | None, popularity: float,
-               alt_title: str = "") -> float:
+    @staticmethod
+    def _score(candidate_title: str, want: str, want_year: int | None,
+               cand_year: int | None, popularity: float) -> float:
         s = difflib.SequenceMatcher(None, normalize_title(candidate_title), want).ratio()
-        if alt_title:
-            s = max(s, difflib.SequenceMatcher(None, normalize_title(alt_title), want).ratio())
-        if s < cls.MIN_SIM:
-            # a matching year used to lift 0.45-similarity junk over the bar
-            # and attach unrelated files to the wrong movie
-            return 0.0
         if want_year and cand_year:
             if want_year == cand_year:
                 s += 0.35
@@ -148,9 +125,6 @@ class TMDB:
         data = await self._get(
             f"/search/{kind}", {"query": query, **({"year": p.year} if p.year else {})}
         )
-        if p.year and (not data or not data.get("results")):
-            # release year in filenames is often off by one / re-release year
-            data = await self._get(f"/search/{kind}", {"query": query})
         if not data or not data.get("results"):
             return None
         want = normalize_title(query)
@@ -158,8 +132,7 @@ class TMDB:
         for item in data["results"][:10]:
             cand = item.get("title") or item.get("name") or ""
             cy = self._year_of(item, "release_date" if kind == "movie" else "first_air_date")
-            s = self._score(cand, want, p.year, cy, item.get("popularity") or 0,
-                            item.get("original_title") or item.get("original_name") or "")
+            s = self._score(cand, want, p.year, cy, item.get("popularity") or 0)
             if s > best_s:
                 best, best_s = item, s
         if best is None or best_s < 0.75:
@@ -185,19 +158,13 @@ class TMDB:
         }
 
     async def season_poster(self, tmdb_id: int, season_no: int) -> str:
-        try:
-            data = await self._get(f"/tv/{tmdb_id}/season/{season_no}", {})
-        except TMDBError:
-            return ""
+        data = await self._get(f"/tv/{tmdb_id}/season/{season_no}", {})
         if not data:
             return ""
         return _img(data.get("poster_path"))
 
     async def episode_title(self, tmdb_id: int, season_no: int, ep_no: int) -> str:
-        try:
-            data = await self._get(f"/tv/{tmdb_id}/season/{season_no}/episode/{ep_no}", {})
-        except TMDBError:
-            return ""
+        data = await self._get(f"/tv/{tmdb_id}/season/{season_no}/episode/{ep_no}", {})
         if not data:
             return ""
         return data.get("name") or ""

@@ -139,6 +139,7 @@ TAG_STRIP_RE = re.compile(
     r"ORG|BMS|HYBRID|BCORE|DS4K|KATMOVIES?HD|SONYLIV|"
     r"PART\s?0\d\d|V\d|BLURA|HEV|WEB\s+D|"
     r"(?:480|720|1080|2160)P(?:HEVC|X26[45]|H26[45]|10BIT)|"
+    r"\d{2,3}\s*KBPS|"
     r"\d{2,3}\s*FPS|\d{2,3}FP|"
     r"10BIT|8BIT|12BIT|HDR10PLUS|HDR10\+?|HDR|DV|SDR|"
     r"NF|AMZN|DSNP|HULU|ATVP|HBO|PCOK|CRIT|"
@@ -191,6 +192,8 @@ def _strip_channel_watermark(name: str) -> str:
         name = " ".join(toks[i:])
     # mid-name handles: "Vivah @bhaiyajihub 2006" -> "Vivah 2006"
     name = re.sub(r"(?<!\S)@\w+", " ", name)
+    # handle glued onto the final token: "Athreya@kick" -> "Athreya"
+    name = re.sub(r"@\w+\s*$", " ", name)
     return name
 
 
@@ -244,6 +247,9 @@ def parse_filename(raw: str) -> ParsedName:
     # channel watermarks ("@Fbm Hw Teenage Mutant Ninja Turtles") — strip
     # before any other parsing so TMDB matching sees the real title
     name = _strip_channel_watermark(name)
+    # leading site domain spelled out as words: "www 1TamilMV cool Spider..."
+    # (from "www_1TamilMV_cool_...") — the domain is never the title
+    name = re.sub(r"^www\s+\S+\s+(?:com|net|cool|org|me|to|info)\s+", " ", name, flags=re.I)
 
     # season packs ("S01 COMBINED", "[E01-04]") before series markers
     name = _detect_pack(name, p, pack_range)
@@ -281,7 +287,29 @@ def parse_filename(raw: str) -> ParsedName:
         # the title ("2012.2009.1080p" -> title "2012", year 2009).
         m = years[-1]
         p.year = int(m.group(1))
-        name = name[: m.start()] + " " + name[m.end():]
+        before, after = name[: m.start()], name[m.end():]
+        if re.search(r"[A-Za-z]", before):
+            # Scene-style naming: the title NEVER continues past the release
+            # year — everything after it is release metadata (quality,
+            # codec, group, language, filler). Filtering that tail token by
+            # token is how truncated tags ("BluR", "x26", "We", "192Kbps")
+            # and filler ("Bollywood", "- Fi", "@RjRip") kept leaking into
+            # titles and splintering one movie into many poster-less cards
+            # ("Kick Bollywood Fi", "Spider Man No Way Home X26", ...).
+            # Cut the tail wholesale; the pre-year part is the title.
+            name = before
+            # ...except an episode-only marker hiding in the tail
+            # ("Some Show 2019 E02") — rescue it before the tail goes.
+            if p.kind == "movie" and not p.is_pack:
+                em = EP_ONLY_RE.search(after)
+                if em and not re.search(r"\bseason\b", after, re.I):
+                    p.kind = "series"
+                    p.season = 1
+                    p.episode = int(em.group(1))
+        else:
+            # year leads the name ("2014 Kick ...") or the pre-year part is
+            # a bare number title ("1917 (2019)") — keep the old behaviour.
+            name = before + " " + after
 
     # episode-only marker after year removal ("Show E02")
     if p.kind == "movie" and not p.is_pack:
@@ -314,7 +342,8 @@ def parse_filename(raw: str) -> ParsedName:
     # (was "x264") — case-insensitive, the flattened name is not cased yet
     name = re.sub(r"\s+[A-Z]\s*$", " ", name, flags=re.I)
     name = re.sub(r"\b(Season|Series|Episode|Ep|Dual|Audio|Hindi|Hin|English|Engli|Eng|"
-                r"Tam|Tel|Mal|Kan|Multi|ESub)\b", " ", name, flags=re.I)
+                r"Tam|Tel|Mal|Kan|Multi|ESub|Farsi|"
+                r"Bollywood|Tollywood|Kollywood|Mollywood|Sandalwood)\b", " ", name, flags=re.I)
     # site suffix: "MoviesMod Com" (was ".com")
     name = re.sub(r"\s+\bCom\b\s*$", " ", name, flags=re.I)
     # trailing release-group / site watermarks, applied until stable so
@@ -333,7 +362,10 @@ def parse_filename(raw: str) -> ParsedName:
         m = re.search(r"((?:\s*\b\d{1,4}\b)+)\s*$", name)
         if m:
             toks = m.group(1).split()
-            if any(len(t) >= 2 or t == "0" or len(toks) > 1 for t in toks):
+            # never strip the name bare: a number-only title ("1917",
+            # "2012") keeps its number — it IS the title
+            if (any(len(t) >= 2 or t == "0" or len(toks) > 1 for t in toks)
+                    and name[: m.start()].strip()):
                 name = name[: m.start()].strip()
     name = re.sub(r"\s+", " ", name).strip(" -")
     # leading emoji / punctuation junk from captions ("🎬 Vivah" -> "Vivah")

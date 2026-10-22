@@ -3,30 +3,58 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>Media Library</title>
+<meta name="theme-color" content="#07070b">
+<!-- Optional: set to your API origin (e.g. https://api.example.com) to skip the Vercel proxy hop -->
+<meta name="api-base" content="">
+<title>Core TG</title>
+<link rel="preconnect" href="https://image.tmdb.org" crossorigin>
+<link rel="dns-prefetch" href="https://image.tmdb.org">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+<div id="bg" aria-hidden="true"><i class="aurora a1"></i><i class="aurora a2"></i><i class="grain"></i></div>
+
+<div id="splash" aria-hidden="true">
+  <div class="splash-inner">
+    <svg class="clap" viewBox="0 0 64 64" width="72" height="72">
+      <g class="clap-top"><path d="M6 20 L58 12 L60 24 L8 32 Z" fill="#e50914"/>
+        <path d="M14 18 l6 -1 -4 12 -6 1z M28 16 l6 -1 -4 12 -6 1z M42 14 l6 -1 -4 12 -6 1z" fill="#fff" opacity=".92"/></g>
+      <rect x="8" y="30" width="50" height="26" rx="3" fill="#1b1b24" stroke="#e50914" stroke-width="2"/>
+      <path d="M26 38 L40 43 L26 48 Z" fill="#fff"/>
+    </svg>
+    <div class="wordmark"><span>C</span><span>o</span><span>r</span><span>e</span><span>&nbsp;</span><span>T</span><span>G</span></div>
+    <div class="splash-bar"><i></i></div>
+  </div>
+  <div class="splash-credit">By GDHUBNATION</div>
+</div>
+
+<div id="loadbar"></div>
+
 <header id="topbar">
   <div class="toprow">
-    <div class="brand">🎬 Media Library</div>
+    <div class="brand"><span class="logo-dot"></span>Core TG</div>
     <div class="top-actions">
       <button id="camToggle" class="cam-toggle" title="Hide theatre prints">🎭 All prints</button>
       <button id="camInfo" class="info-btn" title="About this filter">i</button>
     </div>
   </div>
   <div class="search-wrap">
-    <input id="search" type="search" placeholder="Search movies, series…" autocomplete="off">
-    <button id="clear" hidden>✕</button>
+    <svg class="s-ico" viewBox="0 0 24 24" width="18" height="18"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zm9 16-4-4"/></svg>
+    <input id="search" type="search" placeholder="Search movies, series…" autocomplete="off" enterkeyhint="search">
+    <button id="clear" hidden aria-label="Clear">✕</button>
   </div>
+  <div id="recent-searches" hidden></div>
 </header>
-<nav id="tabs">
-  <button data-tab="home" class="active">Home</button>
-  <button data-tab="movies">Movies</button>
-  <button data-tab="series">Series</button>
-</nav>
+
 <main id="view"></main>
+
+<nav id="tabs">
+  <button data-tab="home" class="active"><svg viewBox="0 0 24 24"><path d="M4 11 12 4l8 7v9h-5v-6H9v6H4z"/></svg><span>Home</span></button>
+  <button data-tab="movies"><svg viewBox="0 0 24 24"><path d="M4 5h16v14H4zM4 9h16M8 5v14M16 5v14" fill="none" stroke="currentColor" stroke-width="1.8"/></svg><span>Movies</span></button>
+  <button data-tab="series"><svg viewBox="0 0 24 24"><path d="M3 7h18v12H3zM8 3l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg><span>Series</span></button>
+</nav>
+
 <div id="toast"></div>
 <div id="camModal" class="modal" hidden>
   <div class="modal-box">

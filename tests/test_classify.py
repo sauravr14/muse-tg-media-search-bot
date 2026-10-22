@@ -53,6 +53,29 @@ class ClassifyTest(unittest.TestCase):
         res = self.db.query("SELECT resolution FROM files WHERE episode_id=?", (ep1["id"],))
         self.assertEqual(sorted(r["resolution"] for r in res), ["1080p", "720p"])
 
+    def test_range_pack_creates_episode_rows(self):
+        # a range pack files under the season AND creates a row for every
+        # covered episode, so the season does not look half-scanned
+        name = "You (2018) S01 E01-05 480p HEVC HDRip.mkv"
+        p = parse_filename(name)
+        r = self.clf.ingest(p, _file_meta(-1001, 77, name))
+        f = self.db.query_one("SELECT * FROM files WHERE id=?", (r["file_id"],))
+        self.assertIsNone(f["episode_id"])
+        self.assertIsNotNone(f["season_id"])
+        self.assertEqual(f["pack_label"], "E01\u2013E05")
+        eps = self.db.query(
+            "SELECT ep_no FROM episodes WHERE season_id=? ORDER BY ep_no",
+            (f["season_id"],))
+        self.assertEqual([e["ep_no"] for e in eps], [1, 2, 3, 4, 5])
+
+    def test_episode_file_records_season(self):
+        name = "Breaking.Bad.S01E02.720p.mkv"
+        p = parse_filename(name)
+        r = self.clf.ingest(p, _file_meta(-1001, 78, name))
+        f = self.db.query_one("SELECT * FROM files WHERE id=?", (r["file_id"],))
+        self.assertIsNotNone(f["episode_id"])
+        self.assertIsNotNone(f["season_id"])
+
     def test_idempotent(self):
         p = parse_filename("Dune.2021.720p.mkv")
         r1 = self.clf.ingest(p, _file_meta(-1001, 50, "Dune.2021.720p.mkv"))

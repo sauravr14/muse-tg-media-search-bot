@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 
 import aiohttp
 
@@ -44,6 +45,10 @@ class LLTitle:
         self.api_key = api_key
         self.model = model or FREE_MODEL
         self._session = session
+        # circuit breaker: after a full round of 429 retries, OpenRouter's
+        # free tier stays saturated for a while — fail fast instead of
+        # burning ~30s of backoff on every unmatchable title
+        self.rate_limited_until = 0.0
 
     @property
     def available(self) -> bool:
@@ -65,6 +70,8 @@ class LLTitle:
     async def guess_title(self, filename: str) -> dict | None:
         """Return {"title", "year", "kind"} or None when unidentifiable."""
         if not self.available or not filename:
+            return None
+        if time.time() < self.rate_limited_until:
             return None
         data = None
         for attempt in range(3):
@@ -96,6 +103,10 @@ class LLTitle:
                 log.warning("openrouter request failed: %r", e)
                 return None
         if data is None:
+            # the only way to fall out of the retry loop empty-handed is
+            # 429 on every attempt — trip the breaker so the enricher
+            # stops paying the backoff on each subsequent title
+            self.rate_limited_until = time.time() + 600
             return None
         try:
             msg = data["choices"][0]["message"]

@@ -224,61 +224,6 @@ def normalize_title(title: str) -> str:
     return t
 
 
-def _clean_title(name: str, year_found: bool) -> str:
-    """Strip release junk from a flattened name and return the display title."""
-    # drop anything in brackets/parens/braces (release info, not title)
-    name = re.sub(r"[\(\[].*?[\)\]]", " ", name)
-    name = re.sub(r"\{.*?\}", " ", name)
-    # also a trailing unclosed bracket: "Title Hq [Tam Tel"
-    name = re.sub(r"\s*[\(\[][^\)\]]*$", " ", name)
-    # leading site database ids: "1354295 Outlander 2008"
-    name = re.sub(r"^\d{6,}\s+", " ", name)
-    # drop leftover quality/codec/source/cam tokens
-    for rx, _ in RES_PATTERNS + CODEC_PATTERNS + SOURCE_PATTERNS:
-        name = rx.sub(" ", name)
-    for rx in CAM_PATTERNS:
-        name = rx.sub(" ", name)
-    name = TAG_STRIP_RE.sub(" ", name)
-    name = HEX_RE.sub(" ", name)
-    name = HASHY_RE.sub(" ", name)
-    # trailing site-tag separator junk: "The Furious ... MoviesMod.At"
-    # (a leading "At" can be legit: "At Close Range" — only strip trailing)
-    name = re.sub(r"\s+\b[Aa][Tt]\b\s*$", " ", name)
-    # truncated tag letter: "... 10bit N" (was "NF"), "... WEBRip x"
-    # (was "x264") — case-insensitive, the flattened name is not cased yet
-    name = re.sub(r"\s+[A-Z]\s*$", " ", name, flags=re.I)
-    name = re.sub(r"\b(Season|Series|Episode|Ep|Dual|Audio|Hindi|Hin|English|Engli|Eng|"
-                r"Tam|Tel|Mal|Kan|Multi|ESub)\b", " ", name, flags=re.I)
-    # site suffix: "MoviesMod Com" (was ".com")
-    name = re.sub(r"\s+\bCom\b\s*$", " ", name, flags=re.I)
-    # trailing release-group / site watermarks, applied until stable so
-    # chained suffixes ("... x264 LOKiHD Telly") are fully stripped
-    for _ in range(3):
-        new_name = RELEASE_GROUPS.sub("", name)
-        new_name = SITE_NAMES.sub("", new_name)
-        if new_name == name:
-            break
-        name = new_name
-    if year_found:
-        # a year was found: trailing bare numbers are usually junk
-        # ("Film 1992 ... 247", "Stranger Things ... 04"), but a single 1-9
-        # can be the sequel number ("Meatballs 2") and a leading number the
-        # title ("21 Jump Street")
-        m = re.search(r"((?:\s*\b\d{1,4}\b)+)\s*$", name)
-        if m:
-            toks = m.group(1).split()
-            # a trailing year-like number is part of the title ("Wonder Woman
-            # 1984 2020"): the real release year was already extracted
-            only_years = all(re.fullmatch(r"(?:19|20)\d\d", t) for t in toks)
-            if not only_years and any(len(t) >= 2 or t == "0" or len(toks) > 1 for t in toks):
-                name = name[: m.start()].strip()
-    name = re.sub(r"\s+", " ", name).strip(" -")
-    # leading emoji / punctuation junk from captions ("🎬 Vivah" -> "Vivah")
-    name = re.sub(r"^[^\w\s]+", "", name).strip()
-
-    return name.strip()
-
-
 def parse_filename(raw: str) -> ParsedName:
     p = ParsedName(raw=raw)
     name = _strip_ext(raw.strip())
@@ -331,26 +276,12 @@ def parse_filename(raw: str) -> ParsedName:
             name = name[: m.start()] + " " + name[m.end():]
 
     years = list(YEAR_RE.finditer(name))
-    year_head = ""  # text before the release year (when a year was found)
     if years:
         # Prefer the LAST year-like token: the release year normally follows
         # the title ("2012.2009.1080p" -> title "2012", year 2009).
         m = years[-1]
         p.year = int(m.group(1))
-        year_head = name[: m.start()]
-        tail = name[m.end():]
-        # Standard layout is "Title Year <release junk>". Everything after
-        # the year is junk — including truncated tags ("... 2021 We",
-        # "... 2021 X26") that no token list can ever enumerate. An
-        # episode-only marker ("Show 2019 E02") must still be read from
-        # the tail before it is discarded.
-        if p.kind == "movie" and not p.is_pack and not re.search(r"\bseason\b", tail, re.I):
-            em = EP_ONLY_RE.search(tail)
-            if em:
-                p.kind = "series"
-                p.season = 1
-                p.episode = int(em.group(1))
-        name = year_head + " " + tail
+        name = name[: m.start()] + " " + name[m.end():]
 
     # episode-only marker after year removal ("Show E02")
     if p.kind == "movie" and not p.is_pack:
@@ -361,38 +292,53 @@ def parse_filename(raw: str) -> ParsedName:
             p.episode = int(m.group(1))
             name = name[: m.start()] + " " + name[m.end():]
 
-    # Cut at the year when the title sits before it; if that leaves nothing
-    # ("[Hindi] 2021 Movie Name") fall back to the whole name.
-    title = ""
-    if year_head.strip():
-        title = _clean_title(year_head, True)
-    if not title:
-        title = _clean_title(name, bool(p.year))
-    name = title
+    # drop anything in brackets/parens/braces (release info, not title)
+    name = re.sub(r"[\(\[].*?[\)\]]", " ", name)
+    name = re.sub(r"\{.*?\}", " ", name)
+    # also a trailing unclosed bracket: "Title Hq [Tam Tel"
+    name = re.sub(r"\s*[\(\[][^\)\]]*$", " ", name)
+    # leading site database ids: "1354295 Outlander 2008"
+    name = re.sub(r"^\d{6,}\s+", " ", name)
+    # drop leftover quality/codec/source/cam tokens
+    for rx, _ in RES_PATTERNS + CODEC_PATTERNS + SOURCE_PATTERNS:
+        name = rx.sub(" ", name)
+    for rx in CAM_PATTERNS:
+        name = rx.sub(" ", name)
+    name = TAG_STRIP_RE.sub(" ", name)
+    name = HEX_RE.sub(" ", name)
+    name = HASHY_RE.sub(" ", name)
+    # trailing site-tag separator junk: "The Furious ... MoviesMod.At"
+    # (a leading "At" can be legit: "At Close Range" — only strip trailing)
+    name = re.sub(r"\s+\b[Aa][Tt]\b\s*$", " ", name)
+    # truncated tag letter: "... 10bit N" (was "NF"), "... WEBRip x"
+    # (was "x264") — case-insensitive, the flattened name is not cased yet
+    name = re.sub(r"\s+[A-Z]\s*$", " ", name, flags=re.I)
+    name = re.sub(r"\b(Season|Series|Episode|Ep|Dual|Audio|Hindi|Hin|English|Engli|Eng|"
+                r"Tam|Tel|Mal|Kan|Multi|ESub)\b", " ", name, flags=re.I)
+    # site suffix: "MoviesMod Com" (was ".com")
+    name = re.sub(r"\s+\bCom\b\s*$", " ", name, flags=re.I)
+    # trailing release-group / site watermarks, applied until stable so
+    # chained suffixes ("... x264 LOKiHD Telly") are fully stripped
+    for _ in range(3):
+        new_name = RELEASE_GROUPS.sub("", name)
+        new_name = SITE_NAMES.sub("", new_name)
+        if new_name == name:
+            break
+        name = new_name
+    if p.year:
+        # a year was found: trailing bare numbers are usually junk
+        # ("Film 1992 ... 247", "Stranger Things ... 04"), but a single 1-9
+        # can be the sequel number ("Meatballs 2") and a leading number the
+        # title ("21 Jump Street")
+        m = re.search(r"((?:\s*\b\d{1,4}\b)+)\s*$", name)
+        if m:
+            toks = m.group(1).split()
+            if any(len(t) >= 2 or t == "0" or len(toks) > 1 for t in toks):
+                name = name[: m.start()].strip()
+    name = re.sub(r"\s+", " ", name).strip(" -")
+    # leading emoji / punctuation junk from captions ("🎬 Vivah" -> "Vivah")
+    name = re.sub(r"^[^\w\s]+", "", name).strip()
+
     p.title = name.strip().title() if name.strip() else _strip_ext(raw).strip()
     p.norm_title = normalize_title(p.title)
     return p
-
-
-def merge_parsed(pf: ParsedName, pc: ParsedName) -> ParsedName:
-    """Combine the filename parse (pf) with the caption's first-line parse (pc).
-
-    Telegram filenames are often generic or missing the year while the caption
-    carries "Movie Name (2021) 1080p". The caption is adopted only when it
-    brings something the filename lacks (a year, or a title at all); quality
-    fields missing on the winner are filled from the other side. A filename
-    that already has a year always wins, so promo captions can't override it.
-    """
-    generic = (not pf.title) or bool(re.match(r"(?i)^(file|video|document)[ _]\d+", pf.title))
-    use_caption = bool(pc.title) and (generic or (pc.year and not pf.year))
-    if not use_caption:
-        return pf
-    win, other = pc, pf
-    for f in ("resolution", "quality", "codec"):
-        if not getattr(win, f) and getattr(other, f):
-            setattr(win, f, getattr(other, f))
-    win.is_cam = win.is_cam or other.is_cam
-    if win.kind == "movie" and other.kind == "series" and other.episode:
-        win.kind, win.season, win.episode = "series", other.season, other.episode
-    win.raw = pf.raw
-    return win

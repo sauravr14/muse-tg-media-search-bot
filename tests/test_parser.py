@@ -407,6 +407,79 @@ class ParserTest(unittest.TestCase):
         p = parse_filename("Agent_Sai_Srinivasa_Athreya@kick.mkv")
         self.assertEqual(p.title, "Agent Sai Srinivasa Athreya")
 
+
+class EpisodeRangeTest(unittest.TestCase):
+    """Multi-episode range files are mini-packs, not single episodes —
+    filing "S01 E01-05" under E01 alone made E02-E05 vanish from the
+    season listing (found live on You / House of the Dragon, 2026-10-22).
+    Real channel filenames, verbatim."""
+
+    def _check(self, raw, want):
+        p = parse_filename(raw)
+        got = (p.title, p.year, p.kind, p.season, p.episode,
+               p.is_pack, p.pack_label, p.ep_range)
+        self.assertEqual(got, want, raw)
+
+    def test_range_forms(self):
+        R = True
+        cases = [
+            ("You (2018) S01 E01-05 480p HEVC HDRip.mkv",
+             ("You", 2018, "series", 1, None, R, "E01\u2013E05", (1, 5))),
+            ("You_2018_S01_E01_05_480p_HEVC_HDRip.mkv",
+             ("You", 2018, "series", 1, None, R, "E01\u2013E05", (1, 5))),
+            ("You_2019_480p_HEVC_HDRip_S02_01_05_NF_Series.mp4",
+             ("You", 2019, "series", 2, None, R, "E01\u2013E05", (1, 5))),
+            ("You (2021) S03 [Ep01 To 10] 720p HDRip.mkv",
+             ("You", 2021, "series", 3, None, R, "E01\u2013E10", (1, 10))),
+            ("You_2023_S04_Epi_01_05_480p_HEVC.mkv",
+             ("You", 2023, "series", 4, None, R, "E01\u2013E05", (1, 5))),
+            ("House of the Dragon (2022) S01 [E01-03] 1080p.mkv",
+             ("House Of The Dragon", 2022, "series", 1, None, R, "E01\u2013E03", (1, 3))),
+            ("House of the Dragon (2022) [S01E01T05] 480p.mkv",
+             ("House Of The Dragon", 2022, "series", 1, None, R, "E01\u2013E05", (1, 5))),
+            ("@ClipmateMovies_You_2018_S01E01_05_480p.mkv",
+             ("You", 2018, "series", 1, None, R, "E01\u2013E05", (1, 5))),
+            ("You.S04(E01-03) Combined 1080p NF.WEBRip.mkv",
+             ("You", None, "series", 4, None, R, "E01\u2013E03", (1, 3))),
+            ("House of the Dragon (2024) S02 EP (01-08) - COMBINED.mkv",
+             ("House Of The Dragon", 2024, "series", 2, None, R, "E01\u2013E08", (1, 8))),
+        ]
+        for raw, want in cases:
+            self._check(raw, want)
+
+    def test_range_end_never_leaks_into_title(self):
+        self._check("House of the Dragon S01 E01-05 480p WebRip Hindi English MS.mkv",
+                    ("House Of The Dragon", None, "series", 1, None, True,
+                     "E01\u2013E05", (1, 5)))
+        self._check("House of the Dragon S02 E01-04 WebRip 720p.mkv",
+                    ("House Of The Dragon", None, "series", 2, None, True,
+                     "E01\u2013E04", (1, 4)))
+
+    def test_not_ranges(self):
+        # audio layout after the marker is not an episode range
+        self._check("Show S01E01 5 1 AAC.mkv",
+                    ("Show", None, "series", 1, 1, False, "", None))
+        # bare resolution after the marker is not an episode range
+        self._check("Show S01E01 720.mkv",
+                    ("Show", None, "series", 1, 1, False, "", None))
+        # spaced bare single episode
+        self._check("Show Name S02 07 720p.mkv",
+                    ("Show Name", None, "series", 2, 7, False, "", None))
+
+    def test_episode_name_never_leaks_into_title(self):
+        self._check("House.of.the.Dragon.S01E01.The.Heirs.of.the.Dragon.1080p.10b.mkv",
+                    ("House Of The Dragon", None, "series", 1, 1, False, "", None))
+        self._check("House.of.the.Dragon.S01E02.The.Rogue.Prince.1080p.10bit.BluR.mkv",
+                    ("House Of The Dragon", None, "series", 1, 2, False, "", None))
+        # a year after the marker is rescued from the dropped tail
+        self._check("Show S01E01 2023 1080p.mkv",
+                    ("Show", 2023, "series", 1, 1, False, "", None))
+
+    def test_compete_misspelling_is_a_pack(self):
+        self._check("House of the Dragon Compete S01 WebRip Hindi English 480.mkv",
+                    ("House Of The Dragon", None, "series", 1, None, True,
+                     "Complete", None))
+
 if __name__ == "__main__":
     unittest.main()
 

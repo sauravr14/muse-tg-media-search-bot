@@ -107,7 +107,17 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         if not q:
             return {"results": [], "page": page}
         terms = [t for t in q.replace('"', "").split() if t]
-        match = " ".join(f'"{t}"*' for t in terms)
+        # each term matches itself OR its singular form: FTS prefix
+        # matching is one-directional, so "dragons" alone never matched
+        # the title token "dragon" and the real House of the Dragon
+        # vanished from its own search
+        groups = []
+        for t in terms:
+            variants = {t}
+            if t.endswith("s") and len(t) > 3:
+                variants.add(t[:-1])
+            groups.append("(" + " OR ".join(f'"{v}"*' for v in sorted(variants)) + ")")
+        match = " ".join(groups)
         per, off = 20, (max(page, 1) - 1) * 20
         try:
             rows = db.query(

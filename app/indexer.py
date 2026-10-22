@@ -528,11 +528,14 @@ class Indexer:
 
     async def cleanup_catalog(self) -> dict:
         """Targeted fix-up after a parser improvement: re-parse every file
-        and move only the ones whose (norm_title, year, kind) changed to
-        their correct title. Matching files — and their titles' posters /
-        TMDB matches — are untouched, unlike rebuild_catalog which wipes
-        everything. Titles left with no files are removed (seasons and
-        episodes cascade). Holds the scan lock.
+        and move the ones whose (norm_title, year, kind) changed — or
+        whose season/episode/pack attachment changed (an episode-range
+        file filed under its first episode, a pack filed as a movie) —
+        to their correct title and attachment. Matching files — and
+        their titles' posters / TMDB matches — are untouched, unlike
+        rebuild_catalog which wipes everything. Titles left with no
+        files are removed (seasons and episodes cascade). Holds the
+        scan lock.
 
         Responsiveness contract (learned the hard way on 2026-10-20: the
         first version loaded all ~496k rows at once and yielded only every
@@ -542,6 +545,23 @@ class Indexer:
         to the event loop after EVERY file, and logs progress so a stall
         is visible in the container logs."""
         from .parser import parse_filename
+
+        def _parsed_key(p) -> tuple:
+            if p.is_pack:
+                return ("pack", p.season or 1, p.pack_label or "Complete")
+            if p.kind == "series" and p.episode:
+                return ("ep", p.season or 1, p.episode)
+            return ("none",)
+
+        def _current_key(f) -> tuple:
+            # an episode file's season comes from its episode row (older
+            # ingest left files.season_id NULL for episode files)
+            if f["episode_id"]:
+                return ("ep", f["cur_ep_season"], f["cur_ep_no"])
+            if f["season_id"]:
+                return ("pack", f["cur_pack_season"], f["pack_label"] or "Complete")
+            return ("none",)
+
         async with self._scan_lock:
             top = self.db.query_one("SELECT MAX(id) AS m FROM files")
             max_id = top["m"] or 0  # snapshot: re-inserted files get new
@@ -551,8 +571,13 @@ class Indexer:
             while last_id < max_id:
                 rows = self.db.query(
                     "SELECT f.*, t.norm_title AS cur_norm, t.year AS cur_year, "
-                    "t.kind AS cur_kind FROM files f "
+                    "t.kind AS cur_kind, sp.season_no AS cur_pack_season, "
+                    "e.ep_no AS cur_ep_no, se.season_no AS cur_ep_season "
+                    "FROM files f "
                     "LEFT JOIN titles t ON t.id = f.title_id "
+                    "LEFT JOIN seasons sp ON sp.id = f.season_id "
+                    "LEFT JOIN episodes e ON e.id = f.episode_id "
+                    "LEFT JOIN seasons se ON se.id = e.season_id "
                     "WHERE f.id > ? AND f.id <= ? ORDER BY f.id LIMIT 500",
                     (last_id, max_id))
                 if not rows:
@@ -563,7 +588,8 @@ class Indexer:
                     if p.title:
                         if (p.norm_title == f["cur_norm"]
                                 and p.year == f["cur_year"]
-                                and p.kind == f["cur_kind"]):
+                                and p.kind == f["cur_kind"]
+                                and _parsed_key(p) == _current_key(f)):
                             kept += 1
                         else:
                             hidden = f["status"] == "hidden"

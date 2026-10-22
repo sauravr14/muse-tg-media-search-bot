@@ -21,8 +21,8 @@ from pyrogram.errors import FloodWait
 from .classify import Classifier
 from .llm import LLTitle
 from .db import DB
-from .parser import ParsedName, merge_parsed, parse_filename
-from .tmdb import TMDB, TMDBError
+from .parser import ParsedName, parse_filename
+from .tmdb import TMDB
 
 log = logging.getLogger("mediabot.indexer")
 
@@ -66,7 +66,6 @@ def _file_meta_from_msg(msg) -> dict | None:
         "mime": getattr(media, "mime_type", "") or "",
         "tg_chat_id": msg.chat.id,
         "tg_msg_id": msg.id,
-        "tg_file_id": getattr(media, "file_id", "") or "",
         "caption": msg.caption or "",
         "msg_date": msg.date.timestamp() if getattr(msg, "date", None) else 0,
     }
@@ -106,10 +105,6 @@ class Indexer:
         if meta is None:
             return None
         p = parse_filename(meta["file_name"])
-        cap = next((ln.strip() for ln in (meta["caption"] or "").splitlines()
-                    if ln.strip()), "")
-        if cap:
-            p = merge_parsed(p, parse_filename(cap[:200]))
         if not p.title:
             return None
         res = self.clf.ingest(p, meta)
@@ -642,81 +637,48 @@ class Indexer:
             log.warning("live ingest failed: %r", e)
 
     # -- TMDB enricher -----------------------------------------------------------
-    ENRICH_WORKERS = 3
-    # retry schedule for DEFINITIVE "no match" results (seconds)
-    NO_MATCH_BACKOFF = (1 * 86400, 3 * 86400, 7 * 86400, 30 * 86400)
-    TRANSIENT_RETRY = 300  # TMDB/LLM hiccup: try again in 5 min, no penalty
-
     async def enricher_loop(self) -> None:
-        """Background: attach TMDB metadata to unmatched titles (N workers)."""
+        """Background: attach TMDB metadata to unmatched titles."""
         self._running = True
-        await asyncio.gather(*(self._enrich_worker() for _ in range(self.ENRICH_WORKERS)))
-
-    async def _enrich_worker(self) -> None:
         while self._running:
             try:
-                title_id = await asyncio.wait_for(self._enrich_queue.get(), timeout=3)
+                title_id = await asyncio.wait_for(self._enrich_queue.get(), timeout=5)
             except asyncio.TimeoutError:
-                # sweep: next unmatched title that is DUE. (The old sweep looked
-                # at only the single oldest row and spun on it for 7 days, so
-                # older unmatched titles were never retried.)
+                # also sweep old unmatched titles slowly
                 row = self.db.query_one(
-                    "SELECT id FROM titles WHERE tmdb_id IS NULL AND tmdb_next_at <= ? "
-                    "ORDER BY tmdb_next_at, id LIMIT 1", (time.time(),))
-                if not row:
+                    "SELECT id FROM titles WHERE tmdb_id IS NULL ORDER BY added_at LIMIT 1"
+                )
+                if row and not self._recently_tried(row["id"]):
+                    title_id = row["id"]
+                else:
                     continue
-                title_id = row["id"]
-            try:
-                await self._enrich_one(title_id)
-            except Exception as e:  # a bad row must never kill a worker
-                log.warning("enrich of title %s crashed: %r", title_id, e)
-                self.db.execute("UPDATE titles SET tmdb_next_at=? WHERE id=?",
-                                (time.time() + 3600, title_id))
-            await asyncio.sleep(0.15)
+            await self._enrich_one(title_id)
+            await asyncio.sleep(1.0)
 
-    def _park(self, title_id: int, seconds: float, tried: bool) -> None:
-        self.db.execute(
-            "UPDATE titles SET tmdb_next_at=?, tmdb_tries=tmdb_tries+? WHERE id=?",
-            (time.time() + seconds, 1 if tried else 0, title_id))
+    def _recently_tried(self, title_id: int) -> bool:
+        ts = self.db.get_kv(f"tmdb_try:{title_id}")
+        return bool(ts) and (time.time() - float(ts) < 7 * 24 * 3600)
 
     async def _enrich_one(self, title_id: int) -> None:
+        from .parser import normalize_title
         row = self.db.query_one("SELECT * FROM titles WHERE id=?", (title_id,))
         if not row or row["tmdb_id"]:
             return
-        # claim: other workers/sweeps skip it while we work
-        self.db.execute("UPDATE titles SET tmdb_next_at=? WHERE id=?",
-                        (time.time() + 600, title_id))
+        self.db.set_kv(f"tmdb_try:{title_id}", str(time.time()))
         p = ParsedName(raw=row["title"], title=row["title"],
                        norm_title=row["norm_title"], year=row["year"], kind=row["kind"])
-        try:
-            meta = await self.tmdb.match(p)
-            transient = False
-            if not meta and self.llm and self.llm.available:
-                meta, transient = await self._enrich_via_llm(row, p)
-        except TMDBError as e:
-            log.info("tmdb unavailable for title %s (%s) - retry in %ss",
-                     title_id, e, self.TRANSIENT_RETRY)
-            self._park(title_id, self.TRANSIENT_RETRY, tried=False)
-            return
+        meta = await self.tmdb.match(p)
+        if not meta and self.llm and self.llm.available:
+            meta = await self._enrich_via_llm(row, p)
         if not meta:
-            if transient:  # LLM rate-limited: not a verdict on the title
-                self._park(title_id, self.TRANSIENT_RETRY, tried=False)
-            else:
-                n = min(row["tmdb_tries"], len(self.NO_MATCH_BACKOFF) - 1)
-                self._park(title_id, self.NO_MATCH_BACKOFF[n], tried=True)
             return
         # adopt canonical TMDB title; merge possible duplicate title rows
         await self._adopt_meta(row, meta)
 
-    async def _enrich_via_llm(self, row, p) -> tuple[dict | None, bool]:
+    async def _enrich_via_llm(self, row, p) -> dict | None:
         """Ask the LLM to identify the title from a raw release filename,
-        then cross-check its guess against TMDB (threshold still applies).
-
-        Returns (meta, transient). transient=True means the LLM was
-        unavailable (rate limit/outage): nothing is cached and the caller
-        retries soon instead of treating the title as unidentifiable."""
+        then cross-check its guess against TMDB (threshold still applies)."""
         from .parser import normalize_title
-        import json
         fn = self.db.query_one("SELECT file_name FROM files WHERE title_id=? LIMIT 1",
                                (row["id"],))
         filename = fn["file_name"] if fn else p.raw
@@ -725,16 +687,15 @@ class Indexer:
         guess = None
         if cached:
             try:
-                guess = json.loads(cached)
+                guess = __import__("json").loads(cached)
             except Exception:
                 guess = None
         if guess is None:
             guess = await self.llm.guess_title(filename)
-            if guess is None and getattr(self.llm, "transient", False):
-                return None, True  # do NOT cache a rate-limit as "unknown"
-            self.db.set_kv(ck, json.dumps(guess or {}))
+            self.db.set_kv(ck, __import__("json").dumps(guess or {}))
+            await asyncio.sleep(0.5)
         if not guess or not guess.get("title"):
-            return None, False
+            return None
         tried = set()
         for variant in (guess["title"], guess["title"].split(":")[0],
                         guess["title"].split(" - ")[0]):
@@ -750,8 +711,8 @@ class Indexer:
             if meta:
                 log.info("llm identified %r as %r (%s)", p.raw[:60],
                          meta["title"], meta.get("year"))
-                return meta, False
-        return None, False
+                return meta
+        return None
 
     async def _merge_titles(self, old_id: int, new_id: int) -> None:
         """Fold duplicate title old_id into new_id (same TMDB id).
@@ -788,10 +749,9 @@ class Indexer:
                            (new_id, se["id"]))
                 # pack files keep their season_id: the season row itself moved
         db.execute("UPDATE files SET title_id=? WHERE title_id=?", (new_id, old_id))
-        old_clean = db.query_one("SELECT has_clean FROM titles WHERE id=?", (old_id,))
         db.execute("DELETE FROM titles WHERE id=?", (old_id,))
-        db.execute("UPDATE titles SET last_file_at=?, has_clean=MAX(has_clean, ?) WHERE id=?",
-                   (time.time(), old_clean["has_clean"] if old_clean else 1, new_id))
+        db.execute("UPDATE titles SET last_file_at=? WHERE id=?",
+                   (time.time(), new_id))
         log.info("merged title %s into %s", old_id, new_id)
 
     async def _adopt_meta(self, row, meta: dict) -> None:

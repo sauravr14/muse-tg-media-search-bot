@@ -232,7 +232,10 @@ class ParserTest(unittest.TestCase):
         # "_450MB" has no \b before the digits ("_" is a word char),
         # so the size pattern must be separator-aware on both sides
         p = parse_filename("Vivaha_Bhojanambu_2021_HQ_HDRip_x264_Telugu_Kannada_450MB.mkv")
-        self.assertEqual(p.title, "Vivaha Bhojanambu Telugu Kannada")
+        # "Telugu Kannada" are post-year language tags, not part of the
+        # movie's name — the year cut drops them (pre-2026-10-22 this test
+        # encoded the leak, which left the title TMDB-unmatchable)
+        self.assertEqual(p.title, "Vivaha Bhojanambu")
         p = parse_filename("Movie_2020_700MB_480p.mkv")
         self.assertEqual(p.title, "Movie")
         p = parse_filename("Movie.2020.1.2GB.1080p.mkv")
@@ -344,6 +347,65 @@ class ParserTest(unittest.TestCase):
         # the intact "AAC 5.1" path must keep working end to end
         p = parse_filename("Some.Movie.2020.720p.BluRay.AAC.5.1.x264.mkv")
         self.assertEqual(p.title, "Some Movie")
+
+    def test_post_year_tail_is_metadata_not_title(self):
+        # Real filenames from the live catalog (2026-10-22): every token
+        # after the release year is release metadata — truncated tags
+        # ("BluR", "x26", "We"), filler ("Bollywood"), uploader tails
+        # ("- Fi", "@RjRip"), bitrates ("192kbps"). Keeping any of it
+        # splinters one movie into many poster-less titles.
+        for raw in (
+            "🎬 Kick (2014) Bollywood Hindi Full Movie BluRay 720p ESub - Fi.mkv",
+            "Kick (2014) Bollywood Hindi Full Movie BluRay 1080p ESub - F.mkv",
+            "Kick (2014) Hindi 480p BluR.Mkv",
+            "[ @BT_MOVIES_HD ][ @FILMSCLUB04 ]Kick (2014) Hindi 1080p Blu.Mkv",
+            "Kick (2014) Hindi 1080p BluRay ESubs - EMoviezBot.mkv",
+            "avc_Kick_2014_480p_Farsi_Dubbed_.mp4",
+            "Kick.2014.BluRay.720p.x264.Ganool.mkv",
+            "Kick_2014_720p_10bit_BluRay_x265_HEVC_Hindi_DD_5_1_ESub_Immortal.mkv",
+            "[TPE].Kick 2014 Hindi 720p Blu-Ray x264 AAC 5.1 ESub-Masti.mkv",
+            "Kick_2014_Full_Movie_New_Bollywood_HD_Hindi_Movie_New_S_8g2n7JSp.mp4",
+        ):
+            p = parse_filename(raw)
+            self.assertEqual((p.title, p.year), ("Kick", 2014), raw)
+        for raw in (
+            "Kick 2023 1080p DSNP WEB-DL x264 DD5.1 192kbps Tam Mal K.mkv",
+            "Kick_2023_HQ_HDRip_720p_x264_DD+5_1_192Kbps_Malayalam_+_Kannada.mkv",
+            "Kick 2023 480p DSNP WEB-DL x265 2 0 64kbps Tam Mal Kan_D.mkv",
+        ):
+            p = parse_filename(raw)
+            self.assertEqual((p.title, p.year), ("Kick", 2023), raw)
+        for raw in (
+            "Spider Man   No Way Home (2021) 1080p UHD HDR10 DV Bl @RjRip.mkv",
+            "Spider Man No Way Home (2021) BR-Rip - x264 - [Tam + Tel + H.mkv",
+            "Spider Man No Way Home (2021) EXTENDED 1080p 10bit WE @RjRip.mkv",
+            "Spider Man No Way Home (2021) EXTENDED 720p 10bit WEB @RjRip.mkv",
+            "Spider Man   No Way Home (2021) 1080p 10bit BluRay x2 @RjRip.mkv",
+            "Spider Man   No Way Home (2021) 720p 10bit BluRay x26 @RjRip.mkv",
+            "www_1TamilMV_cool_Spider_Man_No_Way_Home_2021_BR_Rip_x264_Tam_+.mkv",
+        ):
+            p = parse_filename(raw)
+            self.assertEqual((p.title, p.year),
+                             ("Spider Man No Way Home", 2021), raw)
+
+    def test_year_cut_guards(self):
+        # a year that is part of the title survives when it sits BEFORE
+        # the release year; number-only titles keep their number
+        p = parse_filename("Blade Runner 2049 (2017) 1080p BluRay.mkv")
+        self.assertEqual(p.year, 2017)
+        self.assertTrue(p.title.startswith("Blade Runner"))
+        p = parse_filename("1917 (2019) 1080p WEB-DL.mkv")
+        self.assertEqual((p.title, p.year), ("1917", 2019))
+        p = parse_filename("2012.2009.1080p.BluRay.mkv")
+        self.assertEqual((p.title, p.year), ("2012", 2009))
+        # episode-only marker hiding after the year is rescued
+        p = parse_filename("Some Show 2019 E02.mkv")
+        self.assertEqual((p.title, p.kind, p.episode), ("Some Show", "series", 2))
+        # handle glued onto the year dies with the tail
+        p = parse_filename("Aadu 2015@kickass_torrents.mkv")
+        self.assertEqual((p.title, p.year), ("Aadu", 2015))
+        p = parse_filename("Agent_Sai_Srinivasa_Athreya@kick.mkv")
+        self.assertEqual(p.title, "Agent Sai Srinivasa Athreya")
 
 if __name__ == "__main__":
     unittest.main()

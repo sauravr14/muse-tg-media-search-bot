@@ -149,8 +149,15 @@ class Classifier:
             season = self.get_or_create_season(title_id, p.season or 1)
             season_id = season["id"]
             pack_label = p.pack_label or "Complete"
+            if p.ep_range:
+                # a range pack ("E01–E05") covers real episodes: create
+                # their rows so the season listing shows every covered
+                # episode instead of looking half-scanned
+                for ep_no in range(p.ep_range[0], p.ep_range[1] + 1):
+                    self.get_or_create_episode(title_id, season["id"], ep_no)
         elif p.kind == "series" and p.episode:
             season = self.get_or_create_season(title_id, p.season or 1)
+            season_id = season["id"]
             ep = self.get_or_create_episode(title_id, season["id"], p.episode)
             episode_id = ep["id"]
 

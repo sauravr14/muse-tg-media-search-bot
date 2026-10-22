@@ -54,8 +54,29 @@ CAM_PATTERNS = [
 # S01E02, S1E2, s01e02
 SE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
 SE_SPACED_RE = re.compile(r"\b[Ss](\d{1,2})\s+[Ee](\d{1,3})\b")
+# S02 01 (season + one bare zero-padded episode number, from "S02_01")
+SE_BARE_RE = re.compile(r"\b[Ss](\d{1,2})\s+(\d{1,2})\b")
+# multi-episode ranges, matched on the flattened name; group order is
+# always (season, first_ep, last_ep). The range end must be zero-padded
+# or T/To-marked so audio tokens ("S01E01 5 1") can't fake a range, and
+# _apply caps the span so resolutions ("S01E01 720") can't either.
+EP_RANGE_PATTERNS = [
+    # [S01E01T05] — "T" is the range separator
+    re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})[Tt](\d{1,3})(?![\dA-Za-z])"),
+    # S01E01-05 / S01E01_05 (flattened: "S01E01 05")
+    re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})\s+(\d{2,3})(?![\dA-Za-z])"),
+    # S01 E01-05 / S01_E01_05 (flattened: "S01 E01 05")
+    re.compile(r"[Ss](\d{1,2})\s+[Ee](\d{1,3})\s+(\d{2,3})(?![\dA-Za-z])"),
+    # S03 Ep01 To 10 / S04 Epi 01 05 / S02 EP (01-08) (flattened;
+    # brackets survive flattening, so the season->Ep gap tolerates them)
+    re.compile(r"[Ss](\d{1,2})[\s\[\]\(\)]*[Ee]p(?:isode|i)?\s*(\d{1,3})\s+(?:To\s+)?(\d{1,3})(?![\dA-Za-z])", re.I),
+    re.compile(r"Season\s+(\d{1,2})\s+[Ee]p(?:isode|i)?\s*(\d{1,3})\s+(?:To\s+)?(\d{1,3})(?![\dA-Za-z])", re.I),
+    # S02_01_05 (flattened: "S02 01 05") — season + two bare padded numbers
+    re.compile(r"[Ss](\d{1,2})\s+(\d{2})\s+(\d{2})(?![\dA-Za-z])"),
+]
 # season-pack markers: "S01 COMBINED", "Season 1 Complete", "[E01-04]"
-PACK_RE = re.compile(r"\b(COMBINED|COMPLETE)\b", re.I)
+# (COMPETE is the common misspelling of COMPLETE in release names)
+PACK_RE = re.compile(r"\b(COMBINED|COMPLETE|COMPETE)\b", re.I)
 PACK_RANGE_RE = re.compile(r"[\(\[\{]\s*[Ee](\d{1,3})\s*[-–_\s]\s*(?:[Ee])?(\d{1,3})\s*[\)\]\}]")
 SEASON_NUM_RE = re.compile(r"\b[Ss](\d{1,2})\b")
 SEASON_WORD_RE = re.compile(r"\b[Ss]eason\s+(\d{1,2})\b", re.I)
@@ -78,12 +99,67 @@ def _detect_pack(name: str, p: "ParsedName", pack_range: tuple | None = None) ->
     if sm:
         p.season = int(sm.group(1))
         name = name[: sm.start()] + " " + name[sm.end():]
+    if not pack_range:
+        # inline range without brackets surviving flattening is rare, but
+        # "EP (01-08) COMBINED" keeps its parens until the bracket strip —
+        # read the range straight from them when present
+        im = re.search(r"\(\s*(\d{1,3})[\s\-–]+(\d{1,3})\s*\)", name)
+        if im:
+            a, b = int(im.group(1)), int(im.group(2))
+            if 1 <= a < b <= a + 50:
+                pack_range = (a, b)
     if pack_range:
         a, b = pack_range
         p.pack_label = f"E{a:02d}\u2013E{b:02d}"
+        p.ep_range = pack_range
     else:
         p.pack_label = "Complete"
     return PACK_RE.sub(" ", name)
+
+
+def _detect_episode_range(name: str, p: "ParsedName",
+                          pack_range: tuple | None = None) -> str:
+    """Detect multi-episode range files ("S01 E01-05", "S02_01_05",
+    "[S01E01T05]", "S03 Ep01 To 10").
+
+    A range file is a mini-pack, not a single episode: filing it under
+    its first episode made every other covered episode vanish from the
+    season listing (a "You" season packaged as E01-05 + E06-10 showed
+    only episodes 1 and 6). Sets kind/season/is_pack/ep_range; ingest
+    creates an episode row for every covered episode. Returns the name
+    with the range span removed, so the range end can never leak into
+    the title ("House Of The Dragon 05 Ms")."""
+    def _apply(season: int, a: int, b: int, span: tuple) -> str | None:
+        if not (1 <= a < b <= a + 50):
+            return None
+        p.kind = "series"
+        p.season = season
+        p.is_pack = True
+        p.ep_range = (a, b)
+        p.pack_label = f"E{a:02d}\u2013E{b:02d}"
+        if re.search(r"[A-Za-z]", name[: span[0]]):
+            # the title is the text before the range; the tail (another
+            # bracket remnant, "Combined", uploader initials) is release
+            # metadata — kept aside only to rescue a year from it
+            p.extra["tail"] = name[span[1]:]
+            return name[: span[0]]
+        return name[: span[0]] + " " + name[span[1]:]
+
+    if pack_range:
+        sm = SEASON_NUM_RE.search(name) or SEASON_WORD_RE.search(name)
+        if sm:
+            out = _apply(int(sm.group(1)), pack_range[0], pack_range[1],
+                         (sm.start(), sm.end()))
+            if out is not None:
+                return out
+    for rx in EP_RANGE_PATTERNS:
+        m = rx.search(name)
+        if m:
+            out = _apply(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                         (m.start(), m.end()))
+            if out is not None:
+                return out
+    return name
 # 1x02
 X_RE = re.compile(r"\b(\d{1,2})x(\d{1,3})\b")
 # Season 1 Episode 2 / Season.1.Episode.2
@@ -211,6 +287,7 @@ class ParsedName:
     codec: str = ""
     is_pack: bool = False  # season pack (episode is None)
     pack_label: str = ""  # "E01–E04" | "Complete"
+    ep_range: tuple | None = None  # (first, last) episode a pack covers
     is_cam: bool = False  # theatre print (HDCAM/CAM/HDTS/PreDVD/...)
     extra: dict = field(default_factory=dict)
 
@@ -251,35 +328,55 @@ def parse_filename(raw: str) -> ParsedName:
     # (from "www_1TamilMV_cool_...") — the domain is never the title
     name = re.sub(r"^www\s+\S+\s+(?:com|net|cool|org|me|to|info)\s+", " ", name, flags=re.I)
 
-    # season packs ("S01 COMBINED", "[E01-04]") before series markers
-    name = _detect_pack(name, p, pack_range)
+    # episode-range mini-packs ("S01 E01-05") BEFORE season packs and
+    # series markers: a range must never be filed as its first episode
+    name = _detect_episode_range(name, p, pack_range)
 
+    # season packs ("S01 COMBINED", "[E01-04]") before series markers
+    if not p.is_pack:
+        name = _detect_pack(name, p, pack_range)
+
+    # resolution/codec/source/cam are read from the head AND any tail the
+    # range step set aside ("Lanterns 2026 S01 COMBINED [E01-04] 1080p"
+    # truncates to "Lanterns 2026" — the 1080p lives in the tail)
+    probe = name + " " + (p.extra.get("tail") or "")
     for rx, val in RES_PATTERNS:
-        if rx.search(name):
+        if rx.search(probe):
             p.resolution = val
             break
     for rx, val in CODEC_PATTERNS:
-        if rx.search(name):
+        if rx.search(probe):
             p.codec = val
             break
     for rx, val in SOURCE_PATTERNS:
-        if rx.search(name):
+        if rx.search(probe):
             p.quality = val
             break
     for rx in CAM_PATTERNS:
-        if rx.search(name):
+        if rx.search(probe):
             p.is_cam = True
             break
 
     # series markers (checked before year so S01E02 isn't mangled)
+    series_tail = ""
     if not p.is_pack:
         m = (SE_RE.search(name) or SE_SPACED_RE.search(name) or X_RE.search(name)
-             or SEASON_EP_WORDS_RE.search(name))
+             or SEASON_EP_WORDS_RE.search(name) or SE_BARE_RE.search(name))
         if m:
             p.kind = "series"
             p.season = int(m.group(1))
             p.episode = int(m.group(2))
-            name = name[: m.start()] + " " + name[m.end():]
+            if re.search(r"[A-Za-z]", name[: m.start()]):
+                # The title is the text BEFORE the marker. Words after it
+                # are the episode's own name or release tags, never the
+                # show's title — keeping them minted splinter titles like
+                # "House Of The Dragon The Heirs Of The Dragon 10B" from
+                # "House.of.the.Dragon.S01E01.The.Heirs.of.the.Dragon...".
+                # The tail is kept aside only to rescue a year from it.
+                series_tail = name[m.end():]
+                name = name[: m.start()]
+            else:
+                name = name[: m.start()] + " " + name[m.end():]
 
     years = list(YEAR_RE.finditer(name))
     if years:
@@ -310,6 +407,14 @@ def parse_filename(raw: str) -> ParsedName:
             # year leads the name ("2014 Kick ...") or the pre-year part is
             # a bare number title ("1917 (2019)") — keep the old behaviour.
             name = before + " " + after
+
+    if not years and (series_tail or p.extra.get("tail")):
+        # the year sat after the episode marker ("Show S01E01 2022
+        # 1080p") — rescue it from the dropped tail; the tail itself
+        # (episode name, tags) stays dropped
+        ym = YEAR_RE.search(series_tail or p.extra.get("tail", ""))
+        if ym:
+            p.year = int(ym.group(1))
 
     # episode-only marker after year removal ("Show E02")
     if p.kind == "movie" and not p.is_pack:
@@ -354,6 +459,9 @@ def parse_filename(raw: str) -> ParsedName:
         if new_name == name:
             break
         name = new_name
+    # trailing bare resolution ("... Compete S01 ... 480" — the file was
+    # "480.mkv", no "p" for the resolution patterns to catch)
+    name = re.sub(r"\s+(360|480|720|1080|2160)\s*$", " ", name)
     if p.year:
         # a year was found: trailing bare numbers are usually junk
         # ("Film 1992 ... 247", "Stranger Things ... 04"), but a single 1-9

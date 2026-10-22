@@ -15,7 +15,6 @@ import hashlib
 import json
 import logging
 import re
-import time
 
 import aiohttp
 
@@ -45,12 +44,6 @@ class LLTitle:
         self.api_key = api_key
         self.model = model or FREE_MODEL
         self._session = session
-        # Free tiers rate-limit hard. After a 429 we stop calling for a while
-        # (no inline sleeping that stalls the enricher) and flag the result
-        # as transient so callers do NOT cache "unidentifiable".
-        self.cooldown_until = 0.0
-        self._streak = 0
-        self.transient = False
 
     @property
     def available(self) -> bool:
@@ -73,42 +66,35 @@ class LLTitle:
         """Return {"title", "year", "kind"} or None when unidentifiable."""
         if not self.available or not filename:
             return None
-        self.transient = False
-        if time.time() < self.cooldown_until:
-            self.transient = True
-            return None
         data = None
-        try:
-            s = await self._sess()
-            async with s.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}",
-                         "Content-Type": "application/json"},
-                json={"model": self.model,
-                      "messages": [{"role": "system", "content": SYSTEM},
-                                   {"role": "user",
-                                    "content": USER_TMPL.format(fn=filename[:200])}],
-                      "temperature": 0,
-                      "max_tokens": 200},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as r:
-                if r.status == 429:
-                    self._streak += 1
-                    wait = min(30 * self._streak, 300)
-                    self.cooldown_until = time.time() + wait
-                    self.transient = True
-                    log.warning("openrouter rate-limited, pausing LLM calls for %ss", wait)
-                    return None
-                if r.status != 200:
-                    log.warning("openrouter %s: %s", r.status, (await r.text())[:120])
-                    self.transient = r.status >= 500
-                    return None
-                data = await r.json()
-                self._streak = 0
-        except Exception as e:
-            log.warning("openrouter request failed: %r", e)
-            self.transient = True
-            return None
+        for attempt in range(3):
+            try:
+                s = await self._sess()
+                async with s.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}",
+                             "Content-Type": "application/json"},
+                    json={"model": self.model,
+                          "messages": [{"role": "system", "content": SYSTEM},
+                                       {"role": "user",
+                                        "content": USER_TMPL.format(fn=filename[:200])}],
+                          "temperature": 0,
+                          "max_tokens": 500},
+                    timeout=aiohttp.ClientTimeout(total=90),
+                ) as r:
+                    if r.status == 429:
+                        wait = 5 * (attempt + 1)
+                        log.warning("openrouter rate-limited, retry in %ss", wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    if r.status != 200:
+                        log.warning("openrouter %s: %s", r.status, (await r.text())[:120])
+                        return None
+                    data = await r.json()
+                    break
+            except Exception as e:
+                log.warning("openrouter request failed: %r", e)
+                return None
         if data is None:
             return None
         try:

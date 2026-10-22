@@ -652,6 +652,15 @@ class Indexer:
         self._running = True
         backlog: list[int] = []
         while self._running:
+            # Heavy jobs (history scans, /cleanup) hold the scan lock for
+            # hours and saturate the same event loop + DB. The enricher
+            # must not compete with them: while the lock is held it waits
+            # — its work (posters) is deferrable, theirs is user-visible.
+            # (Learned 2026-10-22: enricher + cleanup together dropped
+            # cleanup to ~750 files/min and made the bot reply late.)
+            if self._scan_lock.locked():
+                await asyncio.sleep(5)
+                continue
             title_id = None
             try:
                 title_id = self._enrich_queue.get_nowait()

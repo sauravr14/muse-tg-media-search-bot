@@ -89,28 +89,21 @@ class MediaBot:
         q = q.strip()
         if not q:
             return []
-        # FTS5 prefix query on word tokens only (punctuation breaks raw FTS)
-        terms = re.findall(r"\w+", q.lower())[:8]
+        # quote for FTS5; prefix match each term
+        terms = [t for t in q.replace('"', "").split() if t]
         if not terms:
             return []
         match = " ".join(f'"{t}"*' for t in terms)
-        sql = ("SELECT t.* FROM titles t WHERE t.id IN (SELECT rowid FROM titles_fts "
-               "WHERE titles_fts MATCH ? ORDER BY rank LIMIT 400)")
+        sql = ("SELECT t.* FROM titles_fts f JOIN titles t ON t.id=f.rowid "
+               "WHERE titles_fts MATCH ?")
         params: list = [match]
         if kind in ("movie", "series"):
             sql += " AND t.kind=?"
             params.append(kind)
-        # matched (TMDB) titles first; unmatched junk variants sink to the end
-        sql += (" ORDER BY (t.tmdb_id IS NOT NULL) DESC, t.popularity DESC, "
-                "t.last_file_at DESC LIMIT ? OFFSET ?")
-        params += [limit + 12, offset]
+        sql += " ORDER BY t.popularity DESC NULLS LAST, t.last_file_at DESC LIMIT ? OFFSET ?"
+        params += [limit, offset]
         try:
-            rows = self.db.query(sql, tuple(params))
-            matched = [r["norm_title"] for r in rows if r["tmdb_id"]]
-            keep = [r for r in rows if r["tmdb_id"] or not any(
-                r["norm_title"] == m or r["norm_title"].startswith(m + " ")
-                for m in matched)]
-            return keep[:limit]
+            return self.db.query(sql, tuple(params))
         except Exception as e:
             log.warning("fts failed for %r: %r", q, e)
             like = f"%{'%'.join(terms)}%"
@@ -605,36 +598,19 @@ class MediaBot:
         f = self.db.query_one("SELECT * FROM files WHERE id=?", (fid,))
         if not f:
             return False, "File not found."
-        caption = f"🎬 <b>{html.escape(f['file_name'])}</b>"
-        if f["resolution"]:
-            caption += f" · {f['resolution']}"
         try:
-            sent = None
-            cached = f["tg_file_id"] if "tg_file_id" in f.keys() else ""
-            if cached:
-                # FAST PATH: one Telegram call, no fetch from the channel.
-                try:
-                    sent = await self.client.send_cached_media(
-                        user_id, cached, caption=caption, parse_mode=ParseMode.HTML)
-                except Exception as e:
-                    if type(e).__name__ in ("PeerIdInvalid", "UserIsBlocked",
-                                            "InputUserDeactivated"):
-                        return False, "not_started"
-                    log.info("cached file_id failed (%s), falling back to copy", type(e).__name__)
-            if sent is None:
-                msg = await self.client.get_messages(f["tg_chat_id"], f["tg_msg_id"])
-                if not msg or msg.empty:
-                    return False, "Source file unavailable."
-                sent = await msg.copy(user_id, caption=caption, parse_mode=ParseMode.HTML)
-                # remember the bot-scoped file_id: every later delivery is the fast path
-                media = (getattr(sent, "video", None) or getattr(sent, "document", None)
-                         or getattr(sent, "audio", None))
-                if media and getattr(media, "file_id", ""):
-                    self.db.execute("UPDATE files SET tg_file_id=? WHERE id=?",
-                                    (media.file_id, fid))
-            self._schedule_delete(user_id, [sent.id], delay=600)
-            # the reminder is sent in the background: don't make the user wait for it
-            asyncio.create_task(self._send_delete_notice(user_id))
+            msg = await self.client.get_messages(f["tg_chat_id"], f["tg_msg_id"])
+            if not msg or msg.empty:
+                return False, "Source file unavailable."
+            caption = f"🎬 <b>{html.escape(f['file_name'])}</b>"
+            if f["resolution"]:
+                caption += f" · {f['resolution']}"
+            sent = await msg.copy(user_id, caption=caption, parse_mode=ParseMode.HTML)
+            warn = await self.client.send_message(
+                user_id,
+                "⏳ The file will be deleted in 10 minutes. "
+                "Forward the files to your saved messages.")
+            self._schedule_delete(user_id, [sent.id, warn.id], delay=600)
             return True, "sent"
         except Exception as e:
             log.warning("deliver_to_user failed: %r", e)
@@ -642,15 +618,6 @@ class MediaBot:
             if name in ("PeerIdInvalid", "UserIsBlocked", "InputUserDeactivated"):
                 return False, "not_started"
             return False, f"{name}: {e}"[:200]
-
-    async def _send_delete_notice(self, user_id: int) -> None:
-        try:
-            warn = await self.client.send_message(
-                user_id, "⏳ The file will be deleted in 10 minutes. "
-                         "Forward the files to your saved messages.")
-            self._schedule_delete(user_id, [warn.id], delay=600)
-        except Exception as e:
-            log.info("delete notice failed: %r", e)
 
     async def _deliver_file(self, chat_id: int, file_id: str, user_id: int):
         ok, msg = await self.deliver_to_user(chat_id, file_id)

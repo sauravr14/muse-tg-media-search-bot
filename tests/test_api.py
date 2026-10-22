@@ -144,5 +144,46 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(len(d["versions"]), 1)  # hidden one gone
 
 
+class MultiWordSearchTest(unittest.TestCase):
+    """Regression (2026-10-22): /api/search built its FTS5 query as
+    adjacent parenthesised term groups — a syntax error FTS5 rejects,
+    silently swallowed into an empty result list. Every multi-word
+    search ("black panther", "the good doctor") returned nothing while
+    single words worked. Groups must be joined with an explicit AND."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db = DB(Path(tempfile.mkdtemp()) / "api2.db")
+        clf = Classifier(cls.db)
+        meta = lambda c, m, n: {"file_name": n, "size": 10, "duration": 5,
+                                "mime": "video/x-matroska", "tg_chat_id": c,
+                                "tg_msg_id": m, "caption": "", "msg_date": 0}
+        names = ["Black.Panther.2018.1080p.mkv",
+                 "The.Good.Doctor.S01E01.720p.mkv",
+                 "House.of.the.Dragon.S01E01.720p.mkv"]
+        for i, n in enumerate(names):
+            clf.ingest(parse_filename(n), meta(-1002, 1 + i, n))
+        cfg = Config()
+        cfg.bot_token = "test-token"
+        cls.client = TestClient(create_app(cfg, cls.db, bot_username="testbot"))
+
+    def _titles(self, q):
+        d = self.client.get("/api/search", params={"q": q}).json()
+        return [r["title"] for r in d["results"]]
+
+    def test_two_word_movie(self):
+        self.assertEqual(self._titles("black panther"), ["Black Panther"])
+
+    def test_three_word_series_with_the(self):
+        self.assertEqual(self._titles("the good doctor"), ["The Good Doctor"])
+
+    def test_multi_word_plural_term(self):
+        self.assertEqual(self._titles("house of the dragons"),
+                         ["House Of The Dragon"])  # parser title-cases
+
+    def test_partial_phrase_still_matches(self):
+        self.assertEqual(self._titles("good doctor"), ["The Good Doctor"])
+
+
 if __name__ == "__main__":
     unittest.main()

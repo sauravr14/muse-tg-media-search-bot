@@ -72,6 +72,26 @@ class TestLLTitle(unittest.TestCase):
         llm = LLTitle("k", session=FakeSession({}, status=429))
         self.assertIsNone(asyncio.run(llm.guess_title("abc")))
 
+    def test_rate_limit_trips_breaker_and_fails_fast(self):
+        import time
+        from unittest import mock
+
+        async def _nosleep(*a, **k):
+            return None
+
+        llm = LLTitle("k", session=FakeSession({}, status=429))
+        with mock.patch.object(asyncio, "sleep", _nosleep):
+            self.assertIsNone(asyncio.run(llm.guess_title("abc")))
+        # three attempts were made, then the breaker tripped
+        self.assertEqual(len(llm._session.posts), 3)
+        self.assertGreater(llm.rate_limited_until, time.time())
+        # during the cooldown, guesses fail fast with no HTTP at all
+        llm._session = FakeSession(
+            {"choices": [{"message": {
+                "content": '{"title": "X", "year": 2000, "kind": "movie"}'}}]})
+        self.assertIsNone(asyncio.run(llm.guess_title("abc")))
+        self.assertEqual(len(llm._session.posts), 0)
+
     def test_no_key_not_available(self):
         self.assertFalse(LLTitle("").available)
         self.assertIsNone(asyncio.run(LLTitle("").guess_title("abc")))

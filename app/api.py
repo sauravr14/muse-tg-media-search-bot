@@ -134,6 +134,45 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
             tuple(([kind] if kind in ("movie", "series") else []) + [limit]))
         return {"results": [_title_card(t) for t in rows]}
 
+    @app.get("/api/home")
+    async def home(hide_cam: int = 0):
+        """Everything the Home tab needs in one request: a hero carousel
+        (TMDB-matched titles with backdrops) plus poster-first rails.
+        Ported from the 2026-10-22 optimized build's /api/home onto this
+        API's helpers, so the Netflix-style webapp works on this backend."""
+        clean = CLEAN_ONLY if hide_cam else ""
+
+        def hero_card(t) -> dict:
+            c = _title_card(t)
+            c["backdrop"] = t["backdrop"]
+            return c
+
+        heroes: list = []
+        for kind in ("movie", "series"):
+            heroes += db.query(
+                "SELECT * FROM titles WHERE kind=? AND backdrop != ''"
+                " AND overview != '' AND poster != ''" + clean
+                + " ORDER BY last_file_at DESC LIMIT 4", (kind,))
+        heroes.sort(key=lambda t: t["last_file_at"], reverse=True)
+
+        def rail(kind: str) -> list:
+            rows = db.query(
+                "SELECT * FROM titles WHERE kind=? AND poster != ''" + clean
+                + " ORDER BY last_file_at DESC LIMIT 18", (kind,))
+            return [_title_card(t) for t in rows]
+
+        trending = db.query(
+            "SELECT * FROM titles WHERE poster != ''" + clean
+            + " ORDER BY popularity DESC NULLS LAST LIMIT 18")
+        rows = [
+            {"title": "Recently added movies", "results": rail("movie")},
+            {"title": "Recently added series", "results": rail("series")},
+            {"title": "Trending now",
+             "results": [_title_card(t) for t in trending]},
+        ]
+        return {"hero": [hero_card(t) for t in heroes[:6]],
+                "rows": [r for r in rows if r["results"]]}
+
     @app.post("/api/getfile")
     async def getfile(request: Request):
         """Mini App Get button: bot delivers the file straight to the user's DM.

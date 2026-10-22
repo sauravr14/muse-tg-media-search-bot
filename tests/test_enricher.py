@@ -68,5 +68,36 @@ class BacklogTest(unittest.TestCase):
         self.assertEqual(len(self.idx._backlog_ids(2)), 2)
 
 
+class EnricherDeferralTest(unittest.TestCase):
+    def test_enricher_waits_while_scan_lock_held(self):
+        import asyncio as _a
+        db = DB(Path(tempfile.mkdtemp()) / "defer.db")
+        idx = Indexer(None, db, TMDB(db, ""))
+        calls = []
+
+        async def fake_enrich(tid):
+            calls.append(tid)
+
+        idx._enrich_one = fake_enrich
+        idx._enrich_queue.put_nowait(123)
+
+        async def main():
+            async with idx._scan_lock:
+                task = _a.create_task(idx.enricher_loop())
+                await _a.sleep(0.4)
+                # lock held: the queued title must NOT be enriched
+                self.assertEqual(calls, [])
+            # lock released: the loop wakes on its 5s deferral tick
+            for _ in range(70):
+                if calls:
+                    break
+                await _a.sleep(0.1)
+            idx.stop()
+            task.cancel()
+            self.assertEqual(calls, [123])
+
+        _a.run(main())
+
+
 if __name__ == "__main__":
     unittest.main()

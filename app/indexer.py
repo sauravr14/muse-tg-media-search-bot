@@ -638,22 +638,58 @@ class Indexer:
 
     # -- TMDB enricher -----------------------------------------------------------
     async def enricher_loop(self) -> None:
-        """Background: attach TMDB metadata to unmatched titles."""
+        """Background: attach TMDB metadata to unmatched titles.
+
+        Freshly ingested titles go first (the live queue); the backlog of
+        older unmatched titles is swept most-files-first, so the titles
+        users actually open get posters first. The old sweep re-picked the
+        single OLDEST unmatched title on every pass and skipped it when it
+        had been tried within 7 days — one unmatchable title at the head
+        froze the whole backlog (284k titles waiting, ~2.5k matched,
+        famous titles never even attempted). The sweep now pulls batches
+        of untried ids ordered by file count, computed in a worker thread
+        so the aggregate never blocks the event loop."""
         self._running = True
+        backlog: list[int] = []
         while self._running:
+            title_id = None
             try:
-                title_id = await asyncio.wait_for(self._enrich_queue.get(), timeout=5)
-            except asyncio.TimeoutError:
-                # also sweep old unmatched titles slowly
-                row = self.db.query_one(
-                    "SELECT id FROM titles WHERE tmdb_id IS NULL ORDER BY added_at LIMIT 1"
-                )
-                if row and not self._recently_tried(row["id"]):
-                    title_id = row["id"]
-                else:
-                    continue
-            await self._enrich_one(title_id)
-            await asyncio.sleep(1.0)
+                title_id = self._enrich_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            if title_id is None:
+                while backlog and title_id is None:
+                    cand = backlog.pop(0)
+                    if not self._recently_tried(cand):
+                        title_id = cand
+                if title_id is None and not backlog:
+                    backlog = await asyncio.to_thread(self._backlog_ids, 500)
+                    if backlog:
+                        continue
+                    # backlog exhausted for this retry window: idle-wait
+                    try:
+                        title_id = await asyncio.wait_for(
+                            self._enrich_queue.get(), timeout=60)
+                    except asyncio.TimeoutError:
+                        continue
+            if title_id is not None:
+                await self._enrich_one(title_id)
+                await asyncio.sleep(0.3)
+
+    def _backlog_ids(self, limit: int) -> list[int]:
+        """Untried unmatched title ids, most files first. Runs in a
+        worker thread (see enricher_loop) — the per-title file COUNT over
+        the whole catalog is far too heavy for the event loop."""
+        cutoff = time.time() - 7 * 24 * 3600
+        rows = self.db.query(
+            "SELECT t.id FROM titles t WHERE t.tmdb_id IS NULL"
+            " AND NOT EXISTS (SELECT 1 FROM kv"
+            " WHERE kv.key = 'tmdb_try:' || t.id"
+            " AND CAST(kv.value AS REAL) > ?)"
+            " ORDER BY (SELECT COUNT(*) FROM files f"
+            " WHERE f.title_id = t.id) DESC, t.added_at LIMIT ?",
+            (cutoff, limit))
+        return [r["id"] for r in rows]
 
     def _recently_tried(self, title_id: int) -> bool:
         ts = self.db.get_kv(f"tmdb_try:{title_id}")

@@ -475,3 +475,65 @@ class CleanupCatalogTest(unittest.TestCase):
             "SELECT id FROM titles WHERE id=?", (self.good_id,)))
         self.assertIsNotNone(self.db.query_one(
             "SELECT id FROM titles WHERE id=?", (self.other_id,)))
+
+
+class CleanupAttachmentTest(unittest.TestCase):
+    """Cleanup also repairs a file whose title is right but whose
+    season/episode/pack attachment is wrong — the 2026-10-22 case: a
+    "You S01 E01-05" range file filed under episode 1 alone, hiding
+    episodes 2-5. Title/year/kind are unchanged by the parser fix, so a
+    title-only comparison would keep it misfiled forever."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = DB(os.path.join(self.tmp, "t.db"))
+        self.chat_id = -1002001978984
+        self.db.upsert_source(self.chat_id, "JEROM DB", "")
+        self.idx = Indexer(FakeClient({}), self.db, TMDB(self.db, ""))
+        now = time.time()
+        cur = self.db.execute(
+            "INSERT INTO titles(kind, title, norm_title, year, "
+            "added_at, updated_at) VALUES('series', 'You', 'you', 2018, "
+            "?, ?)", (now, now))
+        self.title_id = cur.lastrowid
+        cur = self.db.execute(
+            "INSERT INTO seasons(title_id, season_no) VALUES(?, 1)",
+            (self.title_id,))
+        self.season_id = cur.lastrowid
+        cur = self.db.execute(
+            "INSERT INTO episodes(title_id, season_id, ep_no) "
+            "VALUES(?, ?, 1)", (self.title_id, self.season_id))
+        ep_id = cur.lastrowid
+        # the range file, misfiled under episode 1 by the old parser
+        self.db.execute(
+            "INSERT INTO files(title_id, episode_id, file_name, "
+            "tg_chat_id, tg_msg_id, indexed_at, status) VALUES(?, ?, "
+            "'You (2018) S01 E01-05 480p HEVC HDRip.mkv', ?, 42, ?, 'ok')",
+            (self.title_id, ep_id, self.chat_id, now))
+        # a correct single-episode file that must be kept as-is
+        cur = self.db.execute(
+            "INSERT INTO episodes(title_id, season_id, ep_no) "
+            "VALUES(?, ?, 7)", (self.title_id, self.season_id))
+        ep7_id = cur.lastrowid
+        self.db.execute(
+            "INSERT INTO files(title_id, episode_id, file_name, "
+            "tg_chat_id, tg_msg_id, indexed_at, status) VALUES(?, ?, "
+            "'You (2018) S01E07 720p.mkv', ?, 43, ?, 'ok')",
+            (self.title_id, ep7_id, self.chat_id, now))
+
+    def test_range_file_refiled_as_pack_and_episodes_created(self):
+        res = asyncio.run(self.idx.cleanup_catalog())
+        self.assertEqual(res["moved"], 1)
+        self.assertEqual(res["kept"], 1)
+        f = self.db.query_one(
+            "SELECT * FROM files WHERE tg_msg_id=42")
+        self.assertIsNone(f["episode_id"])
+        self.assertEqual(f["season_id"], self.season_id)
+        self.assertEqual(f["pack_label"], "E01\u2013E05")
+        eps = self.db.query(
+            "SELECT ep_no FROM episodes WHERE season_id=? ORDER BY ep_no",
+            (self.season_id,))
+        self.assertEqual([e["ep_no"] for e in eps], [1, 2, 3, 4, 5, 7])
+        # the kept file still points at episode 7
+        f7 = self.db.query_one("SELECT * FROM files WHERE tg_msg_id=43")
+        self.assertIsNotNone(f7["episode_id"])

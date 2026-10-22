@@ -70,6 +70,21 @@ class ApiTest(unittest.TestCase):
         d = self.client.get("/api/recent").json()
         self.assertEqual(len(d["results"]), 2)
 
+    def test_home_shape(self):
+        # give Inception full TMDB dressing so it qualifies for hero + rails
+        self.db.execute(
+            "UPDATE titles SET poster='p.jpg', backdrop='b.jpg',"
+            " overview='A dream heist.' WHERE title='Inception'")
+        d = self.client.get("/api/home").json()
+        self.assertEqual([h["title"] for h in d["hero"]], ["Inception"])
+        self.assertEqual(d["hero"][0]["backdrop"], "b.jpg")
+        rails = {r["title"]: r["results"] for r in d["rows"]}
+        self.assertIn("Recently added movies", rails)
+        self.assertEqual([t["title"] for t in rails["Recently added movies"]],
+                         ["Inception"])
+        # poster-less titles (Dark) stay out of the poster rails
+        self.assertNotIn("Recently added series", rails)
+
     def test_movie_detail_versions(self):
         # note: test_admin_hide runs first alphabetically and hides the 1080p file
         tid = self.client.get("/api/search", params={"q": "Inception"}).json()["results"][0]["id"]

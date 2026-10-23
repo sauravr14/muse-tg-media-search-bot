@@ -18,6 +18,7 @@ from .config import cfg
 from .db import DB
 from .indexer import Indexer
 from .llm import LLTitle
+from .mnimdb import MNImdb
 from .tmdb import TMDB
 
 logging.basicConfig(
@@ -42,7 +43,10 @@ async def amain() -> None:
     llm = LLTitle(cfg.openrouter_key, cfg.llm_model) if cfg.has_llm else None
     if llm:
         log.info("LLM title fallback enabled (%s)", cfg.llm_model)
-    indexer = Indexer(bot.client, db, tmdb, llm=llm)
+    mnimdb = MNImdb(cfg.mn_imdb_base_url) if cfg.has_mnimdb else None
+    if mnimdb:
+        log.info("MN IMDb poster fallback enabled (%s)", cfg.mn_imdb_base_url)
+    indexer = Indexer(bot.client, db, tmdb, llm=llm, mnimdb=mnimdb)
     bot.indexer = indexer
     from .panel import IndexPanel
     bot.panel = IndexPanel(bot.client, db, indexer)
@@ -69,6 +73,8 @@ async def amain() -> None:
         await tmdb.close()
         if llm:
             await llm.close()
+        if mnimdb:
+            await mnimdb.close()
 
 
 def main() -> None:

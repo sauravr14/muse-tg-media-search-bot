@@ -802,6 +802,9 @@ class MediaBot:
             text = (f"✅ Cleanup done: <b>{res['moved']:,}</b> files moved to their "
                     f"correct titles, <b>{res['orphans_removed']:,}</b> empty junk "
                     f"titles removed, <b>{res['kept']:,}</b> files already correct.")
+            if res.get("resumed"):
+                text += ("\n↩️ This run picked up from the saved checkpoint "
+                         "instead of starting over.")
         except Exception as e:
             log.warning("cleanup failed: %r", e)
             text = f"⚠️ Cleanup failed: {html.escape(str(e)[:200])}"

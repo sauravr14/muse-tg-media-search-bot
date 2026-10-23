@@ -24,6 +24,7 @@ log = logging.getLogger("mediabot.tmdb")
 API = "https://api.themoviedb.org/3"
 IMG = "https://image.tmdb.org/t/p/w500"
 CACHE_TTL = 30 * 24 * 3600  # 30 days
+MISS_TTL = 7 * 24 * 3600  # negative-cache lifetime for non-200 responses
 
 
 def _img(path: str | None) -> str:
@@ -31,11 +32,14 @@ def _img(path: str | None) -> str:
 
 
 class TMDB:
+    MIN_INTERVAL = 0.15  # min seconds between real TMDB requests
+
     def __init__(self, db: DB, api_key: str, session: aiohttp.ClientSession | None = None):
         self.db = db
         self.api_key = api_key
         self._session = session
         self._lock = asyncio.Lock()
+        self._last_req = 0.0
 
     async def _sess(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -62,21 +66,39 @@ class TMDB:
             (key, _j(payload), time.time()),
         )
 
+    def _cache_set_miss(self, key: str) -> None:
+        # Negative cache entry: a real payload sentinel whose fetched_at is
+        # backdated so the normal TTL check in _cache_get expires it after
+        # MISS_TTL instead of CACHE_TTL. Without this, a wrong TMDB id
+        # re-storms hundreds of 404s on every enrich pass.
+        self.db.execute(
+            "INSERT INTO tmdb_cache(key, payload, fetched_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET payload=excluded.payload, fetched_at=excluded.fetched_at",
+            (key, _j({"__miss__": True}), time.time() - (CACHE_TTL - MISS_TTL)),
+        )
+
     async def _get(self, path: str, params: dict) -> dict | None:
         if not self.api_key:
             return None
         key = f"GET:{path}:{_j(sorted(params.items()))}"
         cached = self._cache_get(key)
+        if isinstance(cached, dict) and cached.get("__miss__"):
+            return None
         if cached is not None:
             return cached
         try:
             sess = await self._sess()
             async with self._lock:  # gentle on TMDB rate limits
+                wait = self.MIN_INTERVAL - (time.monotonic() - self._last_req)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._last_req = time.monotonic()
                 async with sess.get(
                     f"{API}{path}", params={"api_key": self.api_key, **params}
                 ) as resp:
                     if resp.status != 200:
                         log.warning("tmdb %s -> %s", path, resp.status)
+                        self._cache_set_miss(key)
                         return None
                     data = await resp.json()
             self._cache_set(key, data)

@@ -965,16 +965,35 @@ class Indexer:
         )
         # fill episode titles for series — capped and batched: episode
         # names are garnish, and an uncapped fill once meant one TMDB
-        # call per episode (500+ for a long anime) inside a single enrich
+        # call per episode (500+ for a long anime) inside a single enrich.
+        # Attempts are capped too, and a run of consecutive misses bails
+        # out early: when the tmdb_id is a wrong match every episode 404s,
+        # and only counting successes let the loop storm TMDB (2026-10-23)
         if meta["kind"] == "series" and meta.get("tmdb_id"):
             fills = []
+            attempts = 0
+            consec_misses = 0
+            stop = False
             for se in db.query("SELECT * FROM seasons WHERE title_id=?", (row["id"],)):
+                if stop:
+                    break
                 for ep in db.query("SELECT * FROM episodes WHERE season_id=?", (se["id"],)):
-                    if not ep["ep_title"] and len(fills) < 40:
-                        name = await self.tmdb.episode_title(
-                            meta["tmdb_id"], se["season_no"], ep["ep_no"])
-                        if name:
-                            fills.append((name, ep["id"]))
+                    if ep["ep_title"]:
+                        continue
+                    if attempts >= 40 or len(fills) >= 40:
+                        stop = True
+                        break
+                    attempts += 1
+                    name = await self.tmdb.episode_title(
+                        meta["tmdb_id"], se["season_no"], ep["ep_no"])
+                    if name:
+                        fills.append((name, ep["id"]))
+                        consec_misses = 0
+                    else:
+                        consec_misses += 1
+                        if consec_misses >= 6:
+                            stop = True
+                            break
             if fills:
                 with db.transaction():
                     for name, ep_id in fills:

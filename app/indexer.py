@@ -23,6 +23,7 @@ from pyrogram.errors import FloodWait
 
 from .classify import Classifier
 from .llm import LLTitle
+from .mnimdb import MNImdb
 from .db import DB
 from .parser import ParsedName, parse_filename
 from .tmdb import TMDB
@@ -76,7 +77,8 @@ def _file_meta_from_msg(msg) -> dict | None:
 
 
 class Indexer:
-    def __init__(self, client, db: DB, tmdb: TMDB, llm: LLTitle | None = None):
+    def __init__(self, client, db: DB, tmdb: TMDB, llm: LLTitle | None = None,
+                 mnimdb: MNImdb | None = None):
         # Bot-token only. History is read with messages.GetMessages by explicit
         # ID ranges (like Levii/EvaMaria filter bots) because Telegram blocks
         # bots from messages.GetHistory. The bot must be admin in private
@@ -85,6 +87,7 @@ class Indexer:
         self.db = db
         self.tmdb = tmdb
         self.llm = llm
+        self.mnimdb = mnimdb
         self.clf = Classifier(db)
         self._scan_lock = asyncio.Lock()
         self._enrich_queue: asyncio.Queue[int] = asyncio.Queue()
@@ -810,9 +813,35 @@ class Indexer:
         if not meta and self.llm and self.llm.available:
             meta = await self._enrich_via_llm(row, p)
         if not meta:
+            # TMDB has nothing: last resort is a poster-only fill from
+            # the MN IMDb fallback (never merges, never sets tmdb_id —
+            # the title stays in the unmatched backlog either way)
+            if self.mnimdb and self.mnimdb.available:
+                await self._enrich_via_mnimdb(row)
             return
         # adopt canonical TMDB title; merge possible duplicate title rows
         await self._adopt_meta(row, meta)
+
+    async def _enrich_via_mnimdb(self, row) -> None:
+        """Fill titles.poster from the MN IMDb API for a title TMDB
+        could not match. Poster only — the API has no TMDB id, so the
+        title keeps its own name/year and is never merged. The
+        mnimdb_try marker (7 days, same window as tmdb_try) is set on
+        every attempt so the backlog sweep cannot re-ask the free API
+        about the same hopeless title on every pass."""
+        ts = self.db.get_kv(f"mnimdb_try:{row['id']}")
+        if ts and time.time() - float(ts) < 7 * 24 * 3600:
+            return
+        self.db.set_kv(f"mnimdb_try:{row['id']}", str(time.time()))
+        poster = await self.mnimdb.poster_for(
+            row["title"], row["year"], row["kind"])
+        if poster:
+            self.db.execute(
+                "UPDATE titles SET poster=?, updated_at=? "
+                "WHERE id=? AND poster=''",
+                (poster, time.time(), row["id"]))
+            log.info("mn imdb poster for %r (%s)",
+                     row["title"][:60], row["year"])
 
     async def _enrich_via_llm(self, row, p) -> dict | None:
         """Ask the LLM to identify the title from a raw release filename,

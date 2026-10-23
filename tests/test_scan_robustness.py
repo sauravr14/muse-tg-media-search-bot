@@ -537,3 +537,122 @@ class CleanupAttachmentTest(unittest.TestCase):
         # the kept file still points at episode 7
         f7 = self.db.query_one("SELECT * FROM files WHERE tg_msg_id=43")
         self.assertIsNotNone(f7["episode_id"])
+
+
+class CleanupResumeTest(unittest.TestCase):
+    """cleanup_catalog persists a checkpoint in kv after every page, so
+    a run killed mid-walk (restart/deploy — three times on 2026-10-22)
+    resumes after the last checked file instead of re-walking from
+    file 1. A checkpoint written under a different parser fingerprint
+    is ignored: that walk was checking against old rules."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = DB(os.path.join(self.tmp, "t.db"))
+        self.chat_id = -1002001978984
+        self.db.upsert_source(self.chat_id, "JEROM DB", "")
+        self.idx = Indexer(FakeClient({}), self.db, TMDB(self.db, ""))
+        now = time.time()
+
+        def add_title(title, norm, year):
+            cur = self.db.execute(
+                "INSERT INTO titles(kind, title, norm_title, year, "
+                "added_at, updated_at) VALUES('movie', ?, ?, ?, ?, ?)",
+                (title, norm, year, now, now))
+            return cur.lastrowid
+
+        def add_file(title_id, msg_id, file_name):
+            self.db.execute(
+                "INSERT INTO files(title_id, file_name, tg_chat_id, "
+                "tg_msg_id, indexed_at, status) VALUES(?, ?, ?, ?, ?, "
+                "'ok')", (title_id, file_name, self.chat_id, msg_id, now))
+
+        # file ids land in insert order: 1 = junk-grouped, 2/3 = correct
+        self.junk_id = add_title("Vivah 3 2Gb", "vivah 3 2gb", 2006)
+        add_file(self.junk_id, 1,
+                 "Vivah (2006) Hindi 1080p BluRay 3.2GB ESub [BollYFlix].mkv")
+        self.good_id = add_title("Vivah", "vivah", 2006)
+        add_file(self.good_id, 2, "Vivah.2006.720p.BluRay.mkv")
+        self.other_id = add_title("Inception", "inception", 2010)
+        add_file(self.other_id, 3, "Inception.2010.1080p.BluRay.mkv")
+
+    def _seed_ckpt(self, **kw):
+        import json
+        payload = {"last_id": 0, "max_id": 0, "moved": 0, "kept": 0,
+                   "sig": self.idx._cleanup_parser_sig()}
+        payload.update(kw)
+        self.db.set_kv(indexer_mod.CLEANUP_CKPT_KEY, json.dumps(payload))
+
+    def test_resume_skips_already_checked_files(self):
+        # what the killed run had already done: file 1 moved off the
+        # junk title (delete + re-insert lands it on a fresh id above
+        # the snapshot max, so the walk would never revisit it anyway)
+        f = self.db.query_one("SELECT * FROM files WHERE tg_msg_id=1")
+        self.db.execute("DELETE FROM files WHERE id=?", (f["id"],))
+        self.db.execute(
+            "INSERT INTO files(title_id, file_name, tg_chat_id, tg_msg_id, "
+            "indexed_at, status) VALUES(?, ?, ?, ?, ?, 'ok')",
+            (self.good_id, f["file_name"], self.chat_id, 1, time.time()))
+        self._seed_ckpt(last_id=1, max_id=3, moved=1, kept=0)
+        res = asyncio.run(self.idx.cleanup_catalog())
+        self.assertTrue(res["resumed"])
+        self.assertEqual(res["moved"], 1)  # carried from the checkpoint
+        self.assertEqual(res["kept"], 2)   # only files 2 and 3 walked
+        self.assertEqual(res["orphans_removed"], 1)  # emptied junk title
+        self.assertEqual(
+            self.db.get_kv(indexer_mod.CLEANUP_CKPT_KEY, ""), "")
+
+    def test_checkpoint_written_then_cleared_on_completion(self):
+        import json
+        writes = []
+        orig = self.db.set_kv
+
+        def rec(key, value):
+            if key == indexer_mod.CLEANUP_CKPT_KEY:
+                writes.append(json.loads(value))
+            return orig(key, value)
+
+        self.db.set_kv = rec
+        try:
+            res = asyncio.run(self.idx.cleanup_catalog())
+        finally:
+            self.db.set_kv = orig
+        self.assertFalse(res["resumed"])
+        # initial snapshot write, then one save after the only page
+        self.assertEqual([w["last_id"] for w in writes], [0, 3])
+        self.assertEqual(
+            self.db.get_kv(indexer_mod.CLEANUP_CKPT_KEY, ""), "")
+
+    def test_checkpoint_with_stale_parser_sig_is_ignored(self):
+        self._seed_ckpt(last_id=3, max_id=3, moved=99, kept=99, sig="stale")
+        res = asyncio.run(self.idx.cleanup_catalog())
+        self.assertFalse(res["resumed"])
+        self.assertEqual(res["moved"], 1)  # full fresh walk
+        self.assertEqual(res["kept"], 2)
+
+    def test_corrupt_checkpoint_is_ignored(self):
+        self.db.set_kv(indexer_mod.CLEANUP_CKPT_KEY, "{not json")
+        res = asyncio.run(self.idx.cleanup_catalog())
+        self.assertFalse(res["resumed"])
+        self.assertEqual(res["moved"], 1)
+        self.assertEqual(res["kept"], 2)
+
+    def test_resume_at_walk_end_still_clears_orphans_and_checkpoint(self):
+        # the previous run finished the walk but died in the orphan
+        # phase: no file is re-walked, counts carry, orphans still go
+        now = time.time()
+        self.db.execute(
+            "INSERT INTO titles(kind, title, norm_title, year, added_at, "
+            "updated_at) VALUES('movie', 'Bare Orphan', 'bare orphan', "
+            "2020, ?, ?)", (now, now))
+        self._seed_ckpt(last_id=3, max_id=3, moved=5, kept=7)
+        res = asyncio.run(self.idx.cleanup_catalog())
+        self.assertTrue(res["resumed"])
+        self.assertEqual(res["moved"], 5)
+        self.assertEqual(res["kept"], 7)
+        self.assertEqual(res["orphans_removed"], 1)
+        f = self.db.query_one(
+            "SELECT title_id FROM files WHERE tg_msg_id=1")
+        self.assertEqual(f["title_id"], self.junk_id)  # not re-walked
+        self.assertEqual(
+            self.db.get_kv(indexer_mod.CLEANUP_CKPT_KEY, ""), "")

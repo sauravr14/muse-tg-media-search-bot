@@ -12,6 +12,9 @@ TMDB key never blocks indexing or searching.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
+import json
 import logging
 import time
 from types import SimpleNamespace
@@ -28,6 +31,7 @@ log = logging.getLogger("mediabot.indexer")
 
 MEDIA_TYPES = ("video", "document")
 BATCH = 100
+CLEANUP_CKPT_KEY = "cleanup:ckpt"
 # Network guard: a hung Telegram connection must never wedge the scan lock.
 GET_TIMEOUT = 90
 # A batch that times out this many times in a row aborts the scan; the
@@ -526,6 +530,25 @@ class Indexer:
             log.info("catalog rebuilt: %d files -> %d titles", n, titles)
             return {"files": n, "titles": titles}
 
+    @staticmethod
+    def _cleanup_parser_sig() -> str:
+        """Fingerprint of the filename parser a cleanup walk checks
+        against. A checkpoint is only resumed when the parser is
+        unchanged: a parser fix is the usual reason to run /cleanup, and
+        resuming an old-parser walk after deploying a new parser would
+        leave the already-walked half checked against the old rules."""
+        try:
+            src = inspect.getsource(parse_filename)
+            return hashlib.md5(src.encode()).hexdigest()
+        except Exception:
+            return ""
+
+    def _save_cleanup_ckpt(self, last_id: int, max_id: int, moved: int,
+                           kept: int, sig: str) -> None:
+        self.db.set_kv(CLEANUP_CKPT_KEY, json.dumps(
+            {"last_id": last_id, "max_id": max_id, "moved": moved,
+             "kept": kept, "sig": sig}))
+
     async def cleanup_catalog(self) -> dict:
         """Targeted fix-up after a parser improvement: re-parse every file
         and move the ones whose (norm_title, year, kind) changed — or
@@ -543,7 +566,15 @@ class Indexer:
         bot/API/Telegram-ping starved for ~2h and the app looked dead).
         This version pages through files by id in small chunks and yields
         to the event loop after EVERY file, and logs progress so a stall
-        is visible in the container logs."""
+        is visible in the container logs.
+
+        The walk is resumable: a checkpoint (last checked file id,
+        snapshot max, counts, parser fingerprint) is persisted after
+        every page, so a restart or deploy mid-run resumes after the
+        last checked file instead of starting over. Restarts killed
+        this run three times on 2026-10-22 alone, losing hours of
+        checked progress each time; the moves themselves were never
+        lost (per-file transactions)."""
         from .parser import parse_filename
 
         def _parsed_key(p) -> tuple:
@@ -563,11 +594,44 @@ class Indexer:
             return ("none",)
 
         async with self._scan_lock:
-            top = self.db.query_one("SELECT MAX(id) AS m FROM files")
-            max_id = top["m"] or 0  # snapshot: re-inserted files get new
-            # ids above this and are not revisited in the same run
+            # Checkpoint resume: a previous run that was killed mid-walk
+            # (restart, deploy) leaves its position in kv; pick up after
+            # the last checked file instead of re-walking from file 1.
+            # The parser fingerprint guards the common deploy case — if
+            # the parser changed since the checkpoint was written, that
+            # walk was checking against old rules, so start fresh.
+            sig = self._cleanup_parser_sig()
             moved = kept = 0
             last_id = 0
+            max_id = 0
+            resumed = False
+            ckpt = None
+            try:
+                raw = self.db.get_kv(CLEANUP_CKPT_KEY, "")
+                if raw:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict) \
+                            and int(parsed.get("max_id") or 0) > 0 \
+                            and parsed.get("sig") == sig:
+                        ckpt = {k: int(parsed.get(k) or 0) for k in
+                                ("last_id", "max_id", "moved", "kept")}
+            except (ValueError, TypeError):
+                ckpt = None
+            if ckpt is not None:
+                last_id = ckpt["last_id"]
+                max_id = ckpt["max_id"]
+                moved = ckpt["moved"]
+                kept = ckpt["kept"]
+                resumed = True
+                if last_id < max_id:
+                    log.info("catalog cleanup: resuming at file id %d "
+                             "(%d/%d files checked, %d moved so far)",
+                             last_id, kept + moved, max_id, moved)
+            else:
+                top = self.db.query_one("SELECT MAX(id) AS m FROM files")
+                max_id = top["m"] or 0  # snapshot: re-inserted files get
+                # new ids above this and are not revisited in the same run
+                self._save_cleanup_ckpt(last_id, max_id, moved, kept, sig)
             while last_id < max_id:
                 rows = self.db.query(
                     "SELECT f.*, t.norm_title AS cur_norm, t.year AS cur_year, "
@@ -625,6 +689,7 @@ class Indexer:
                     await asyncio.sleep(0)
                 log.info("catalog cleanup: %d/%d files checked (%d moved)",
                          kept + moved, max_id, moved)
+                self._save_cleanup_ckpt(last_id, max_id, moved, kept, sig)
             # Orphan removal, chunked: on 2026-10-21 the single DELETE below
             # starved the event loop for ~1h (bot + API dead) because the FK
             # cascades into seasons/episodes had no indexes on the child
@@ -647,7 +712,10 @@ class Indexer:
                 await asyncio.sleep(0)
             log.info("catalog cleanup: %d moved, %d kept, %d orphan titles removed",
                      moved, kept, orphans)
-            return {"moved": moved, "kept": kept, "orphans_removed": orphans}
+            self.db.execute("DELETE FROM kv WHERE key=?",
+                            (CLEANUP_CKPT_KEY,))
+            return {"moved": moved, "kept": kept,
+                    "orphans_removed": orphans, "resumed": resumed}
 
     # -- live handler ----------------------------------------------------------
     async def on_channel_post(self, _, msg) -> None:

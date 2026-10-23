@@ -25,6 +25,7 @@ class Config:
     tmdb_api_key: str = field(default_factory=lambda: os.environ.get("TMDB_API_KEY", ""))
     openrouter_key: str = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY", ""))
     llm_model: str = field(default_factory=lambda: os.environ.get("LLM_MODEL", "liquid/lfm-2.5-2.6b:free"))
+    mn_imdb_base_url: str = field(default_factory=lambda: os.environ.get("MN_IMDB_BASE_URL", "https://mn-api-imdb.vercel.app"))
     mini_app_url: str = field(
         default_factory=lambda: os.environ.get("MINI_APP_URL", "http://localhost:8000/app/").rstrip("/") + "/"
     )
@@ -50,6 +51,10 @@ class Config:
     @property
     def has_tmdb(self) -> bool:
         return bool(self.tmdb_api_key)
+
+    @property
+    def has_mnimdb(self) -> bool:
+        return bool(self.mn_imdb_base_url)
 
     def is_admin(self, user_id: int | None) -> bool:
         return bool(user_id) and user_id in self.admin_ids

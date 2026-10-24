@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import Config
 from .db import DB, RES_ORDER, _uj
+from .dbthread import run_db
 
 log = logging.getLogger("mediabot.api")
 APP_DIR = Path(__file__).parent / "webapp"
@@ -123,7 +124,8 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         match = " AND ".join(groups)
         per, off = 20, (max(page, 1) - 1) * 20
         try:
-            rows = db.query(
+            rows = await run_db(
+                db.query,
                 "SELECT t.* FROM titles_fts f JOIN titles t ON t.id=f.rowid "
                 "WHERE titles_fts MATCH ?"
                 + (" AND t.kind=? " if kind in ("movie", "series") else "")
@@ -139,7 +141,8 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
     async def recent(kind: str = "", limit: int = 24, hide_cam: int = 0):
         limit = min(max(limit, 1), 60)
         where = " WHERE kind=? " if kind in ("movie", "series") else " WHERE 1=1 "
-        rows = db.query(
+        rows = await run_db(
+            db.query,
             "SELECT * FROM titles" + where
             + (CLEAN_ONLY if hide_cam else "")
             # titles with posters first — keeps Recently Added looking clean
@@ -162,24 +165,27 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
 
         heroes: list = []
         for kind in ("movie", "series"):
-            heroes += db.query(
+            heroes += await run_db(
+                db.query,
                 "SELECT * FROM titles WHERE kind=? AND backdrop != ''"
                 " AND overview != '' AND poster != ''" + clean
                 + " ORDER BY last_file_at DESC LIMIT 4", (kind,))
         heroes.sort(key=lambda t: t["last_file_at"], reverse=True)
 
-        def rail(kind: str) -> list:
-            rows = db.query(
+        async def rail(kind: str) -> list:
+            rows = await run_db(
+                db.query,
                 "SELECT * FROM titles WHERE kind=? AND poster != ''" + clean
                 + " ORDER BY last_file_at DESC LIMIT 18", (kind,))
             return [_title_card(t) for t in rows]
 
-        trending = db.query(
+        trending = await run_db(
+            db.query,
             "SELECT * FROM titles WHERE poster != ''" + clean
             + " ORDER BY popularity DESC NULLS LAST LIMIT 18")
         rows = [
-            {"title": "Recently added movies", "results": rail("movie")},
-            {"title": "Recently added series", "results": rail("series")},
+            {"title": "Recently added movies", "results": await rail("movie")},
+            {"title": "Recently added series", "results": await rail("series")},
             {"title": "Trending now",
              "results": [_title_card(t) for t in trending]},
         ]
@@ -226,9 +232,11 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         params: list = [kind] if kind in ("movie", "series") else []
         if hide_cam:
             where += CLEAN_ONLY
-        total = db.query_one(f"SELECT COUNT(*) c FROM titles {where}",
-                             tuple(params))["c"]
-        rows = db.query(
+        total = (await run_db(db.query_one,
+                              f"SELECT COUNT(*) c FROM titles {where}",
+                              tuple(params)))["c"]
+        rows = await run_db(
+            db.query,
             f"SELECT * FROM titles {where}ORDER BY {order} LIMIT ? OFFSET ?",
             tuple(params + [per, (page - 1) * per]))
         return {"results": [_title_card(t) for t in rows], "page": page,
@@ -236,7 +244,8 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
 
     @app.get("/api/title/{title_id}")
     async def title_detail(title_id: int, hide_cam: int = 0):
-        t = db.query_one("SELECT * FROM titles WHERE id=?", (title_id,))
+        t = await run_db(db.query_one, "SELECT * FROM titles WHERE id=?",
+                         (title_id,))
         if not t:
             raise HTTPException(404, "not found")
         out = _title_card(t)
@@ -244,7 +253,8 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                     "overview": t["overview"], "popularity": t["popularity"],
                     "lang": t["lang"], "added_at": t["added_at"]})
         if t["kind"] == "movie":
-            files = db.query(
+            files = await run_db(
+                db.query,
                 "SELECT * FROM files WHERE title_id=? AND episode_id IS NULL "
                 "AND season_id IS NULL AND status='ok'"
                 + (" AND is_cam=0" if hide_cam else "")
@@ -256,7 +266,8 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
             # (was: 2 queries per episode -> 18s for Game of Thrones)
             by_ep: dict[int, list] = {}
             packs_by_season: dict[int, list] = {}
-            for f in db.query(
+            for f in await run_db(
+                    db.query,
                     "SELECT * FROM files WHERE title_id=? AND status='ok'" + cam
                     + " ORDER BY " + RES_ORDER + " DESC", (title_id,)):
                 if f["episode_id"]:
@@ -264,11 +275,13 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                 elif f["season_id"]:
                     packs_by_season.setdefault(f["season_id"], []).append(f)
             seasons = []
-            for se in db.query("SELECT * FROM seasons WHERE title_id=? ORDER BY season_no",
-                               (title_id,)):
+            for se in await run_db(db.query,
+                                   "SELECT * FROM seasons WHERE title_id=? ORDER BY season_no",
+                                   (title_id,)):
                 eps = []
-                for e in db.query("SELECT * FROM episodes WHERE season_id=? ORDER BY ep_no",
-                                  (se["id"],)):
+                for e in await run_db(db.query,
+                                      "SELECT * FROM episodes WHERE season_id=? ORDER BY ep_no",
+                                      (se["id"],)):
                     vers = by_ep.get(e["id"], [])
                     eps.append({"ep_no": e["ep_no"], "title": e["ep_title"],
                                 "air_date": e["air_date"], "overview": e["overview"],
@@ -282,26 +295,28 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
 
     @app.get("/api/deeplink/file/{file_id}")
     async def deeplink(file_id: int):
-        f = db.query_one("SELECT id FROM files WHERE id=?", (file_id,))
+        f = await run_db(db.query_one, "SELECT id FROM files WHERE id=?",
+                         (file_id,))
         if not f or not bot_username:
             raise HTTPException(404, "not found")
         return {"url": f"https://t.me/{bot_username}?start=file_{file_id}"}
 
     @app.get("/api/stats")
     async def stats():
-        return db.stats()
+        return await run_db(db.stats)
 
     # -- admin ----------------------------------------------------------------------
     @app.get("/api/admin/overview")
     async def admin_overview(request: Request):
         _admin(request)
-        return {"stats": db.stats(),
-                "sources": [dict(s) for s in db.list_sources()]}
+        return {"stats": await run_db(db.stats),
+                "sources": [dict(s) for s in await run_db(db.list_sources)]}
 
     @app.get("/api/admin/unmatched")
     async def admin_unmatched(request: Request, limit: int = 50):
         _admin(request)
-        rows = db.query(
+        rows = await run_db(
+            db.query,
             "SELECT * FROM files WHERE title_id IS NULL ORDER BY indexed_at DESC LIMIT ?",
             (min(limit, 200),))
         return {"files": [_file_dict(f) | {"file_name": f["file_name"],
@@ -310,7 +325,8 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
     @app.post("/api/admin/file/{file_id}/hide")
     async def admin_hide(request: Request, file_id: int):
         _admin(request)
-        db.execute("UPDATE files SET status='hidden' WHERE id=?", (file_id,))
+        await run_db(db.execute, "UPDATE files SET status='hidden' WHERE id=?",
+                     (file_id,))
         return {"ok": True}
 
     @app.post("/api/admin/title/{title_id}/retitle")
@@ -322,8 +338,9 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         if not title:
             raise HTTPException(400, "title required")
         from .parser import normalize_title
-        db.execute("UPDATE titles SET title=?, norm_title=?, year=?, updated_at=? WHERE id=?",
-                   (title, normalize_title(title), year, time.time(), title_id))
+        await run_db(db.execute,
+                     "UPDATE titles SET title=?, norm_title=?, year=?, updated_at=? WHERE id=?",
+                     (title, normalize_title(title), year, time.time(), title_id))
         return {"ok": True}
 
     # -- mini app static --------------------------------------------------------------

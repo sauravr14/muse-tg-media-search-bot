@@ -29,7 +29,7 @@ import logging
 import time
 from hashlib import sha256
 
-from pyrogram import raw
+from pyrogram import raw, utils
 from pyrogram.crypto import aes
 from pyrogram.errors import (AuthBytesInvalid, CDNFileHashMismatch,
                              FileReferenceExpired, VolumeLocNotFound)
@@ -148,6 +148,21 @@ class ByteStreamer:
                         chat_id, msg_id, getattr(msg, "empty", None))
             raise StreamFileNotFound
         media = next((getattr(msg, a, None) for a in _MEDIA_ATTRS), None)
+        if not media and utils.get_peer_type(chat_id) == "channel":
+            # A wrong-type stored peer makes get_messages take the bare
+            # messages.GetMessages branch, which returns the message
+            # shell WITHOUT media (proven live: right id + caption,
+            # media None). Re-fetch channel-scoped, bypassing storage.
+            log.warning("stream resolve: get_messages gave no media "
+                        "%s/%s, trying direct channel fetch", chat_id, msg_id)
+            fb = await self._fetch_channel_message(chat_id, msg_id)
+            if fb is not None:
+                msg = fb
+                media = next((getattr(msg, a, None)
+                              for a in _MEDIA_ATTRS), None)
+                if media is not None:
+                    log.info("stream resolve: direct channel fetch "
+                             "recovered media %s/%s", chat_id, msg_id)
         if not media:
             # Diagnostic: is Telegram serving a different/stripped message
             # to this client than the catalog row describes?
@@ -171,6 +186,33 @@ class ByteStreamer:
         }
         self._props[key] = (time.monotonic(), props)
         return props
+
+    async def _fetch_channel_message(self, chat_id: int, msg_id: int):
+        """Direct channel-scoped fetch, bypassing peer storage.
+
+        Returns a Message or None. GetChannels with access_hash=0 is
+        the same re-resolution resolve_peer does for unknown peers.
+        """
+        try:
+            channel_id = utils.get_channel_id(chat_id)
+            chats = await self.client.invoke(
+                raw.functions.channels.GetChannels(id=[
+                    raw.types.InputChannel(channel_id=channel_id,
+                                           access_hash=0)]))
+            if not chats.chats:
+                return None
+            r = await self.client.invoke(
+                raw.functions.channels.GetMessages(
+                    channel=raw.types.InputChannel(
+                        channel_id=channel_id,
+                        access_hash=chats.chats[0].access_hash),
+                    id=[raw.types.InputMessageID(id=msg_id)]))
+            parsed = await utils.parse_messages(self.client, r, replies=0)
+            return parsed[0] if parsed else None
+        except Exception as e:
+            log.warning("stream channel fallback failed %s/%s: %s",
+                        chat_id, msg_id, type(e).__name__)
+            return None
 
     async def media_session(self, dc_id: int) -> Session:
         client = self.client
@@ -261,8 +303,20 @@ class ByteStreamer:
             while True:
                 if redirect is None:
                     try:
-                        r = await sess.send(raw.functions.upload.GetFile(
-                            location=loc, offset=offset, limit=CHUNK_SIZE))
+                        try:
+                            r = await sess.invoke(
+                                raw.functions.upload.GetFile(
+                                    location=loc, offset=offset,
+                                    limit=CHUNK_SIZE),
+                                timeout=30)
+                        except TimeoutError:
+                            # slow first chunk / flaky DC path: one retry
+                            # at the same offset (safe: same bytes)
+                            r = await sess.invoke(
+                                raw.functions.upload.GetFile(
+                                    location=loc, offset=offset,
+                                    limit=CHUNK_SIZE),
+                                timeout=30)
                     except FileReferenceExpired:
                         # saved file references go stale; re-resolve once
                         if refreshed:

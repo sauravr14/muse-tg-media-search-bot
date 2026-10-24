@@ -66,6 +66,18 @@
     <button class="btn" id="camModalClose">Got it</button>
   </div>
 </div>
+<div id="playModal" class="modal play-modal" hidden>
+  <div class="play-box">
+    <div class="play-head"><span id="playTitle">Video</span><button id="playClose" aria-label="Close">✕</button></div>
+    <video id="playVideo" controls playsinline preload="none"></video>
+    <div class="play-actions">
+      <a class="btn ghost" id="playVlc">Open in VLC</a>
+      <a class="btn ghost" id="playMx">Open in MX Player</a>
+      <button class="btn ghost" id="playCopy">Copy link</button>
+    </div>
+    <p class="muted">If the browser can't play the sound (multi-audio MKV), use VLC or MX Player above.</p>
+  </div>
+</div>
 <script src="app.js"></script>
 </body>
 </html>

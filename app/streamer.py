@@ -199,6 +199,8 @@ class ByteStreamer:
                 raw.functions.channels.GetChannels(id=[
                     raw.types.InputChannel(channel_id=channel_id,
                                            access_hash=0)]))
+            log.warning("stream channel fallback: GetChannels %s/%s -> "
+                        "%d chats", chat_id, msg_id, len(chats.chats))
             if not chats.chats:
                 return None
             r = await self.client.invoke(
@@ -207,6 +209,13 @@ class ByteStreamer:
                         channel_id=channel_id,
                         access_hash=chats.chats[0].access_hash),
                     id=[raw.types.InputMessageID(id=msg_id)]))
+            raw_first = r.messages[0] if r.messages else None
+            log.warning("stream channel fallback: GetMessages %s/%s -> "
+                        "%d msgs, first type=%s media=%s",
+                        chat_id, msg_id, len(r.messages),
+                        type(raw_first).__name__ if raw_first else None,
+                        type(getattr(raw_first, "media", None)).__name__
+                        if raw_first else None)
             parsed = await utils.parse_messages(self.client, r, replies=0)
             return parsed[0] if parsed else None
         except Exception as e:

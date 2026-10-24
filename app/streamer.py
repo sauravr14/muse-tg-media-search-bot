@@ -149,8 +149,16 @@ class ByteStreamer:
             raise StreamFileNotFound
         media = next((getattr(msg, a, None) for a in _MEDIA_ATTRS), None)
         if not media:
-            log.warning("stream resolve: no media %s/%s msg_type=%s",
-                        chat_id, msg_id, type(msg).__name__)
+            # Diagnostic: is Telegram serving a different/stripped message
+            # to this client than the catalog row describes?
+            chat = getattr(msg, "chat", None)
+            log.warning(
+                "stream resolve: no media req=%s/%s got_msg_id=%r "
+                "got_chat_id=%r text=%r caption=%r",
+                chat_id, msg_id, getattr(msg, "id", None),
+                getattr(chat, "id", None),
+                (getattr(msg, "text", "") or "")[:80],
+                (getattr(msg, "caption", "") or "")[:80])
             raise StreamFileNotFound
         fid = FileId.decode(media.file_id)
         props = {

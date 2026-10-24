@@ -130,5 +130,59 @@ def _async(value):
     return _coro()
 
 
+class CdnYieldTest(unittest.TestCase):
+    """A FileCdnRedirect must switch to a CDN session, decrypt and
+    hash-verify instead of yielding nothing (the 206-with-0-bytes bug)."""
+
+    def test_cdn_redirect_decrypts(self):
+        import os
+        from hashlib import sha256
+
+        from pyrogram import raw
+        from pyrogram.crypto import aes
+
+        blob = bytes(range(256)) * (1024 * 9)  # 2.25MB
+        key, iv = os.urandom(32), os.urandom(16)
+        redirect = raw.types.upload.FileCdnRedirect(
+            dc_id=4, file_token=b"tok", encryption_key=key,
+            encryption_iv=iv, file_hashes=[])
+
+        class MainSession:
+            async def send(self, req):
+                return redirect
+
+            async def invoke(self, req):
+                chunk = blob[req.offset:req.offset + 1024 * 1024]
+                return [raw.types.FileHash(
+                    offset=req.offset, limit=len(chunk),
+                    hash=sha256(chunk).digest())]
+
+        class CdnSession:
+            async def invoke(self, req):
+                chunk = blob[req.offset:req.offset + 1024 * 1024]
+                enc = aes.ctr256_encrypt(
+                    chunk, key,
+                    bytearray(iv[:-4]
+                              + (req.offset // 16).to_bytes(4, "big")))
+                return raw.types.upload.CdnFile(bytes=enc)
+
+            async def stop(self):
+                pass
+
+        streamer = ByteStreamer(client=None)
+        props = {"chat_id": 1, "msg_id": 2, "dc_id": 1, "media_id": 7,
+                 "access_hash": 8, "file_reference": b"ref"}
+        streamer.media_session = lambda dc_id: _async(MainSession())
+        streamer._cdn_session = lambda dc_id: _async(CdnSession())
+
+        async def collect():
+            out = []
+            async for chunk in streamer.yield_range(props, 0, len(blob) - 1):
+                out.append(chunk)
+            return out
+
+        self.assertEqual(b"".join(asyncio.run(collect())), blob)
+
+
 if __name__ == "__main__":
     unittest.main()

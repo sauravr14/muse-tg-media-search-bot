@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from pyrogram.errors import FloodWait
 
 from .classify import Classifier
+from .dbthread import run_db
 from .llm import LLTitle
 from .mnimdb import MNImdb
 from .db import DB
@@ -78,7 +79,7 @@ def _file_meta_from_msg(msg) -> dict | None:
 
 class Indexer:
     def __init__(self, client, db: DB, tmdb: TMDB, llm: LLTitle | None = None,
-                 mnimdb: MNImdb | None = None):
+                 mnimdb: MNImdb | None = None, guard=None):
         # Bot-token only. History is read with messages.GetMessages by explicit
         # ID ranges (like Levii/EvaMaria filter bots) because Telegram blocks
         # bots from messages.GetHistory. The bot must be admin in private
@@ -89,6 +90,7 @@ class Indexer:
         self.llm = llm
         self.mnimdb = mnimdb
         self.clf = Classifier(db)
+        self.guard = guard  # LoopGuard or None: heavy jobs back off while lagged
         self._scan_lock = asyncio.Lock()
         self._enrich_queue: asyncio.Queue[int] = asyncio.Queue()
         self._running = False
@@ -106,21 +108,63 @@ class Indexer:
         """Ask the running scan of chat_id to stop after its current batch."""
         self._stop_ids.add(chat_id)
 
+    async def _guard_wait(self) -> None:
+        """Back off while the event loop is lagging (LoopGuard, if wired)."""
+        if self.guard is not None:
+            await self.guard.wait_clear()
+
     # -- ingestion ---------------------------------------------------------
+    def _ingest_one(self, meta: dict) -> tuple[dict | None, int | None]:
+        """Sync core of one ingest: parse + classify + title lookup.
+
+        Runs on a worker thread (via run_db). Returns (result, enrich_id):
+        enrich_id is a title that still needs TMDB metadata — the caller
+        (loop thread) enqueues it, because asyncio queues must not be
+        touched from a worker thread.
+        """
+        p = parse_filename(meta["file_name"])
+        if not p.title:
+            return None, None
+        res = self.clf.ingest(p, meta)
+        if res.get("duplicate"):
+            return res, None
+        title = self.db.query_one("SELECT id, tmdb_id FROM titles WHERE id=?",
+                                  (res["title_id"],))
+        if title and not title["tmdb_id"]:
+            return res, title["id"]
+        return res, None
+
     async def ingest_message(self, msg) -> dict | None:
         meta = _file_meta_from_msg(msg)
         if meta is None:
             return None
-        p = parse_filename(meta["file_name"])
-        if not p.title:
-            return None
-        res = self.clf.ingest(p, meta)
-        if not res.get("duplicate"):
-            title = self.db.query_one("SELECT id, tmdb_id FROM titles WHERE id=?",
-                                      (res["title_id"],))
-            if title and not title["tmdb_id"]:
-                self._enrich_queue.put_nowait(title["id"])
+        res, enrich_id = await run_db(self._ingest_one, meta)
+        if enrich_id is not None:
+            self._enrich_queue.put_nowait(enrich_id)
         return res
+
+    def _ingest_batch(self, msgs) -> dict:
+        """Sync core of one scan batch: ingest every message in ONE
+        transaction (~7 commits/file -> 1 commit/batch), on a worker
+        thread so the commit/fsync can never stall the event loop.
+        Returns counts plus title ids that need enrichment (enqueued by
+        the caller on the loop thread)."""
+        done = new = 0
+        enrich_ids: list[int] = []
+        with self.db.transaction():
+            for msg in msgs:
+                done += 1
+                if msg is None or getattr(msg, "empty", False):
+                    continue
+                meta = _file_meta_from_msg(msg)
+                if meta is None:
+                    continue
+                res, enrich_id = self._ingest_one(meta)
+                if res and not res.get("duplicate"):
+                    new += 1
+                if enrich_id is not None:
+                    enrich_ids.append(enrich_id)
+        return {"done": done, "new": new, "enrich_ids": enrich_ids}
 
     # -- historical scan -----------------------------------------------------
     def max_seen(self, chat_id: int) -> int:
@@ -245,7 +289,7 @@ class Indexer:
             lo, hi = ids[0], ids[-1]
             log.warning("scan of %s: ids %s-%s unresolvable, skipping",
                         chat_id, lo, hi)
-            self._note_poison(chat_id, lo, hi)
+            await run_db(self._note_poison, chat_id, lo, hi)
             return [SimpleNamespace(empty=True) for _ in ids]
         mid = len(ids) // 2
         left = await self._fetch_ids(chat_id, ids[:mid], POISON_TIMEOUT)
@@ -316,12 +360,13 @@ class Indexer:
         caller can report progress on long scans.
         """
         async with self._scan_lock:
-            src = self.db.query_one("SELECT * FROM sources WHERE chat_id=?", (chat_id,))
+            src = await run_db(self.db.query_one,
+                               "SELECT * FROM sources WHERE chat_id=?", (chat_id,))
             if not src:
                 return {"error": "unknown source"}
             if top_id:
-                self.note_seen(chat_id, top_id)
-            hi = top_id or self.max_seen(chat_id)
+                await run_db(self.note_seen, chat_id, top_id)
+            hi = top_id or await run_db(self.max_seen, chat_id)
             lo = (src["last_msg_id"] or 0) + 1
             # /setskip: ignore the first N messages of a channel on fresh scans
             skip = src["skip_first"] or 0
@@ -336,22 +381,23 @@ class Indexer:
                 # forwarded): probe the channel's top message id so the scan
                 # can start without needing a forwarded post.
                 if not top_id and not (src["last_msg_id"] or 0) \
-                        and not self.max_seen(chat_id):
+                        and not await run_db(self.max_seen, chat_id):
                     probed = await self.probe_top_id(chat_id)
                     if probed:
-                        self.note_seen(chat_id, probed)
+                        await run_db(self.note_seen, chat_id, probed)
                         hi = probed
                 if hi < lo:
                     # Up to date as far as we know — clear any stale error so the
                     # supervisor and /channels stop reporting a dead failure.
                     if (src["status"] or "") == "error":
-                        self.db.set_source(chat_id, status="idle", error="")
+                        await run_db(self.db.set_source, chat_id,
+                                     status="idle", error="")
                     return {"scanned": 0, "new": 0, "note": "nothing new to scan"}
-            self.db.set_source(chat_id, status="scanning", error="")
-            self._heartbeat(chat_id)
+            await run_db(self.db.set_source, chat_id, status="scanning", error="")
+            await run_db(self._heartbeat, chat_id)
             ok, reason = await self.access_test(chat_id)
             if not ok:
-                self.db.set_source(chat_id, status="error", error=reason)
+                await run_db(self.db.set_source, chat_id, status="error", error=reason)
                 return {"scanned": 0, "new": 0, "error": reason}
             done = new = 0
             cur = lo
@@ -371,6 +417,7 @@ class Indexer:
                         self._stop_ids.discard(chat_id)
                         log.info("scan of %s stopped by admin at %s", chat_id, cur)
                         break
+                    await self._guard_wait()
                     batch_end = min(cur + BATCH - 1, hi)
                     ids = list(range(cur, batch_end + 1))
                     msgs = None
@@ -393,21 +440,18 @@ class Indexer:
                         raise RuntimeError(
                             f"batch {cur}-{batch_end} failed {MAX_BATCH_RETRIES}x; "
                             "will resume from checkpoint")
-                    # one DB transaction per batch: ~7 commits/file -> 1 commit/batch
-                    with self.db.transaction():
-                        for i, msg in enumerate(msgs):
-                            done += 1
-                            if msg is None or getattr(msg, "empty", False):
-                                continue
-                            r = await self.ingest_message(msg)
-                            if r and not r.get("duplicate"):
-                                new += 1
-                            # let the bot/API breathe between files
-                            if i % 25 == 24:
-                                await asyncio.sleep(0)
-                        # checkpoint = last message id of the completed batch
-                        self.db.set_source(chat_id, last_msg_id=batch_end)
-                    self._heartbeat(chat_id)
+                    # Batch ingest runs on a worker thread: one transaction
+                    # per batch, and its commit/fsync can never stall the
+                    # event loop (the 2026-10-24 outage pattern).
+                    res = await run_db(self._ingest_batch, msgs)
+                    done += res["done"]
+                    new += res["new"]
+                    for tid in res["enrich_ids"]:
+                        self._enrich_queue.put_nowait(tid)
+                    # checkpoint = last message id of the completed batch
+                    await run_db(self.db.set_source, chat_id,
+                                 last_msg_id=batch_end)
+                    await run_db(self._heartbeat, chat_id)
                     self.current_scan.update(done=done, new=new)
                     if progress_cb:
                         progress_cb(done, total)
@@ -415,15 +459,15 @@ class Indexer:
                     await asyncio.sleep(0.4)
             except Exception as e:
                 log.warning("scan of %s failed: %r", chat_id, e)
-                self.db.set_source(chat_id, status="error",
-                                   error=f"{type(e).__name__}: {e}")
+                await run_db(self.db.set_source, chat_id, status="error",
+                             error=f"{type(e).__name__}: {e}")
                 return {"scanned": done, "new": new, "error": str(e),
                         "poison_skipped": getattr(self, "_poison_count", 0)}
             finally:
                 self.current_scan = None
             stopped = cur <= hi  # loop exited early via /stopindex
-            self.db.set_source(chat_id, status="idle",
-                               last_msg_id=hi if not stopped else cur - 1)
+            await run_db(self.db.set_source, chat_id, status="idle",
+                         last_msg_id=hi if not stopped else cur - 1)
             res = {"scanned": done, "new": new,
                    "poison_skipped": getattr(self, "_poison_count", 0)}
             if stopped:
@@ -462,7 +506,7 @@ class Indexer:
 
     async def _supervisor_tick(self) -> None:
         """One pass over sources: resume errored scans, reboot stalled ones."""
-        for src in self.db.list_sources():
+        for src in await run_db(self.db.list_sources):
             if not self._running:
                 break
             if not src["enabled"]:
@@ -473,63 +517,80 @@ class Indexer:
                          src["chat_id"], (src["error"] or "")[:80])
                 await self.scan_source(src["chat_id"])
             elif status == "scanning":
-                idle_for = time.time() - self._last_heartbeat(src["chat_id"])
+                idle_for = time.time() - await run_db(self._last_heartbeat,
+                                                       src["chat_id"])
                 if idle_for > STALL_AFTER:
                     log.warning("supervisor: scan of %s stalled %.0fs, retrying",
                                 src["chat_id"], idle_for)
-                    self.db.set_source(src["chat_id"], status="error",
-                                       error=f"stalled: no progress for {int(idle_for)}s")
+                    await run_db(self.db.set_source, src["chat_id"],
+                                 status="error",
+                                 error=f"stalled: no progress for {int(idle_for)}s")
                     await self.scan_source(src["chat_id"])
 
     async def scan_all(self) -> None:
-        for src in self.db.list_sources():
+        for src in await run_db(self.db.list_sources):
             if src["enabled"]:
                 await self.scan_source(src["chat_id"])
+
+    def _rebuild_one(self, f, is_hidden: bool) -> tuple[bool, int | None]:
+        """Sync core of one rebuild row: re-parse + re-ingest in one
+        transaction, on a worker thread. Returns (parsed, enrich_id):
+        enrich_id is a title needing enrichment, or None."""
+        p = parse_filename(f["file_name"] or "")
+        if not p.title:
+            return False, None
+        meta = {"file_name": f["file_name"], "size": f["size"] or 0,
+                "duration": f["duration"] or 0, "mime": f["mime"] or "",
+                "tg_chat_id": f["tg_chat_id"], "tg_msg_id": f["tg_msg_id"],
+                "caption": f["caption"] or "", "msg_date": f["msg_date"] or 0}
+        with self.db.transaction():
+            res = self.clf.ingest(p, meta)
+        if res.get("duplicate"):
+            return True, None
+        if is_hidden:
+            self.db.execute("UPDATE files SET status='hidden' WHERE id=?",
+                            (res["file_id"],))
+        title = self.db.query_one(
+            "SELECT id, tmdb_id FROM titles WHERE id=?", (res["title_id"],))
+        if title and not title["tmdb_id"]:
+            return True, title["id"]
+        return True, None
 
     async def rebuild_catalog(self) -> dict:
         """Re-parse every stored file with the current parser and regroup
         titles/seasons/episodes from scratch. Telegram references (chat/msg
         ids) are preserved, so no re-scan is needed; hidden flags survive.
-        New titles are queued for TMDB enrichment."""
+        New titles are queued for TMDB enrichment.
+
+        Each file's DB work runs on a worker thread (run_db), so the loop
+        stays free for the whole rebuild — the old per-50 yield was the
+        only thing standing between a rebuild and a dead bot/API, and a
+        single slow commit could still wedge it (seen 2026-10-20)."""
         from .parser import parse_filename
         async with self._scan_lock:
-            files = self.db.query("SELECT * FROM files")
+            files = await run_db(self.db.query, "SELECT * FROM files")
             hidden = {(f["tg_chat_id"], f["tg_msg_id"])
                       for f in files if f["status"] == "hidden"}
-            self.db.execute("DELETE FROM files")
-            self.db.execute("DELETE FROM episodes")
-            self.db.execute("DELETE FROM seasons")
-            self.db.execute("DELETE FROM titles")
+            await run_db(self.db.execute, "DELETE FROM files")
+            await run_db(self.db.execute, "DELETE FROM episodes")
+            await run_db(self.db.execute, "DELETE FROM seasons")
+            await run_db(self.db.execute, "DELETE FROM titles")
             n = 0
             for f in files:
-                p = parse_filename(f["file_name"] or "")
-                if not p.title:
-                    continue
-                meta = {"file_name": f["file_name"], "size": f["size"] or 0,
-                        "duration": f["duration"] or 0, "mime": f["mime"] or "",
-                        "tg_chat_id": f["tg_chat_id"], "tg_msg_id": f["tg_msg_id"],
-                        "caption": f["caption"] or "", "msg_date": f["msg_date"] or 0}
-                with self.db.transaction():
-                    res = self.clf.ingest(p, meta)
-                n += 1
-                # yield to the event loop: without this the rebuild starves
-                # the bot/API for hours (observed 2026-10-20: healthz and
-                # /api timed out for the whole reparse)
-                if n % 50 == 49:
-                    await asyncio.sleep(0)
-                if res.get("duplicate"):
-                    continue
-                if (f["tg_chat_id"], f["tg_msg_id"]) in hidden:
-                    self.db.execute("UPDATE files SET status='hidden' WHERE id=?",
-                                    (res["file_id"],))
-                title = self.db.query_one(
-                    "SELECT id, tmdb_id FROM titles WHERE id=?", (res["title_id"],))
-                if title and not title["tmdb_id"]:
+                await self._guard_wait()
+                parsed, enrich_id = await run_db(
+                    self._rebuild_one, f,
+                    (f["tg_chat_id"], f["tg_msg_id"]) in hidden)
+                if parsed:
+                    n += 1
+                if enrich_id is not None:
                     try:
-                        self._enrich_queue.put_nowait(title["id"])
+                        self._enrich_queue.put_nowait(enrich_id)
                     except asyncio.QueueFull:
                         pass
-            titles = self.db.query_one("SELECT COUNT(*) c FROM titles")["c"]
+            row = await run_db(self.db.query_one,
+                               "SELECT COUNT(*) c FROM titles")
+            titles = row["c"]
             log.info("catalog rebuilt: %d files -> %d titles", n, titles)
             return {"files": n, "titles": titles}
 
@@ -552,32 +613,14 @@ class Indexer:
             {"last_id": last_id, "max_id": max_id, "moved": moved,
              "kept": kept, "sig": sig}))
 
-    async def cleanup_catalog(self) -> dict:
-        """Targeted fix-up after a parser improvement: re-parse every file
-        and move the ones whose (norm_title, year, kind) changed — or
-        whose season/episode/pack attachment changed (an episode-range
-        file filed under its first episode, a pack filed as a movie) —
-        to their correct title and attachment. Matching files — and
-        their titles' posters / TMDB matches — are untouched, unlike
-        rebuild_catalog which wipes everything. Titles left with no
-        files are removed (seasons and episodes cascade). Holds the
-        scan lock.
-
-        Responsiveness contract (learned the hard way on 2026-10-20: the
-        first version loaded all ~496k rows at once and yielded only every
-        50 files; on a full-size catalog each stretch ran seconds-long, the
-        bot/API/Telegram-ping starved for ~2h and the app looked dead).
-        This version pages through files by id in small chunks and yields
-        to the event loop after EVERY file, and logs progress so a stall
-        is visible in the container logs.
-
-        The walk is resumable: a checkpoint (last checked file id,
-        snapshot max, counts, parser fingerprint) is persisted after
-        every page, so a restart or deploy mid-run resumes after the
-        last checked file instead of starting over. Restarts killed
-        this run three times on 2026-10-22 alone, losing hours of
-        checked progress each time; the moves themselves were never
-        lost (per-file transactions)."""
+    def _cleanup_page(self, last_id: int, max_id: int) -> dict:
+        """Sync core of one cleanup page (500 files): re-parse each file
+        and move the ones whose title/attachment changed, in per-file
+        transactions, then persist the checkpoint — all on a worker
+        thread, so no commit/fsync can stall the event loop. Returns the
+        new last id, page counts, and title ids needing enrichment
+        (enqueued by the caller on the loop thread). The checkpoint save
+        stays with the caller, which holds the cumulative counts."""
         from .parser import parse_filename
 
         def _parsed_key(p) -> tuple:
@@ -596,6 +639,95 @@ class Indexer:
                 return ("pack", f["cur_pack_season"], f["pack_label"] or "Complete")
             return ("none",)
 
+        rows = self.db.query(
+            "SELECT f.*, t.norm_title AS cur_norm, t.year AS cur_year, "
+            "t.kind AS cur_kind, sp.season_no AS cur_pack_season, "
+            "e.ep_no AS cur_ep_no, se.season_no AS cur_ep_season "
+            "FROM files f "
+            "LEFT JOIN titles t ON t.id = f.title_id "
+            "LEFT JOIN seasons sp ON sp.id = f.season_id "
+            "LEFT JOIN episodes e ON e.id = f.episode_id "
+            "LEFT JOIN seasons se ON se.id = e.season_id "
+            "WHERE f.id > ? AND f.id <= ? ORDER BY f.id LIMIT 500",
+            (last_id, max_id))
+        moved = kept = 0
+        enrich_ids: list[int] = []
+        for f in rows:
+            last_id = f["id"]
+            p = parse_filename(f["file_name"] or "")
+            if p.title:
+                if (p.norm_title == f["cur_norm"]
+                        and p.year == f["cur_year"]
+                        and p.kind == f["cur_kind"]
+                        and _parsed_key(p) == _current_key(f)):
+                    kept += 1
+                else:
+                    hidden = f["status"] == "hidden"
+                    self.db.execute("DELETE FROM files WHERE id=?",
+                                    (f["id"],))
+                    meta = {"file_name": f["file_name"],
+                            "size": f["size"] or 0,
+                            "duration": f["duration"] or 0,
+                            "mime": f["mime"] or "",
+                            "tg_chat_id": f["tg_chat_id"],
+                            "tg_msg_id": f["tg_msg_id"],
+                            "caption": f["caption"] or "",
+                            "msg_date": f["msg_date"] or 0}
+                    with self.db.transaction():
+                        res = self.clf.ingest(p, meta)
+                    moved += 1
+                    if not res.get("duplicate"):
+                        if hidden:
+                            self.db.execute(
+                                "UPDATE files SET status='hidden' "
+                                "WHERE id=?", (res["file_id"],))
+                        title = self.db.query_one(
+                            "SELECT id, tmdb_id FROM titles WHERE id=?",
+                            (res["title_id"],))
+                        if title and not title["tmdb_id"]:
+                            enrich_ids.append(title["id"])
+        return {"last_id": last_id, "moved": moved, "kept": kept,
+                "enrich_ids": enrich_ids, "rows": len(rows)}
+
+    def _orphan_chunk(self) -> int:
+        """One chunk of the orphan-title delete. Returns rows deleted
+        (a plain int — never hand a cursor across the thread boundary)."""
+        cur = self.db.execute(
+            "DELETE FROM titles WHERE id IN ("
+            "SELECT id FROM titles WHERE id NOT IN "
+            "(SELECT DISTINCT title_id FROM files "
+            "WHERE title_id IS NOT NULL) LIMIT 2000)")
+        return cur.rowcount
+
+    async def cleanup_catalog(self) -> dict:
+        """Targeted fix-up after a parser improvement: re-parse every file
+        and move the ones whose (norm_title, year, kind) changed — or
+        whose season/episode/pack attachment changed (an episode-range
+        file filed under its first episode, a pack filed as a movie) —
+        to their correct title and attachment. Matching files — and
+        their titles' posters / TMDB matches — are untouched, unlike
+        rebuild_catalog which wipes everything. Titles left with no
+        files are removed (seasons and episodes cascade). Holds the
+        scan lock.
+
+        Responsiveness contract (learned the hard way on 2026-10-20 and
+        again on 2026-10-24, when the bot/API went dead for hours while
+        the container stayed Up): every page's DB work runs on a worker
+        thread via run_db, so a slow commit, a WAL checkpoint, or a disk
+        stall delays only that page — never Telegram keepalives, never
+        /healthz. The old per-file ``await asyncio.sleep(0)`` yields
+        could not protect against a single slow synchronous call, so
+        they are gone; the loop is free for the whole walk by
+        construction. The LoopGuard still pauses the walk if the loop
+        itself ever lags.
+
+        The walk is resumable: a checkpoint (last checked file id,
+        snapshot max, counts, parser fingerprint) is persisted after
+        every page, so a restart or deploy mid-run resumes after the
+        last checked file instead of starting over. Restarts killed
+        this run three times on 2026-10-22 alone, losing hours of
+        checked progress each time; the moves themselves were never
+        lost (per-file transactions)."""
         async with self._scan_lock:
             # Checkpoint resume: a previous run that was killed mid-walk
             # (restart, deploy) leaves its position in kv; pick up after
@@ -610,7 +742,7 @@ class Indexer:
             resumed = False
             ckpt = None
             try:
-                raw = self.db.get_kv(CLEANUP_CKPT_KEY, "")
+                raw = await run_db(self.db.get_kv, CLEANUP_CKPT_KEY, "")
                 if raw:
                     parsed = json.loads(raw)
                     if isinstance(parsed, dict) \
@@ -631,104 +763,61 @@ class Indexer:
                              "(%d/%d files checked, %d moved so far)",
                              last_id, kept + moved, max_id, moved)
             else:
-                top = self.db.query_one("SELECT MAX(id) AS m FROM files")
+                top = await run_db(self.db.query_one,
+                                   "SELECT MAX(id) AS m FROM files")
                 max_id = top["m"] or 0  # snapshot: re-inserted files get
                 # new ids above this and are not revisited in the same run
-                self._save_cleanup_ckpt(last_id, max_id, moved, kept, sig)
+                await run_db(self._save_cleanup_ckpt, last_id, max_id,
+                             moved, kept, sig)
             while last_id < max_id:
-                rows = self.db.query(
-                    "SELECT f.*, t.norm_title AS cur_norm, t.year AS cur_year, "
-                    "t.kind AS cur_kind, sp.season_no AS cur_pack_season, "
-                    "e.ep_no AS cur_ep_no, se.season_no AS cur_ep_season "
-                    "FROM files f "
-                    "LEFT JOIN titles t ON t.id = f.title_id "
-                    "LEFT JOIN seasons sp ON sp.id = f.season_id "
-                    "LEFT JOIN episodes e ON e.id = f.episode_id "
-                    "LEFT JOIN seasons se ON se.id = e.season_id "
-                    "WHERE f.id > ? AND f.id <= ? ORDER BY f.id LIMIT 500",
-                    (last_id, max_id))
-                if not rows:
+                await self._guard_wait()
+                page = await run_db(self._cleanup_page, last_id, max_id)
+                if page["rows"] == 0:
                     break
-                for f in rows:
-                    last_id = f["id"]
-                    p = parse_filename(f["file_name"] or "")
-                    if p.title:
-                        if (p.norm_title == f["cur_norm"]
-                                and p.year == f["cur_year"]
-                                and p.kind == f["cur_kind"]
-                                and _parsed_key(p) == _current_key(f)):
-                            kept += 1
-                        else:
-                            hidden = f["status"] == "hidden"
-                            self.db.execute("DELETE FROM files WHERE id=?",
-                                            (f["id"],))
-                            meta = {"file_name": f["file_name"],
-                                    "size": f["size"] or 0,
-                                    "duration": f["duration"] or 0,
-                                    "mime": f["mime"] or "",
-                                    "tg_chat_id": f["tg_chat_id"],
-                                    "tg_msg_id": f["tg_msg_id"],
-                                    "caption": f["caption"] or "",
-                                    "msg_date": f["msg_date"] or 0}
-                            with self.db.transaction():
-                                res = self.clf.ingest(p, meta)
-                            moved += 1
-                            if not res.get("duplicate"):
-                                if hidden:
-                                    self.db.execute(
-                                        "UPDATE files SET status='hidden' "
-                                        "WHERE id=?", (res["file_id"],))
-                                title = self.db.query_one(
-                                    "SELECT id, tmdb_id FROM titles WHERE id=?",
-                                    (res["title_id"],))
-                                if title and not title["tmdb_id"]:
-                                    try:
-                                        self._enrich_queue.put_nowait(
-                                            title["id"])
-                                    except asyncio.QueueFull:
-                                        pass
-                    # breathe on EVERY file, not every 50: on a 500MB
-                    # catalog even a short stretch starves the loop
-                    await asyncio.sleep(0)
+                last_id = page["last_id"]
+                moved += page["moved"]
+                kept += page["kept"]
+                for tid in page["enrich_ids"]:
+                    try:
+                        self._enrich_queue.put_nowait(tid)
+                    except asyncio.QueueFull:
+                        pass
+                await run_db(self._save_cleanup_ckpt, last_id, max_id,
+                             moved, kept, sig)
                 log.info("catalog cleanup: %d/%d files checked (%d moved)",
                          kept + moved, max_id, moved)
-                self._save_cleanup_ckpt(last_id, max_id, moved, kept, sig)
             # Orphan removal, chunked: on 2026-10-21 the single DELETE below
             # starved the event loop for ~1h (bot + API dead) because the FK
             # cascades into seasons/episodes had no indexes on the child
             # columns — each deleted title scanned the whole child tables.
             # idx_seasons_title / idx_episodes_title / idx_episodes_season fix
-            # the cost; chunking + yielding keeps even a slow phase from ever
-            # wedging the bot/API again. Each chunk is its own transaction,
-            # so an interrupted run keeps partial progress.
+            # the cost; chunking + worker-thread execution keeps even a
+            # slow phase from ever wedging the bot/API again. Each chunk
+            # is its own transaction, so an interrupted run keeps partial
+            # progress.
             orphans = 0
             while True:
-                n = self.db.execute(
-                    "DELETE FROM titles WHERE id IN ("
-                    "SELECT id FROM titles WHERE id NOT IN "
-                    "(SELECT DISTINCT title_id FROM files "
-                    "WHERE title_id IS NOT NULL) LIMIT 2000)"
-                ).rowcount
+                await self._guard_wait()
+                n = await run_db(self._orphan_chunk)
                 orphans += n
                 if n == 0:
                     break
-                await asyncio.sleep(0)
             log.info("catalog cleanup: %d moved, %d kept, %d orphan titles removed",
                      moved, kept, orphans)
-            self.db.execute("DELETE FROM kv WHERE key=?",
-                            (CLEANUP_CKPT_KEY,))
+            await run_db(self.db.execute, "DELETE FROM kv WHERE key=?",
+                         (CLEANUP_CKPT_KEY,))
             return {"moved": moved, "kept": kept,
                     "orphans_removed": orphans, "resumed": resumed}
 
     # -- live handler ----------------------------------------------------------
     async def on_channel_post(self, _, msg) -> None:
-        src = self.db.query_one(
-            "SELECT id FROM sources WHERE chat_id=? AND enabled=1", (msg.chat.id,)
-        )
+        src = await run_db(
+            self.db.query_one,
+            "SELECT id FROM sources WHERE chat_id=? AND enabled=1", (msg.chat.id,))
         if not src:
             return
         try:
-            self.note_seen(msg.chat.id, msg.id)
+            await run_db(self.note_seen, msg.chat.id, msg.id)
             await self.ingest_message(msg)
         except Exception as e:
             log.warning("live ingest failed: %r", e)
@@ -766,10 +855,10 @@ class Indexer:
             if title_id is None:
                 while backlog and title_id is None:
                     cand = backlog.pop(0)
-                    if not self._recently_tried(cand):
+                    if not await self._recently_tried(cand):
                         title_id = cand
                 if title_id is None and not backlog:
-                    backlog = await asyncio.to_thread(self._backlog_ids, 500)
+                    backlog = await run_db(self._backlog_ids, 500)
                     if backlog:
                         continue
                     # backlog exhausted for this retry window: idle-wait
@@ -779,11 +868,12 @@ class Indexer:
                     except asyncio.TimeoutError:
                         continue
             if title_id is not None:
+                await self._guard_wait()
                 await self._enrich_one(title_id)
                 await asyncio.sleep(0.3)
 
     def _backlog_ids(self, limit: int) -> list[int]:
-        """Untried unmatched title ids, most files first. Runs in a
+        """Untried unmatched title ids, most files first. Runs on a
         worker thread (see enricher_loop) — the per-title file COUNT over
         the whole catalog is far too heavy for the event loop."""
         cutoff = time.time() - 7 * 24 * 3600
@@ -797,16 +887,17 @@ class Indexer:
             (cutoff, limit))
         return [r["id"] for r in rows]
 
-    def _recently_tried(self, title_id: int) -> bool:
-        ts = self.db.get_kv(f"tmdb_try:{title_id}")
+    async def _recently_tried(self, title_id: int) -> bool:
+        ts = await run_db(self.db.get_kv, f"tmdb_try:{title_id}")
         return bool(ts) and (time.time() - float(ts) < 7 * 24 * 3600)
 
     async def _enrich_one(self, title_id: int) -> None:
         from .parser import normalize_title
-        row = self.db.query_one("SELECT * FROM titles WHERE id=?", (title_id,))
+        row = await run_db(self.db.query_one, "SELECT * FROM titles WHERE id=?",
+                           (title_id,))
         if not row or row["tmdb_id"]:
             return
-        self.db.set_kv(f"tmdb_try:{title_id}", str(time.time()))
+        await run_db(self.db.set_kv, f"tmdb_try:{title_id}", str(time.time()))
         p = ParsedName(raw=row["title"], title=row["title"],
                        norm_title=row["norm_title"], year=row["year"], kind=row["kind"])
         meta = await self.tmdb.match(p)
@@ -829,14 +920,15 @@ class Indexer:
         mnimdb_try marker (7 days, same window as tmdb_try) is set on
         every attempt so the backlog sweep cannot re-ask the free API
         about the same hopeless title on every pass."""
-        ts = self.db.get_kv(f"mnimdb_try:{row['id']}")
+        ts = await run_db(self.db.get_kv, f"mnimdb_try:{row['id']}")
         if ts and time.time() - float(ts) < 7 * 24 * 3600:
             return
-        self.db.set_kv(f"mnimdb_try:{row['id']}", str(time.time()))
+        await run_db(self.db.set_kv, f"mnimdb_try:{row['id']}", str(time.time()))
         poster = await self.mnimdb.poster_for(
             row["title"], row["year"], row["kind"])
         if poster:
-            self.db.execute(
+            await run_db(
+                self.db.execute,
                 "UPDATE titles SET poster=?, updated_at=? "
                 "WHERE id=? AND poster=''",
                 (poster, time.time(), row["id"]))
@@ -847,11 +939,12 @@ class Indexer:
         """Ask the LLM to identify the title from a raw release filename,
         then cross-check its guess against TMDB (threshold still applies)."""
         from .parser import normalize_title
-        fn = self.db.query_one("SELECT file_name FROM files WHERE title_id=? LIMIT 1",
-                               (row["id"],))
+        fn = await run_db(self.db.query_one,
+                          "SELECT file_name FROM files WHERE title_id=? LIMIT 1",
+                          (row["id"],))
         filename = fn["file_name"] if fn else p.raw
         ck = self.llm.cache_key(filename)
-        cached = self.db.get_kv(ck)
+        cached = await run_db(self.db.get_kv, ck)
         guess = None
         if cached:
             try:
@@ -860,7 +953,8 @@ class Indexer:
                 guess = None
         if guess is None:
             guess = await self.llm.guess_title(filename)
-            self.db.set_kv(ck, __import__("json").dumps(guess or {}))
+            await run_db(self.db.set_kv, ck,
+                         __import__("json").dumps(guess or {}))
             await asyncio.sleep(0.5)
         if not guess or not guess.get("title"):
             return None
@@ -892,7 +986,13 @@ class Indexer:
         Runs as ONE transaction: the per-episode moves used to commit
         after every statement, so merging a long series meant hundreds
         of fsyncs — the enricher sat inside a single merge for minutes
-        and the poster backlog barely moved (seen live 2026-10-22)."""
+        and the poster backlog barely moved (seen live 2026-10-22).
+        The transaction runs on a worker thread (run_db) so even a big
+        merge can never stall the event loop."""
+        await run_db(self._merge_titles_sync, old_id, new_id)
+
+    def _merge_titles_sync(self, old_id: int, new_id: int) -> None:
+        """Sync core of _merge_titles: one transaction, worker thread."""
         with self.db.transaction():
             self._merge_titles_tx(old_id, new_id)
 
@@ -942,17 +1042,28 @@ class Indexer:
                    (time.time(), new_id))
         log.info("merged title %s into %s", old_id, new_id)
 
+    def _apply_episode_fills(self, fills) -> None:
+        """Sync core of the episode-name fill: one transaction, worker
+        thread. Kept separate because _adopt_meta interleaves async
+        TMDB calls (network) with this DB write."""
+        with self.db.transaction():
+            for name, ep_id in fills:
+                self.db.execute("UPDATE episodes SET ep_title=? WHERE id=?",
+                                (name, ep_id))
+
     async def _adopt_meta(self, row, meta: dict) -> None:
         from .parser import normalize_title
         db = self.db
         now = time.time()
         # if another title already owns this tmdb_id, merge into it
-        other = db.query_one("SELECT id FROM titles WHERE tmdb_id=? AND id != ?",
+        other = await run_db(db.query_one,
+                             "SELECT id FROM titles WHERE tmdb_id=? AND id != ?",
                              (meta["tmdb_id"], row["id"]))
         if other:
             await self._merge_titles(row["id"], other["id"])
             return
-        db.execute(
+        await run_db(
+            db.execute,
             "UPDATE titles SET title=?, norm_title=?, orig_title=?, alt_titles=?, year=?,"
             " tmdb_id=?, poster=?, backdrop=?, overview=?, genres=?, rating=?,"
             " popularity=?, lang=?, updated_at=? WHERE id=?",
@@ -974,10 +1085,13 @@ class Indexer:
             attempts = 0
             consec_misses = 0
             stop = False
-            for se in db.query("SELECT * FROM seasons WHERE title_id=?", (row["id"],)):
+            for se in await run_db(db.query, "SELECT * FROM seasons WHERE title_id=?",
+                                   (row["id"],)):
                 if stop:
                     break
-                for ep in db.query("SELECT * FROM episodes WHERE season_id=?", (se["id"],)):
+                for ep in await run_db(db.query,
+                                       "SELECT * FROM episodes WHERE season_id=?",
+                                       (se["id"],)):
                     if ep["ep_title"]:
                         continue
                     if attempts >= 40 or len(fills) >= 40:
@@ -995,10 +1109,7 @@ class Indexer:
                             stop = True
                             break
             if fills:
-                with db.transaction():
-                    for name, ep_id in fills:
-                        db.execute("UPDATE episodes SET ep_title=? WHERE id=?",
-                                   (name, ep_id))
+                await run_db(self._apply_episode_fills, fills)
 
     def stop(self) -> None:
         self._running = False

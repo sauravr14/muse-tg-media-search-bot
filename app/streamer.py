@@ -27,9 +27,12 @@ import hmac
 import json
 import logging
 import time
+from hashlib import sha256
 
 from pyrogram import raw
-from pyrogram.errors import AuthBytesInvalid, FileReferenceExpired
+from pyrogram.crypto import aes
+from pyrogram.errors import (AuthBytesInvalid, CDNFileHashMismatch,
+                             FileReferenceExpired, VolumeLocNotFound)
 from pyrogram.file_id import FileId
 from pyrogram.session import Auth, Session
 
@@ -141,9 +144,13 @@ class ByteStreamer:
             return hit[1]
         msg = await self.client.get_messages(chat_id, msg_id)
         if not msg or getattr(msg, "empty", False):
+            log.warning("stream resolve: no message %s/%s (empty=%r)",
+                        chat_id, msg_id, getattr(msg, "empty", None))
             raise StreamFileNotFound
         media = next((getattr(msg, a, None) for a in _MEDIA_ATTRS), None)
         if not media:
+            log.warning("stream resolve: no media %s/%s msg_type=%s",
+                        chat_id, msg_id, type(msg).__name__)
             raise StreamFileNotFound
         fid = FileId.decode(media.file_id)
         props = {
@@ -192,6 +199,47 @@ class ByteStreamer:
             id=props["media_id"], access_hash=props["access_hash"],
             file_reference=props["file_reference"], thumb_size="")
 
+    async def _cdn_session(self, dc_id: int) -> Session:
+        """Fresh auth session to a CDN DC (CDN sessions never reuse the
+        main session's auth; mirrors Pyrogram's own download_media)."""
+        client = self.client
+        test_mode = await client.storage.test_mode()
+        sess = Session(client, dc_id,
+                       await Auth(client, dc_id, test_mode).create(),
+                       test_mode, is_media=True, is_cdn=True)
+        await sess.start()
+        return sess
+
+    async def _cdn_chunk(self, cdn_session, main_session, redirect,
+                         offset: int) -> bytes | None:
+        """One decrypted CDN chunk at offset, or None if unavailable."""
+        while True:
+            r2 = await cdn_session.invoke(raw.functions.upload.GetCdnFile(
+                file_token=redirect.file_token, offset=offset,
+                limit=CHUNK_SIZE))
+            if isinstance(r2, raw.types.upload.CdnFileReuploadNeeded):
+                try:
+                    await main_session.invoke(
+                        raw.functions.upload.ReuploadCdnFile(
+                            file_token=redirect.file_token,
+                            request_token=r2.request_token))
+                except VolumeLocNotFound:
+                    return None
+                continue
+            decrypted = aes.ctr256_decrypt(
+                r2.bytes, redirect.encryption_key,
+                bytearray(redirect.encryption_iv[:-4]
+                          + (offset // 16).to_bytes(4, "big")))
+            hashes = await main_session.invoke(
+                raw.functions.upload.GetCdnFileHashes(
+                    file_token=redirect.file_token, offset=offset))
+            for i, h in enumerate(hashes):
+                part = decrypted[h.limit * i: h.limit * (i + 1)]
+                CDNFileHashMismatch.check(
+                    h.hash == sha256(part).digest(),
+                    "cdn chunk hash mismatch")
+            return decrypted
+
     async def yield_range(self, props: dict, start: int, end: int):
         """Yield exactly bytes start..end (inclusive) of the file."""
         offset, first_cut, last_cut, part_count = chunk_plan(start, end)
@@ -199,32 +247,54 @@ class ByteStreamer:
         sess = await self.media_session(props["dc_id"])
         current = 1
         refreshed = False
-        while True:
-            try:
-                r = await sess.send(raw.functions.upload.GetFile(
-                    location=loc, offset=offset, limit=CHUNK_SIZE))
-            except FileReferenceExpired:
-                # saved file references go stale; re-resolve once, then retry
-                if refreshed:
-                    raise
-                refreshed = True
-                props = await self.resolve(props["chat_id"], props["msg_id"],
-                                           force=True)
-                loc = self._location(props)
-                sess = await self.media_session(props["dc_id"])
-                continue
-            if not isinstance(r, raw.types.upload.File) or not r.bytes:
-                break
-            data = r.bytes
-            if part_count == 1:
-                yield data[first_cut:last_cut]
-            elif current == 1:
-                yield data[first_cut:]
-            elif current == part_count:
-                yield data[:last_cut]
-            else:
-                yield data
-            current += 1
-            offset += CHUNK_SIZE
-            if current > part_count:
-                break
+        redirect = None
+        cdn_session = None
+        try:
+            while True:
+                if redirect is None:
+                    try:
+                        r = await sess.send(raw.functions.upload.GetFile(
+                            location=loc, offset=offset, limit=CHUNK_SIZE))
+                    except FileReferenceExpired:
+                        # saved file references go stale; re-resolve once
+                        if refreshed:
+                            raise
+                        refreshed = True
+                        props = await self.resolve(props["chat_id"],
+                                                   props["msg_id"],
+                                                   force=True)
+                        loc = self._location(props)
+                        sess = await self.media_session(props["dc_id"])
+                        continue
+                    if isinstance(r, raw.types.upload.FileCdnRedirect):
+                        # popular files live on Telegram's CDN: switch to
+                        # a CDN session instead of yielding nothing
+                        redirect = r
+                        cdn_session = await self._cdn_session(redirect.dc_id)
+                        continue
+                    if not isinstance(r, raw.types.upload.File) or not r.bytes:
+                        break
+                    data = r.bytes
+                else:
+                    data = await self._cdn_chunk(cdn_session, sess, redirect,
+                                                 offset)
+                    if not data:
+                        break
+                if part_count == 1:
+                    yield data[first_cut:last_cut]
+                elif current == 1:
+                    yield data[first_cut:]
+                elif current == part_count:
+                    yield data[:last_cut]
+                else:
+                    yield data
+                current += 1
+                offset += CHUNK_SIZE
+                if current > part_count:
+                    break
+        finally:
+            if cdn_session is not None:
+                try:
+                    await cdn_session.stop()
+                except Exception:
+                    pass

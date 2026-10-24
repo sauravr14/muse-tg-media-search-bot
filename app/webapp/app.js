@@ -298,6 +298,7 @@
             const b = el.nextElementSibling; b.hidden = !b.hidden; el.lastElementChild.textContent = b.hidden ? "▸" : "▾"; haptic();
           }));
           bindGet();
+          bindPlay();
         };
         view.querySelectorAll(".season-tabs button").forEach((b) => b.addEventListener("click", () => {
           view.querySelectorAll(".season-tabs button").forEach((x) => x.classList.remove("active"));
@@ -306,6 +307,7 @@
         renderEps(0);
       }
       bindGet();
+      bindPlay();
     } catch (e) { view.innerHTML = `<div class="empty"><span class="big">⚠️</span>Couldn't load this title.</div>`; }
     finally { progress(false); }
   }
@@ -314,7 +316,7 @@
     return `<div class="ver"><div><div class="q">${label ? esc(label) : ""}${res ? `<span class="res r${esc(res)}">${esc(res.replace("2160p", "4K"))}</span>` : ""}
       ${v.quality ? `<span>${esc(v.quality)}</span>` : ""}${!res && !v.quality && !label ? "Unknown" : ""}</div>
       <div class="s">${fmtSize(v.size)}${v.codec ? " · " + esc(v.codec) : ""}</div></div>
-      <button class="btn" data-file="${v.id}">Get</button></div>`;
+      <div class="ver-btns"><button class="btn ghost" data-play="${v.id}">▶ Play</button><button class="btn" data-file="${v.id}">Get</button></div></div>`;
   }
   function bindGet() {
     view.querySelectorAll("[data-file]").forEach((b) => b.addEventListener("click", async () => {
@@ -341,7 +343,54 @@
     }));
   }
 
-  // ---------- chrome ----------
+  function bindPlay() {
+    view.querySelectorAll("[data-play]").forEach((b) => b.addEventListener("click", async () => {
+      if (b.disabled) return;
+      b.disabled = true; haptic();
+      const old = b.textContent; b.textContent = "Loading…";
+      try {
+        const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 45000);
+        const r = await fetch(API_BASE + "/api/stream_token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-telegram-init-data": tg ? tg.initData : "" },
+          body: JSON.stringify({ file_id: +b.dataset.play }), signal: ctl.signal,
+        }).finally(() => clearTimeout(t));
+        if (!r.ok) throw new Error(await r.text());
+        const d = await r.json();
+        openPlayer(d.url, d.name || "Video");
+      } catch (e) {
+        haptic("err");
+        toast("Couldn't start playback. Try again.");
+      }
+      b.disabled = false; b.textContent = old;
+    }));
+  }
+
+  // ---------- popup player (same page, blurred album behind) ----------
+  const playModal = $("playModal"), playVideo = $("playVideo");
+  function openPlayer(url, name) {
+    $("playTitle").textContent = name;
+    const abs = new URL(url, location.href).href;
+    const hostPath = abs.replace(/^https?:\/\//, "");
+    $("playVlc").href = "intent://" + hostPath + "#Intent;scheme=https;package=org.videolan.vlc;type=video/*;end";
+    $("playMx").href = "intent://" + hostPath + "#Intent;scheme=https;package=com.mxtech.videoplayer.ad;S.title=" + encodeURIComponent(name) + ";end";
+    $("playCopy").onclick = async () => {
+      try { await navigator.clipboard.writeText(abs); toast("Stream link copied"); }
+      catch (e) { toast("Copy failed — long-press the player link"); }
+      haptic("ok");
+    };
+    playVideo.src = url;
+    playModal.hidden = false;
+    playVideo.play().catch(() => {});
+  }
+  function closePlayer() {
+    playModal.hidden = true;
+    playVideo.pause();
+    playVideo.removeAttribute("src");
+    playVideo.load();
+  }
+  $("playClose").addEventListener("click", closePlayer);
+  playModal.addEventListener("click", (e) => { if (e.target.id === "playModal") closePlayer(); });
   function setTab(name) {
     document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
     if (tg && tg.BackButton && name) tg.BackButton.hide();

@@ -99,6 +99,9 @@ class FakeSession:
     async def send(self, req):
         return FakeFile(self.blob[req.offset:req.offset + req.limit])
 
+    async def invoke(self, req, timeout=None):
+        return await self.send(req)
+
 
 class YieldRangeTest(unittest.TestCase):
     def run_yield(self, blob, start, end):
@@ -151,7 +154,9 @@ class CdnYieldTest(unittest.TestCase):
             async def send(self, req):
                 return redirect
 
-            async def invoke(self, req):
+            async def invoke(self, req, timeout=None):
+                if isinstance(req, raw.functions.upload.GetFile):
+                    return redirect
                 chunk = blob[req.offset:req.offset + 1024 * 1024]
                 return [raw.types.FileHash(
                     offset=req.offset, limit=len(chunk),
@@ -182,6 +187,64 @@ class CdnYieldTest(unittest.TestCase):
             return out
 
         self.assertEqual(b"".join(asyncio.run(collect())), blob)
+
+
+class FallbackTest(unittest.TestCase):
+    """When get_messages returns the message shell without media (the
+    bare-fetch symptom of a wrong-type stored peer), resolve must
+    recover via the direct channel fetch instead of 404ing."""
+
+    def test_direct_channel_fetch_recovers_media(self):
+        from types import SimpleNamespace
+
+        from pyrogram import raw
+
+        doc = raw.types.Document(
+            id=777, access_hash=888, file_reference=b"ref",
+            date=1700000000, mime_type="video/x-matroska", size=12345,
+            dc_id=4, attributes=[], thumbs=[])
+        raw_msg = raw.types.Message(
+            id=234688, peer_id=raw.types.PeerChannel(channel_id=4381015304),
+            date=1700000000, message="cap", entities=[],
+            media=raw.types.MessageMediaDocument(document=doc,
+                                                 ttl_seconds=None))
+
+        class NoMediaMsg:
+            id = 234688
+            chat = SimpleNamespace(id=-1004381015304)
+            text = ""
+            caption = "cap"
+            document = video = audio = animation = voice = video_note = None
+
+        class FakeClient:
+            message_cache = {}
+
+            async def get_messages(self, chat_id, msg_id):
+                return NoMediaMsg()
+
+            async def invoke(self, req):
+                if isinstance(req, raw.functions.channels.GetChannels):
+                    return SimpleNamespace(
+                        chats=[SimpleNamespace(access_hash=999)])
+                if isinstance(req, raw.functions.channels.GetMessages):
+                    chan = raw.types.Channel(
+                        id=4381015304, title="t",
+                        photo=raw.types.ChatPhoto(
+                            photo_id=0, dc_id=4, has_video=False,
+                            stripped_thumb=b""),
+                        date=1700000000, usernames=[], access_hash=999,
+                        restriction_reason=[])
+                    return raw.types.messages.Messages(
+                        messages=[raw_msg], topics=[], chats=[chan],
+                        users=[])
+                raise AssertionError("unexpected invoke: %r" % (req,))
+
+        streamer = ByteStreamer(FakeClient())
+        props = asyncio.run(streamer.resolve(-1004381015304, 234688))
+        self.assertEqual(props["media_id"], 777)
+        self.assertEqual(props["dc_id"], 4)
+        self.assertEqual(props["file_size"], 12345)
+        self.assertEqual(props["mime_type"], "video/x-matroska")
 
 
 if __name__ == "__main__":

@@ -12,17 +12,20 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import time
 import urllib.parse
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import Config
 from .db import DB, RES_ORDER, _uj
 from .dbthread import run_db
+from .streamer import (MAX_STREAMS, ByteStreamer, StreamFileNotFound,
+                       parse_range, sign_token, stream_secret, verify_token)
 
 log = logging.getLogger("mediabot.api")
 APP_DIR = Path(__file__).parent / "webapp"
@@ -86,6 +89,8 @@ def _title_card(t) -> dict:
 def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI:
     app = FastAPI(title="Media Library API")
     limiter = RateLimiter()
+    streamer = ByteStreamer(bot.client) if bot is not None else None
+    secret = stream_secret(cfg.bot_token, cfg.stream_secret)
 
     def _admin(request: Request, init_data: str = "") -> int:
         init_data = init_data or request.headers.get("x-telegram-init-data", "")
@@ -214,6 +219,94 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         if not ok:
             raise HTTPException(400, msg)
         return {"ok": True}
+
+    @app.post("/api/stream_token")
+    async def stream_token(request: Request):
+        """Mini App Play button: mint a short-lived signed stream URL.
+
+        Needs a valid Telegram WebApp initData (proves the Telegram user
+        id). No START needed: unlike Get, streaming delivers nothing to
+        the user's DM, so the bot chat state is irrelevant.
+        """
+        if bot is None or streamer is None:
+            raise HTTPException(503, "bot not ready")
+        init_data = request.headers.get("x-telegram-init-data", "")
+        data = validate_init_data(init_data, cfg.bot_token) if init_data else None
+        if not data or not data.get("user_id"):
+            raise HTTPException(401, "open this app from Telegram")
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "bad request")
+        f = await run_db(db.query_one,
+                         "SELECT id, file_name FROM files WHERE id=? AND status='ok'",
+                         (body.get("file_id"),))
+        if not f:
+            raise HTTPException(404, "not found")
+        return {"url": "/api/stream/" + sign_token(secret, int(f["id"])),
+                "name": f["file_name"]}
+
+    @app.api_route("/api/stream/{token}", methods=["GET", "HEAD"])
+    async def stream(request: Request, token: str):
+        """Stream one catalog file's bytes with HTTP Range support.
+
+        The token is HMAC-signed and expires after an hour; the browser
+        sends ordinary Range requests and the bytes are relayed from
+        Telegram's DCs in 1MB chunks (never written to disk).
+        """
+        if bot is None or streamer is None:
+            raise HTTPException(503, "bot not ready")
+        file_id = verify_token(secret, token)
+        if not file_id:
+            raise HTTPException(403, "bad or expired link")
+        f = await run_db(db.query_one,
+                         "SELECT * FROM files WHERE id=? AND status='ok'",
+                         (file_id,))
+        if not f:
+            raise HTTPException(404, "not found")
+        if streamer.active >= MAX_STREAMS:
+            raise HTTPException(503, "too many streams, try again shortly")
+        try:
+            props = await streamer.resolve(f["tg_chat_id"], f["tg_msg_id"])
+        except StreamFileNotFound:
+            raise HTTPException(404, "not found")
+        size = props["file_size"] or f["size"]
+        if size <= 0:
+            raise HTTPException(404, "not found")
+        range_header = request.headers.get("Range", "")
+        try:
+            start, end = (parse_range(range_header, size) if range_header
+                          else (0, size - 1))
+        except ValueError:
+            return Response(status_code=416,
+                            headers={"Content-Range": f"bytes */{size}"})
+        mime = (props["mime_type"]
+                or mimetypes.guess_type(props["file_name"])[0]
+                or "application/octet-stream")
+        safe_name = (props["file_name"] or "file").replace('"', "'")
+        safe_name = "".join(c for c in safe_name if c not in "\r\n")
+        headers = {
+            "Content-Type": mime,
+            "Content-Range": f"bytes {start}-{end}/{size}",
+            "Content-Length": str(end - start + 1),
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f'inline; filename="{safe_name}"',
+        }
+        if request.method == "HEAD":
+            return Response(status_code=206 if range_header else 200,
+                            headers=headers)
+
+        async def _gen():
+            streamer.active += 1
+            try:
+                async for chunk in streamer.yield_range(props, start, end):
+                    yield chunk
+            finally:
+                streamer.active -= 1
+
+        return StreamingResponse(_gen(),
+                                 status_code=206 if range_header else 200,
+                                 headers=headers)
 
     @app.get("/api/browse")
     async def browse(kind: str = "", sort: str = "recent",

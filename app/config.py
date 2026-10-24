@@ -34,6 +34,9 @@ class Config:
     )
     port: int = field(default_factory=lambda: _int("PORT", 8000))
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO"))
+    # Optional signing secret for /api/stream tokens. When empty, a stable
+    # value is derived from BOT_TOKEN server-side (never exposed).
+    stream_secret: str = field(default_factory=lambda: os.environ.get("STREAM_SECRET", ""))
 
     def __post_init__(self) -> None:
         raw = os.environ.get("ADMIN_USER_IDS", "")

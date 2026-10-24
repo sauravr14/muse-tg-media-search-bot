@@ -13,6 +13,8 @@ import time
 from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from .dbthread import run_db
+
 log = logging.getLogger("mediabot.panel")
 
 PANEL_TTL = 15 * 60  # stop auto-refresh 15 min after the last tap
@@ -61,7 +63,7 @@ class IndexPanel:
             pass
 
     # -- rendering ------------------------------------------------------
-    def _text(self) -> str:
+    async def _text(self) -> str:
         cur = self.indexer.current_scan
         if cur:
             total = cur.get("total") or 0
@@ -85,7 +87,7 @@ class IndexPanel:
         else:
             lines = ["⚪ <b>Index status</b> — idle", ""]
         lines.append("<b>Sources</b>")
-        for s in self.db.list_sources():
+        for s in await run_db(self.db.list_sources):
             st = s["status"] or "idle"
             icon = {"scanning": "🟢", "error": "🔴"}.get(st, "⚪")
             if not s["enabled"]:
@@ -115,10 +117,10 @@ class IndexPanel:
             except Exception:
                 pass
         sent = await message.reply_text(
-            self._text(), parse_mode=ParseMode.HTML, reply_markup=self._markup())
+            await self._text(), parse_mode=ParseMode.HTML, reply_markup=self._markup())
         self.chat_id, self.msg_id = sent.chat.id, sent.id
-        self.db.set_kv("panel_chat", str(self.chat_id))
-        self.db.set_kv("panel_msg", str(self.msg_id))
+        await run_db(self.db.set_kv, "panel_chat", str(self.chat_id))
+        await run_db(self.db.set_kv, "panel_msg", str(self.msg_id))
         self.last_tap = time.time()
         self._restart_loop()
 
@@ -135,7 +137,7 @@ class IndexPanel:
                     return
                 try:
                     await self.client.edit_message_text(
-                        self.chat_id, self.msg_id, self._text(),
+                        self.chat_id, self.msg_id, await self._text(),
                         parse_mode=ParseMode.HTML,
                         reply_markup=self._markup())
                 except Exception as e:
@@ -151,8 +153,8 @@ class IndexPanel:
         msg = query.message
         if msg:
             self.chat_id, self.msg_id = msg.chat.id, msg.id
-            self.db.set_kv("panel_chat", str(self.chat_id))
-            self.db.set_kv("panel_msg", str(self.msg_id))
+            await run_db(self.db.set_kv, "panel_chat", str(self.chat_id))
+            await run_db(self.db.set_kv, "panel_msg", str(self.msg_id))
         self.last_tap = time.time()
         data = query.data or ""
         if data == "ip:close":
@@ -163,8 +165,8 @@ class IndexPanel:
             except Exception:
                 pass
             self.chat_id = self.msg_id = None
-            self.db.set_kv("panel_chat", "")
-            self.db.set_kv("panel_msg", "")
+            await run_db(self.db.set_kv, "panel_chat", "")
+            await run_db(self.db.set_kv, "panel_msg", "")
             try:
                 await query.answer()
             except Exception:
@@ -174,7 +176,7 @@ class IndexPanel:
         self._restart_loop()
         try:
             await self.client.edit_message_text(
-                self.chat_id, self.msg_id, self._text(),
+                self.chat_id, self.msg_id, await self._text(),
                 parse_mode=ParseMode.HTML, reply_markup=self._markup())
         except Exception as e:
             if type(e).__name__ != "MessageNotModified":

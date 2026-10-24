@@ -21,6 +21,7 @@ from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
 
 from .config import Config
 from .db import DB, RES_ORDER, _uj
+from .dbthread import run_db
 from .indexer import Indexer
 
 log = logging.getLogger("mediabot.bot")
@@ -144,7 +145,7 @@ class MediaBot:
             text += f"\n{html.escape(overview)}"
         kb_rows = []
         if t["kind"] == "movie" and with_versions:
-            files = self._versions(t["id"])
+            files = await run_db(self._versions, t["id"])
             kb = self._kb_versions(files)
             if kb:
                 kb_rows = kb.inline_keyboard
@@ -243,7 +244,8 @@ class MediaBot:
 
         @c.on_message(filters.private & filters.command("recent"))
         async def recent(_, m: Message):
-            rows = self.db.query(
+            rows = await run_db(
+                self.db.query,
                 "SELECT * FROM titles ORDER BY (poster != '') DESC, "
                 "last_file_at DESC LIMIT 8")
             if not rows:
@@ -256,7 +258,8 @@ class MediaBot:
         @c.on_message(filters.private & filters.command(["movies", "series"]))
         async def browse(_, m: Message):
             kind = "movie" if m.command[0] == "movies" else "series"
-            rows = self.db.query(
+            rows = await run_db(
+                self.db.query,
                 "SELECT * FROM titles WHERE kind=? ORDER BY title LIMIT ?",
                 (kind, PAGE))
             if not rows:
@@ -362,7 +365,8 @@ class MediaBot:
             except Exception as e:
                 await m.reply_text(f"Can't access that chat: {e}")
                 return
-            self.db.upsert_source(chat.id, chat.title or "", chat.username or "")
+            await run_db(self.db.upsert_source, chat.id, chat.title or "",
+                         chat.username or "")
             await m.reply_text(f"✅ Added <b>{html.escape(chat.title or arg)}</b> "
                                f"(<code>{chat.id}</code>).\n\n"
                                f"To start indexing, <b>forward any message</b> from that "
@@ -381,19 +385,21 @@ class MediaBot:
             except ValueError:
                 await m.reply_text("Pass the numeric channel id.")
                 return
-            self.db.remove_source(cid)
+            await run_db(self.db.remove_source, cid)
             await m.reply_text(f"Removed <code>{cid}</code>.", parse_mode=ParseMode.HTML)
 
         @c.on_message(filters.private & filters.command("channels") & filters.user(admin_ids))
         async def channels(_, m: Message):
-            rows = self.db.list_sources()
+            rows = await run_db(self.db.list_sources)
             if not rows:
                 await m.reply_text("No sources configured.")
                 return
             lines = ["<b>📡 Sources</b>"]
             for s in rows:
-                n = self.db.query_one("SELECT COUNT(*) c FROM files WHERE tg_chat_id=?",
-                                      (s["chat_id"],))["c"]
+                n = (await run_db(
+                    self.db.query_one,
+                    "SELECT COUNT(*) c FROM files WHERE tg_chat_id=?",
+                    (s["chat_id"],)))["c"]
                 icon = "🟢" if s["enabled"] else "⚪"
                 lines.append(f"{icon} {html.escape(s['title'] or str(s['chat_id']))} "
                              f"— {n} files — {s['status']}")
@@ -432,7 +438,7 @@ class MediaBot:
                 await m.reply_text("No scan is running right now.")
                 return
             self.indexer.request_stop(target)
-            src = self.db.get_source(target) or {}
+            src = await run_db(self.db.get_source, target) or {}
             name = src.get("title") or str(target)
             await m.reply_text(f"🛑 Stopping the scan of <b>{html.escape(name)}</b> — "
                                f"it will halt after its current batch and keep its checkpoint.")
@@ -461,7 +467,7 @@ class MediaBot:
             """
             args = m.text.split()[1:]
             if not args:
-                rows = self.db.list_sources()
+                rows = await run_db(self.db.list_sources)
                 if not rows:
                     await m.reply_text("No sources configured.")
                     return
@@ -482,7 +488,8 @@ class MediaBot:
                 if n < 0:
                     await m.reply_text("Number must be 0 or more.")
                     return
-                self.db.execute("UPDATE sources SET skip_first=?", (n,))
+                await run_db(self.db.execute,
+                             "UPDATE sources SET skip_first=?", (n,))
                 await m.reply_text(f"✅ Skip set to <b>{n}</b> for all sources.",
                                    parse_mode=ParseMode.HTML)
                 return
@@ -495,14 +502,15 @@ class MediaBot:
             if n < 0:
                 await m.reply_text("Number must be 0 or more.")
                 return
-            self.db.execute("UPDATE sources SET skip_first=? WHERE chat_id=?",
-                            (n, cid))
+            await run_db(self.db.execute,
+                         "UPDATE sources SET skip_first=? WHERE chat_id=?",
+                         (n, cid))
             await m.reply_text(f"✅ Skip set to <b>{n}</b> for <code>{cid}</code>.",
                                parse_mode=ParseMode.HTML)
 
         @c.on_message(filters.private & filters.command("stats") & filters.user(admin_ids))
         async def stats(_, m: Message):
-            s = self.db.stats()
+            s = await run_db(self.db.stats)
             await m.reply_text(
                 f"📊 <b>Catalog stats</b>\n"
                 f"Files: <b>{s['files']}</b> · Movies: <b>{s['movies']}</b> · "
@@ -516,7 +524,7 @@ class MediaBot:
         if now - self._spam.get(user_id, 0) < 1.5:
             return
         self._spam[user_id] = now
-        rows = self.search_titles(q, limit=6)
+        rows = await run_db(self.search_titles, q, limit=6)
         if not rows:
             await self.client.send_message(
                 chat_id, f"No results for <b>{html.escape(q)}</b>.\nTry another spelling.",
@@ -526,9 +534,12 @@ class MediaBot:
         await asyncio.gather(*[self._send_title_card(chat_id, t) for t in rows])
 
     async def _show_seasons(self, q: CallbackQuery, title_id: int):
-        t = self.db.query_one("SELECT * FROM titles WHERE id=?", (title_id,))
-        seasons = self.db.query("SELECT * FROM seasons WHERE title_id=? ORDER BY season_no",
-                                (title_id,))
+        t = await run_db(self.db.query_one, "SELECT * FROM titles WHERE id=?",
+                         (title_id,))
+        seasons = await run_db(
+            self.db.query,
+            "SELECT * FROM seasons WHERE title_id=? ORDER BY season_no",
+            (title_id,))
         rows = [[InlineKeyboardButton(f"Season {s['season_no']}",
                                       callback_data=f"season:{s['id']}")] for s in seasons]
         rows.append([self._app_button("🌐 Open in app", f"title_{title_id}")])
@@ -541,20 +552,27 @@ class MediaBot:
         await q.answer()
 
     async def _show_episodes(self, q: CallbackQuery, season_id: int):
-        se = self.db.query_one("SELECT * FROM seasons WHERE id=?", (season_id,))
-        t = self.db.query_one("SELECT * FROM titles WHERE id=?", (se["title_id"],))
-        eps = self.db.query("SELECT * FROM episodes WHERE season_id=? ORDER BY ep_no",
-                            (season_id,))
+        se = await run_db(self.db.query_one, "SELECT * FROM seasons WHERE id=?",
+                          (season_id,))
+        t = await run_db(self.db.query_one, "SELECT * FROM titles WHERE id=?",
+                         (se["title_id"],))
+        eps = await run_db(
+            self.db.query,
+            "SELECT * FROM episodes WHERE season_id=? ORDER BY ep_no",
+            (season_id,))
         rows = []
-        packs = self.db.query(
+        packs = await run_db(
+            self.db.query,
             "SELECT * FROM files WHERE season_id=? AND episode_id IS NULL "
             "AND status='ok' ORDER BY " + RES_ORDER + " DESC", (season_id,))
         for f in packs:
             label = f"📦 {f['pack_label'] or 'Pack'} ({f['resolution'] or '?'})"
             rows.append([InlineKeyboardButton(label, callback_data=f"getf:{f['id']}")])
         for e in eps:
-            n = self.db.query_one("SELECT COUNT(*) c FROM files WHERE episode_id=?",
-                                  (e["id"],))["c"]
+            n = (await run_db(
+                self.db.query_one,
+                "SELECT COUNT(*) c FROM files WHERE episode_id=?",
+                (e["id"],)))["c"]
             label = f"E{e['ep_no']:02d}" + (f" — {e['ep_title']}" if e["ep_title"] else "")
             rows.append([InlineKeyboardButton(f"{label} ({n} file{'s' if n!=1 else ''})",
                                               callback_data=f"ep:{e['id']}")])
@@ -569,10 +587,13 @@ class MediaBot:
         await q.answer()
 
     async def _show_episode(self, q: CallbackQuery, episode_id: int):
-        e = self.db.query_one("SELECT * FROM episodes WHERE id=?", (episode_id,))
-        se = self.db.query_one("SELECT * FROM seasons WHERE id=?", (e["season_id"],))
-        t = self.db.query_one("SELECT * FROM titles WHERE id=?", (e["title_id"],))
-        files = self._versions(t["id"], episode_id)
+        e = await run_db(self.db.query_one, "SELECT * FROM episodes WHERE id=?",
+                         (episode_id,))
+        se = await run_db(self.db.query_one, "SELECT * FROM seasons WHERE id=?",
+                          (e["season_id"],))
+        t = await run_db(self.db.query_one, "SELECT * FROM titles WHERE id=?",
+                         (e["title_id"],))
+        files = await run_db(self._versions, t["id"], episode_id)
         kb = self._kb_versions(files) or InlineKeyboardMarkup([[]])
         kb.inline_keyboard.append([InlineKeyboardButton(
             "⬅ Episodes", callback_data=f"season:{se['id']}")])
@@ -595,7 +616,8 @@ class MediaBot:
             fid = int(file_id)
         except (ValueError, TypeError):
             return False, "bad file id"
-        f = self.db.query_one("SELECT * FROM files WHERE id=?", (fid,))
+        f = await run_db(self.db.query_one, "SELECT * FROM files WHERE id=?",
+                         (fid,))
         if not f:
             return False, "File not found."
         try:
@@ -610,7 +632,7 @@ class MediaBot:
                 user_id,
                 "⏳ The file will be deleted in 10 minutes. "
                 "Forward the files to your saved messages.")
-            self._schedule_delete(user_id, [sent.id, warn.id], delay=600)
+            await self._schedule_delete(user_id, [sent.id, warn.id], delay=600)
             return True, "sent"
         except Exception as e:
             log.warning("deliver_to_user failed: %r", e)
@@ -632,11 +654,11 @@ class MediaBot:
             await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML)
 
     # -- self-destructing deliveries -----------------------------------------
-    def _schedule_delete(self, chat_id: int, msg_ids: list[int], delay: float):
+    async def _schedule_delete(self, chat_id: int, msg_ids: list[int], delay: float):
         """Delete messages after `delay` seconds. Survives restarts via DB."""
         delete_at = time.time() + delay
         for mid in msg_ids:
-            self.db.add_pending_delete(chat_id, mid, delete_at)
+            await run_db(self.db.add_pending_delete, chat_id, mid, delete_at)
         asyncio.create_task(self._auto_delete(chat_id, msg_ids, delay))
 
     async def _auto_delete(self, chat_id: int, msg_ids: list[int], delay: float):
@@ -646,11 +668,11 @@ class MediaBot:
         except Exception as e:
             log.warning("auto-delete failed: %r", e)
         for mid in msg_ids:
-            self.db.remove_pending_delete(chat_id, mid)
+            await run_db(self.db.remove_pending_delete, chat_id, mid)
 
     async def _recover_pending_deletes(self):
         """Re-schedule deletions that were pending when the bot restarted."""
-        for row in self.db.list_pending_deletes():
+        for row in await run_db(self.db.list_pending_deletes):
             delay = max(0.0, row["delete_at"] - time.time())
             asyncio.create_task(
                 self._auto_delete(row["chat_id"], [row["msg_id"]], delay))
@@ -677,7 +699,7 @@ class MediaBot:
                                  callback_data=f"idx_yes:{cid}:{top_id}"),
             InlineKeyboardButton("❌ No", callback_data="idx_no"),
         ]])
-        self.db.upsert_source(cid, title, username)
+        await run_db(self.db.upsert_source, cid, title, username)
         await self.client.send_message(
             notify_chat,
             f"📡 Index <b>{html.escape(title)}</b> (<code>{cid}</code>)?\n"
@@ -686,7 +708,8 @@ class MediaBot:
             parse_mode=ParseMode.HTML, reply_markup=kb)
 
     async def _index_yes(self, q: CallbackQuery, chat_id: int, top_id: int):
-        chat = self.db.query_one("SELECT title FROM sources WHERE chat_id=?", (chat_id,))
+        chat = await run_db(self.db.query_one,
+                            "SELECT title FROM sources WHERE chat_id=?", (chat_id,))
         title = (chat["title"] if chat else None) or str(chat_id)
         queued = self.indexer._scan_lock.locked()
         await q.answer("Indexing queued — starts when the current scan finishes."
@@ -815,7 +838,7 @@ class MediaBot:
 
     async def _index_all_report(self, notify_chat: int):
         lines = []
-        for src in self.db.list_sources():
+        for src in await run_db(self.db.list_sources):
             if not src["enabled"]:
                 continue
             res = await self.indexer.scan_source(src["chat_id"])

@@ -16,6 +16,7 @@ from .api import create_app
 from .bot import MediaBot
 from .config import cfg
 from .db import DB
+from .dbthread import LoopGuard
 from .indexer import Indexer
 from .llm import LLTitle
 from .mnimdb import MNImdb
@@ -46,7 +47,8 @@ async def amain() -> None:
     mnimdb = MNImdb(cfg.mn_imdb_base_url) if cfg.has_mnimdb else None
     if mnimdb:
         log.info("MN IMDb poster fallback enabled (%s)", cfg.mn_imdb_base_url)
-    indexer = Indexer(bot.client, db, tmdb, llm=llm, mnimdb=mnimdb)
+    indexer = Indexer(bot.client, db, tmdb, llm=llm, mnimdb=mnimdb,
+                      guard=LoopGuard())
     bot.indexer = indexer
     from .panel import IndexPanel
     bot.panel = IndexPanel(bot.client, db, indexer)
@@ -56,6 +58,7 @@ async def amain() -> None:
 
     server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=cfg.port,
                                            log_level="warning"))
+    await indexer.guard.start()
     enrich_task = asyncio.create_task(indexer.enricher_loop(), name="enricher")
     # resume interrupted scans quietly in the background
     scan_task = asyncio.create_task(indexer.scan_all(), name="resume-scan")
@@ -66,6 +69,7 @@ async def amain() -> None:
         await server.serve()
     finally:
         indexer.stop()
+        indexer.guard.stop()
         enrich_task.cancel()
         scan_task.cancel()
         supervisor_task.cancel()

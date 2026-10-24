@@ -100,7 +100,7 @@ class PanelTextTest(unittest.TestCase):
         self.panel = IndexPanel(client=None, db=self.db, indexer=self.idx)
 
     def test_idle_text(self):
-        t = self.panel._text()
+        t = asyncio.run(self.panel._text())
         self.assertIn("idle", t)
         self.assertIn("JEROM DB", t)
         self.assertIn("Zoned Database 1", t)
@@ -112,7 +112,7 @@ class PanelTextTest(unittest.TestCase):
             "done": 40000, "total": 79866, "new": 35000,
             "started_at": time.time() - 3600,
         }
-        t = self.panel._text()
+        t = asyncio.run(self.panel._text())
         self.assertIn("scanning", t)
         self.assertIn("50.1%", t)
         self.assertIn("40,000", t)

@@ -385,7 +385,7 @@
   }
   function closePlayer() {
     playModal.hidden = true;
-    playModal.classList.remove("fs");
+    exitFsMode();
     playVideo.pause();
     playVideo.removeAttribute("src");
     playVideo.load();
@@ -394,7 +394,10 @@
   // webview (it doesn't support the Fullscreen API), so this button tries
   // real fullscreen first and falls back to an edge-to-edge popup.
   const playFullBtn = $("playFull");
-  function exitFsMode() { playModal.classList.remove("fs"); }
+  function exitFsMode() {
+    playModal.classList.remove("fs");
+    if (tg && tg.exitFullscreen) { try { tg.exitFullscreen(); } catch (e) {} }
+  }
   async function toggleFs() {
     if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch (e) {} return; }
     if (playModal.classList.contains("fs")) { exitFsMode(); return; }
@@ -405,6 +408,10 @@
     }
     playModal.classList.add("fs");
     if (tg && tg.expand) tg.expand();
+    // Hide Telegram's own header bar too: closest a Mini App gets to
+    // YouTube-style fullscreen (the OS status bar stays — only native
+    // apps can hide that).
+    if (tg && tg.requestFullscreen) { try { tg.requestFullscreen(); } catch (e) {} }
   }
   playFullBtn.addEventListener("click", toggleFs);
   $("playFsClose").addEventListener("click", exitFsMode);

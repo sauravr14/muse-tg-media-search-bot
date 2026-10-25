@@ -191,5 +191,14 @@ button { font-family: inherit; }
 .play-actions .btn { flex: 1; text-align: center; text-decoration: none; padding: 10px 6px; }
 .play-box .muted { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
 
+/* Player pseudo-fullscreen: Telegram's webview blocks the native
+   Fullscreen API, so the ⛶ button expands the popup edge-to-edge instead. */
+#playFsClose { display: none; }
+.play-modal.fs { padding: 0; }
+.play-modal.fs .play-box { width: 100vw; height: 100dvh; max-width: none; background: #000; border: none; border-radius: 0; padding: 0; }
+.play-modal.fs #playVideo { width: 100vw; height: 100dvh; max-height: none; border-radius: 0; }
+.play-modal.fs .play-head, .play-modal.fs .play-actions, .play-modal.fs .muted { display: none; }
+.play-modal.fs #playFsClose { display: block; position: fixed; top: 12px; right: 12px; z-index: 5; background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.25); color: #fff; font-size: 18px; border-radius: 50%; width: 36px; height: 36px; cursor: pointer; }
+
 @media (min-width: 560px) { .grid { grid-template-columns: repeat(5, 1fr); } .strip .card { flex-basis: 140px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }

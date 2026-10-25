@@ -246,6 +246,68 @@ class FallbackTest(unittest.TestCase):
         self.assertEqual(props["file_size"], 12345)
         self.assertEqual(props["mime_type"], "video/x-matroska")
 
+    def test_video_attribute_message_resolves(self):
+        """Regression: a message whose media parses as video (document
+        attr None, video set) must resolve. The old code picked media
+        with unfiltered next(), which returned the None document first
+        and 404'd every video file — proven live on Doosra."""
+        from types import SimpleNamespace
+
+        from pyrogram import raw
+
+        doc = raw.types.Document(
+            id=777, access_hash=888, file_reference=b"ref",
+            date=1700000000, mime_type="video/x-matroska", size=12345,
+            dc_id=4,
+            attributes=[raw.types.DocumentAttributeVideo(
+                duration=100, w=1280, h=720),
+                raw.types.DocumentAttributeFilename(
+                    file_name="Doosra.mkv")],
+            thumbs=[])
+        raw_msg = raw.types.Message(
+            id=234688, peer_id=raw.types.PeerChannel(channel_id=4381015304),
+            date=1700000000, message="cap", entities=[],
+            media=raw.types.MessageMediaDocument(document=doc,
+                                                 ttl_seconds=None))
+
+        class NoMediaMsg:
+            id = 234688
+            chat = SimpleNamespace(id=-1004381015304)
+            text = ""
+            caption = "cap"
+            document = video = audio = animation = voice = video_note = None
+
+        class FakeClient:
+            message_cache = {}
+
+            async def get_messages(self, chat_id, msg_id):
+                return NoMediaMsg()
+
+            async def invoke(self, req):
+                if isinstance(req, raw.functions.channels.GetChannels):
+                    return SimpleNamespace(
+                        chats=[SimpleNamespace(access_hash=999)])
+                if isinstance(req, raw.functions.channels.GetMessages):
+                    chan = raw.types.Channel(
+                        id=4381015304, title="t",
+                        photo=raw.types.ChatPhoto(
+                            photo_id=0, dc_id=4, has_video=False,
+                            stripped_thumb=b""),
+                        date=1700000000, usernames=[], access_hash=999,
+                        restriction_reason=[])
+                    return raw.types.messages.Messages(
+                        messages=[raw_msg], topics=[], chats=[chan],
+                        users=[])
+                raise AssertionError("unexpected invoke: %r" % (req,))
+
+        streamer = ByteStreamer(FakeClient())
+        props = asyncio.run(streamer.resolve(-1004381015304, 234688))
+        self.assertEqual(props["media_id"], 777)
+        self.assertEqual(props["dc_id"], 4)
+        self.assertEqual(props["file_size"], 12345)
+        self.assertEqual(props["mime_type"], "video/x-matroska")
+        self.assertEqual(props["file_name"], "Doosra.mkv")
+
 
 if __name__ == "__main__":
     unittest.main()

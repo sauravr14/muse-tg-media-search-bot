@@ -210,13 +210,30 @@ class ByteStreamer:
                         access_hash=chats.chats[0].access_hash),
                     id=[raw.types.InputMessageID(id=msg_id)]))
             raw_first = r.messages[0] if r.messages else None
+            raw_media = getattr(raw_first, "media", None)
+            raw_doc = getattr(raw_media, "document", None)
             log.warning("stream channel fallback: GetMessages %s/%s -> "
-                        "%d msgs, first type=%s media=%s",
+                        "%d msgs, first type=%s media=%s doc=%s "
+                        "doc_size=%r doc_mime=%r doc_attrs=%s",
                         chat_id, msg_id, len(r.messages),
                         type(raw_first).__name__ if raw_first else None,
-                        type(getattr(raw_first, "media", None)).__name__
-                        if raw_first else None)
+                        type(raw_media).__name__ if raw_first else None,
+                        type(raw_doc).__name__
+                        if raw_doc is not None else None,
+                        getattr(raw_doc, "size", None),
+                        getattr(raw_doc, "mime_type", None),
+                        [type(a).__name__ for a in
+                         getattr(raw_doc, "attributes", [])]
+                        if raw_doc is not None else None)
             parsed = await utils.parse_messages(self.client, r, replies=0)
+            if parsed:
+                p0 = parsed[0]
+                log.warning("stream channel fallback: parsed %s/%s -> "
+                            "attrs=%s caption=%r",
+                            chat_id, msg_id,
+                            [a for a in _MEDIA_ATTRS
+                             if getattr(p0, a, None) is not None],
+                            (getattr(p0, "caption", "") or "")[:80])
             return parsed[0] if parsed else None
         except Exception as e:
             log.warning("stream channel fallback failed %s/%s: %s",

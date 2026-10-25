@@ -191,6 +191,9 @@ button { font-family: inherit; }
 .play-actions .btn { flex: 1; text-align: center; text-decoration: none; padding: 10px 6px; }
 .play-box .muted { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
 
+.play-head span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.play-head span:last-child { flex-shrink: 0; display: flex; }
+
 /* Player pseudo-fullscreen: Telegram's webview blocks the native
    Fullscreen API, so the ⛶ button expands the popup edge-to-edge instead. */
 #playFsClose { display: none; }

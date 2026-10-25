@@ -3,3 +3,4 @@ fastapi==0.115.6
 uvicorn==0.30.6
 aiohttp==3.10.11
 python-dotenv==1.0.1
+tgcrypto==1.2.5

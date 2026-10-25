@@ -68,7 +68,7 @@
 </div>
 <div id="playModal" class="modal play-modal" hidden>
   <div class="play-box">
-    <div class="play-head"><span id="playTitle">Video</span><button id="playClose" aria-label="Close">✕</button></div>
+    <div class="play-head"><span id="playTitle">Video</span><span><button id="playFull" aria-label="Fullscreen">⛶</button><button id="playClose" aria-label="Close">✕</button></span></div>
     <video id="playVideo" controls playsinline preload="none"></video>
     <div class="play-actions">
       <a class="btn ghost" id="playVlc">Open in VLC</a>
@@ -76,6 +76,7 @@
       <button class="btn ghost" id="playCopy">Copy link</button>
     </div>
     <p class="muted">If the browser can't play the sound (multi-audio MKV), use VLC or MX Player above.</p>
+    <button id="playFsClose" aria-label="Exit fullscreen">✕</button>
   </div>
 </div>
 <script src="app.js"></script>

@@ -385,10 +385,30 @@
   }
   function closePlayer() {
     playModal.hidden = true;
+    playModal.classList.remove("fs");
     playVideo.pause();
     playVideo.removeAttribute("src");
     playVideo.load();
   }
+  // Fullscreen: the native controls' button is greyed out in Telegram's
+  // webview (it doesn't support the Fullscreen API), so this button tries
+  // real fullscreen first and falls back to an edge-to-edge popup.
+  const playFullBtn = $("playFull");
+  function exitFsMode() { playModal.classList.remove("fs"); }
+  async function toggleFs() {
+    if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch (e) {} return; }
+    if (playModal.classList.contains("fs")) { exitFsMode(); return; }
+    const req = playVideo.requestFullscreen || playVideo.webkitEnterFullscreen;
+    if (req) {
+      try { await req.call(playVideo); return; }
+      catch (e) { /* webview blocks it: fall through to CSS mode */ }
+    }
+    playModal.classList.add("fs");
+    if (tg && tg.expand) tg.expand();
+  }
+  playFullBtn.addEventListener("click", toggleFs);
+  $("playFsClose").addEventListener("click", exitFsMode);
+  document.addEventListener("fullscreenchange", () => { if (!document.fullscreenElement) exitFsMode(); });
   $("playClose").addEventListener("click", closePlayer);
   playModal.addEventListener("click", (e) => { if (e.target.id === "playModal") closePlayer(); });
   function setTab(name) {

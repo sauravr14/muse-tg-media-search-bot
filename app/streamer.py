@@ -147,7 +147,8 @@ class ByteStreamer:
             log.warning("stream resolve: no message %s/%s (empty=%r)",
                         chat_id, msg_id, getattr(msg, "empty", None))
             raise StreamFileNotFound
-        media = next((getattr(msg, a, None) for a in _MEDIA_ATTRS), None)
+        media = next((getattr(msg, a, None) for a in _MEDIA_ATTRS
+                      if getattr(msg, a, None) is not None), None)
         if not media and utils.get_peer_type(chat_id) == "channel":
             # A wrong-type stored peer makes get_messages take the bare
             # messages.GetMessages branch, which returns the message
@@ -159,7 +160,8 @@ class ByteStreamer:
             if fb is not None:
                 msg = fb
                 media = next((getattr(msg, a, None)
-                              for a in _MEDIA_ATTRS), None)
+                              for a in _MEDIA_ATTRS
+                              if getattr(msg, a, None) is not None), None)
                 if media is not None:
                     log.info("stream resolve: direct channel fetch "
                              "recovered media %s/%s", chat_id, msg_id)

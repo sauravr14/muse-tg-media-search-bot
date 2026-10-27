@@ -105,11 +105,15 @@ button { font-family: inherit; }
 
 /* rows & cards */
 .strip { display: flex; gap: 10px; overflow-x: auto; scroll-snap-type: x proximity; scroll-padding: 0 14px; padding: 0 14px 6px; scrollbar-width: none; }
-.strip .card { flex: 0 0 112px; scroll-snap-align: start; }
-.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; padding: 0 14px; }
-.card { position: relative; cursor: pointer; transition: transform .15s; }
+.strip .card { flex: 0 0 112px; min-width: 0; scroll-snap-align: start; }
+/* Uniform cards, everywhere: grid items default to min-width:auto, so one
+   long unbroken title (a hash/UUID-style name, common in this catalog)
+   could force its whole column wider and push the grid off the right edge.
+   minmax(0,1fr) + min-width:0 + overflow-wrap:anywhere stops that. */
+.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 0 14px; width: 100%; }
+.card { position: relative; cursor: pointer; transition: transform .15s; min-width: 0; width: 100%; overflow: hidden; }
 .card:active { transform: scale(.96); }
-.poster-box { position: relative; aspect-ratio: 2/3; border-radius: var(--radius); overflow: hidden; background: var(--card);
+.poster-box { position: relative; width: 100%; min-width: 0; aspect-ratio: 2/3; border-radius: var(--radius); overflow: hidden; background: var(--card);
   box-shadow: 0 6px 18px rgba(0, 0, 0, .45); }
 .poster-box img { width: 100%; height: 100%; object-fit: cover; display: block; opacity: 0; transition: opacity .35s; }
 .poster-box img.in { opacity: 1; }
@@ -118,7 +122,7 @@ button { font-family: inherit; }
 .poster-fallback { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 32px; background: linear-gradient(135deg, #2b2b3d, #14141c); z-index: 1; }
 .badge { position: absolute; z-index: 2; top: 6px; left: 6px; padding: 2px 6px; border-radius: 6px; background: rgba(0, 0, 0, .72); font-size: 10.5px; font-weight: 800; color: var(--gold); backdrop-filter: blur(4px); }
 .badge.tv { left: auto; right: 6px; color: #fff; background: rgba(229, 9, 20, .85); }
-.card .t { padding: 7px 2px 0; font-size: 12px; font-weight: 700; line-height: 1.25; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.card .t { padding: 7px 2px 0; font-size: 12px; font-weight: 700; line-height: 1.25; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; min-width: 0; overflow-wrap: anywhere; }
 .card .y { color: var(--muted); font-weight: 500; font-size: 11px; display: block; margin-top: 1px; }
 
 /* skeleton */
@@ -203,5 +207,5 @@ button { font-family: inherit; }
 .play-modal.fs .play-head, .play-modal.fs .play-actions, .play-modal.fs .muted { display: none; }
 .play-modal.fs #playFsClose { display: block; position: fixed; top: 12px; right: 12px; z-index: 5; background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.25); color: #fff; font-size: 18px; border-radius: 50%; width: 36px; height: 36px; cursor: pointer; }
 
-@media (min-width: 560px) { .grid { grid-template-columns: repeat(5, 1fr); } .strip .card { flex-basis: 140px; } }
+@media (min-width: 560px) { .grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } .strip .card { flex-basis: 140px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }

@@ -7,6 +7,7 @@ the bot must be admin in every source channel.
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import logging
 import re
@@ -20,7 +21,7 @@ from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
                             InlineKeyboardMarkup, Message, WebAppInfo)
 
 from .config import Config
-from .db import DB, RES_ORDER, _uj
+from .db import DB, RES_ORDER
 from .dbthread import run_db
 from .indexer import Indexer
 
@@ -71,6 +72,21 @@ def _title_line(t) -> str:
     year = f" ({t['year']})" if t["year"] else ""
     kind = "🎬" if t["kind"] == "movie" else "📺"
     return f"{kind} <b>{html.escape(t['title'])}</b>{year}"
+
+
+def _search_start_param(q: str) -> str:
+    """Encode a search query into a Mini App start_param.
+
+    Telegram start_params allow only [A-Za-z0-9_-] and at most 64 chars,
+    so the query is base64url-encoded (padding stripped) with a 'q_'
+    prefix; the Mini App decodes it and runs the search immediately, so
+    the button lands the user on results, not on a blank search box.
+    Returns '' when the encoded form would not fit — the button then
+    opens the app without a prefilled query instead of a broken param.
+    """
+    enc = base64.urlsafe_b64encode(q.strip().encode("utf-8")).decode().rstrip("=")
+    param = f"q_{enc}"
+    return param if len(param) <= 64 else ""
 
 
 class MediaBot:
@@ -133,38 +149,6 @@ class MediaBot:
                                               callback_data=f"{prefix}:{f['id']}")])
         return InlineKeyboardMarkup(rows) if rows else None
 
-    async def _send_title_card(self, chat_id: int, t, with_versions: bool = True):
-        overview = (t["overview"] or "")[:300]
-        text = f"{_title_line(t)}\n"
-        if t["rating"]:
-            text += f"⭐ {t['rating']:.1f}\n"
-        genres = _uj(t["genres"], [])
-        if genres:
-            text += f"<i>{html.escape(', '.join(genres[:4]))}</i>\n"
-        if overview:
-            text += f"\n{html.escape(overview)}"
-        kb_rows = []
-        if t["kind"] == "movie" and with_versions:
-            files = await run_db(self._versions, t["id"])
-            kb = self._kb_versions(files)
-            if kb:
-                kb_rows = kb.inline_keyboard
-        elif t["kind"] == "series":
-            kb_rows = [[InlineKeyboardButton("📂 Browse seasons",
-                                             callback_data=f"seasons:{t['id']}")]]
-        kb_rows.append([self._app_button("🌐 Open in app", f"title_{t['id']}")])
-        kb = InlineKeyboardMarkup(kb_rows)
-        if t["poster"]:
-            try:
-                await self.client.send_photo(chat_id, t["poster"], caption=text,
-                                            parse_mode=ParseMode.HTML, reply_markup=kb)
-                return
-            except Exception:
-                pass
-        await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML,
-                                       reply_markup=kb)
-
-
     # -- mini app ---------------------------------------------------------------
     def _app_url(self, start_param: str = "") -> str:
         base = self.cfg.mini_app_url
@@ -178,6 +162,8 @@ class MediaBot:
         url = self.cfg.mini_app_url
         if start_param.startswith("title_"):
             url += f"#/title/{start_param[6:]}"
+        elif start_param.startswith("q_"):
+            url += f"#/search/{start_param[2:]}"
         return InlineKeyboardButton(text, url=url)
 
     async def _set_menu_button(self) -> None:
@@ -227,11 +213,13 @@ class MediaBot:
                 "/search <name> — search the catalog\n"
                 "/recent — recently added\n"
                 "/movies · /series — browse\n\n"
+                "Search replies with <b>one message and one button</b> — tap it "
+                "and the app opens straight on your results, with posters, all "
+                "qualities (480p/720p/1080p) grouped under one title, and "
+                "Get / Play. Files you get self-destruct in 10 minutes, "
+                "so forward them to your saved messages.\n\n"
                 "Admin: /addchannel · /rmchannel · /channels · /index · "
-                "/reparse · /setskip · /stats\n\n"
-                "Results group all qualities (480p/720p/1080p) under one title. "
-                "Tap a quality button to get the file — it self-destructs in 10 minutes, "
-                "so forward it to your saved messages.",
+                "/reparse · /setskip · /stats",
                 parse_mode=ParseMode.HTML)
 
         @c.on_message(filters.private & filters.command("search"))
@@ -251,9 +239,14 @@ class MediaBot:
             if not rows:
                 await m.reply_text("Nothing indexed yet.")
                 return
-            await m.reply_text("<b>🆕 Recently added</b>", parse_mode=ParseMode.HTML)
-            await asyncio.gather(
-                *[self._send_title_card(m.chat.id, t, with_versions=False) for t in rows])
+            # One message, like search — the old version sent a card per
+            # title (9 messages) and flooded the chat the same way.
+            lines = ["<b>🆕 Recently added</b>"]
+            lines += [_title_line(t) for t in rows]
+            lines.append("\nOpen the app to browse them with posters.")
+            kb = InlineKeyboardMarkup([[self._app_button("🌐 Open Media Library")]])
+            await m.reply_text("\n".join(lines), parse_mode=ParseMode.HTML,
+                               reply_markup=kb)
 
         @c.on_message(filters.private & filters.command(["movies", "series"]))
         async def browse(_, m: Message):
@@ -520,18 +513,41 @@ class MediaBot:
 
     # -- flows ------------------------------------------------------------------
     async def _do_search(self, chat_id: int, q: str, user_id: int):
+        """Plain-text and /search: exactly ONE reply, never a card per result.
+
+        The old version sent one photo message per match (up to 6), which
+        flooded the chat. Now the reply is a single message with a Mini App
+        button that opens straight on the search results (the query is
+        carried in the start_param), plus a shortcut to the top match.
+        """
         now = time.time()
         if now - self._spam.get(user_id, 0) < 1.5:
             return
         self._spam[user_id] = now
-        rows = await run_db(self.search_titles, q, limit=6)
+        rows = await run_db(self.search_titles, q, limit=PAGE + 1)
         if not rows:
+            kb = InlineKeyboardMarkup([[self._app_button("🌐 Open Media Library")]])
             await self.client.send_message(
-                chat_id, f"No results for <b>{html.escape(q)}</b>.\nTry another spelling.",
-                parse_mode=ParseMode.HTML)
+                chat_id, f"No results for <b>{html.escape(q)}</b>.\n"
+                         "Try another spelling, or browse the app.",
+                parse_mode=ParseMode.HTML, reply_markup=kb)
             return
-        # send cards concurrently instead of one round-trip at a time
-        await asyncio.gather(*[self._send_title_card(chat_id, t) for t in rows])
+        shown, more = rows[:PAGE], len(rows) > PAGE
+        top = shown[0]
+        text = (f"🔎 <b>{html.escape(q)}</b>\n"
+                f"{len(shown)}{'+' if more else ''} title"
+                f"{'s' if len(shown) != 1 else ''} found\n\n"
+                f"Top match: {_title_line(top)}")
+        if top["rating"]:
+            text += f" ⭐ {top['rating']:.1f}"
+        text += ("\n\nOpen the app for posters, all qualities "
+                 "and Get / Play.")
+        kb_rows = [[self._app_button("🌐 View results in app",
+                                     _search_start_param(q))],
+                   [self._app_button("Open top match in app",
+                                     f"title_{top['id']}")]]
+        await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML,
+                                       reply_markup=InlineKeyboardMarkup(kb_rows))
 
     async def _show_seasons(self, q: CallbackQuery, title_id: int):
         t = await run_db(self.db.query_one, "SELECT * FROM titles WHERE id=?",

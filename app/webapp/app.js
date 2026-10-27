@@ -475,9 +475,29 @@
   }
 
   // ---------- boot ----------
+  // Decode a base64url search query carried in a start_param (q_...) or
+  // in the #/search/... hash fallback. UTF-8 safe: atob gives latin-1
+  // bytes, which are percent-decoded back to the original string.
+  function decodeSearchParam(enc) {
+    try {
+      const b64 = enc.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = b64 + "=".repeat((4 - b64.length % 4) % 4);
+      return decodeURIComponent(Array.from(atob(padded),
+        (c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2)).join(""));
+    } catch (e) { return ""; }
+  }
+  function openSearch(q) {
+    if (!q) return false;
+    searchInput.value = q; clearBtn.hidden = false; route();
+    return true;
+  }
   const startParam = tg && tg.initDataUnsafe ? (tg.initDataUnsafe.start_param || "") : "";
   const sp = startParam.match(/^title_(\d+)$/);
+  const sq = startParam.match(/^q_([A-Za-z0-9_-]+)$/);
+  const hashSearch = location.hash.match(/^#\/search\/([A-Za-z0-9_-]+)/);
   if (sp) { if (tg && tg.BackButton) tg.BackButton.show(); titlePage(+sp[1]); }
+  else if (sq && openSearch(decodeSearchParam(sq[1]))) { /* searched */ }
+  else if (hashSearch && openSearch(decodeSearchParam(hashSearch[1]))) { /* searched */ }
   else if (/^#\/title\/\d+/.test(location.hash)) route();
   else home();
   window.addEventListener("load", hideSplash);

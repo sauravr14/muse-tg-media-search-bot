@@ -516,9 +516,9 @@ class MediaBot:
         """Plain-text and /search: exactly ONE reply, never a card per result.
 
         The old version sent one photo message per match (up to 6), which
-        flooded the chat. Now the reply is a single message with a Mini App
+        flooded the chat. Now the reply is a single message with one Mini App
         button that opens straight on the search results (the query is
-        carried in the start_param), plus a shortcut to the top match.
+        carried in the start_param).
         """
         now = time.time()
         if now - self._spam.get(user_id, 0) < 1.5:
@@ -543,9 +543,7 @@ class MediaBot:
         text += ("\n\nOpen the app for posters, all qualities "
                  "and Get / Play.")
         kb_rows = [[self._app_button("🌐 View results in app",
-                                     _search_start_param(q))],
-                   [self._app_button("Open top match in app",
-                                     f"title_{top['id']}")]]
+                                     _search_start_param(q))]]
         await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML,
                                        reply_markup=InlineKeyboardMarkup(kb_rows))
 

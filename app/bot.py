@@ -13,7 +13,7 @@ import logging
 import re
 import time
 
-from pyrogram import Client, StopPropagation, filters
+from pyrogram import Client, ContinuePropagation, StopPropagation, filters
 from pyrogram.enums import ParseMode
 import aiohttp
 
@@ -314,15 +314,23 @@ class MediaBot:
         # the chat. Bot's own messages are never recorded.
         @c.on_message(filters.private)
         async def track_private(_, m: Message):
-            # Fire-and-forget, never awaited: Pyrogram runs an update's
-            # handlers in order on one task, so awaiting a DB write here
-            # blocked /start, /id and search replies for as long as a
-            # long enricher merge held the SQLite write lock (seen live
-            # 2026-10-28: track logged, no reply handler ever ran, and a
-            # fresh connection could not get BEGIN IMMEDIATE for minutes).
-            # Tracking is best-effort: it completes when the lock frees,
-            # and a lost update on restart costs one row, not a reply.
+            # Fire-and-forget, never awaited: awaiting a DB write here
+            # would also delay replies while a slow commit held the
+            # SQLite write lock. Tracking is best-effort: it completes
+            # when the lock frees, and a lost update on restart costs
+            # one row, not a reply.
+            # CRITICAL (2026-10-28 outage): Pyrogram stops at the FIRST
+            # matching handler in a group (it breaks after one match).
+            # This handler matches EVERY private message and is registered
+            # first, so without ContinuePropagation it shadowed /start,
+            # /id, /search, /stats and every other private handler —
+            # messages were tracked (users table grew) but no reply ever
+            # ran, for admin and non-admin alike, while Mini App API
+            # (which bypasses the dispatcher) kept working. Raising
+            # ContinuePropagation lets the dispatcher move on to the
+            # real handler for this message.
             asyncio.create_task(self._track_private(m))
+            raise ContinuePropagation
 
         @c.on_message(filters.group)
         async def track_group(_, m: Message):
@@ -335,6 +343,8 @@ class MediaBot:
                 except Exception as e:
                     log.warning("chat upsert failed: %r", e)
             asyncio.create_task(_track_group())
+            # Same first-match-break reason as track_private above.
+            raise ContinuePropagation
 
         @c.on_chat_member_updated()
         async def track_member(_, u):
@@ -368,9 +378,15 @@ class MediaBot:
             uid = m.from_user.id if m.from_user else 0
             st = self._pending_get(uid)
             if not st:
-                return
+                # No pending prompt: this handler must NOT shadow the
+                # real command/search handler (same first-match-break
+                # trap as track_private — it matches every admin private
+                # text/photo message). Let the dispatcher continue.
+                raise ContinuePropagation
             if (m.text or "").startswith("/"):
-                return
+                # Commands bypass a pending prompt (e.g. /cancel, /start)
+                # — again, continue instead of shadowing the command.
+                raise ContinuePropagation
             try:
                 await self._handle_pending(m, st["kind"])
             except Exception as e:

@@ -16,12 +16,23 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _parse_ids(raw: str) -> tuple[int, ...]:
+    ids = []
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            ids.append(int(part))
+    return tuple(ids)
+
+
 @dataclass
 class Config:
     bot_token: str = field(default_factory=lambda: os.environ.get("BOT_TOKEN", ""))
     api_id: int = field(default_factory=lambda: _int("API_ID", 0))
     api_hash: str = field(default_factory=lambda: os.environ.get("API_HASH", ""))
     admin_ids: tuple[int, ...] = field(default_factory=tuple)
+    sudo_ids: tuple[int, ...] = field(default_factory=tuple)
+    log_channel_id: int = field(default_factory=lambda: _int("LOG_CHANNEL_ID", 0))
     tmdb_api_key: str = field(default_factory=lambda: os.environ.get("TMDB_API_KEY", ""))
     openrouter_key: str = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY", ""))
     llm_model: str = field(default_factory=lambda: os.environ.get("LLM_MODEL", "liquid/lfm-2.5-2.6b:free"))
@@ -39,13 +50,8 @@ class Config:
     stream_secret: str = field(default_factory=lambda: os.environ.get("STREAM_SECRET", ""))
 
     def __post_init__(self) -> None:
-        raw = os.environ.get("ADMIN_USER_IDS", "")
-        ids = []
-        for part in raw.replace(";", ",").split(","):
-            part = part.strip()
-            if part.lstrip("-").isdigit():
-                ids.append(int(part))
-        self.admin_ids = tuple(ids)
+        self.admin_ids = _parse_ids(os.environ.get("ADMIN_USER_IDS", ""))
+        self.sudo_ids = _parse_ids(os.environ.get("SUDO_USER_IDS", ""))
 
     @property
     def has_llm(self) -> bool:
@@ -60,7 +66,18 @@ class Config:
         return bool(self.mn_imdb_base_url)
 
     def is_admin(self, user_id: int | None) -> bool:
+        """Owner only. API admin routes and owner-only bot commands use this."""
         return bool(user_id) and user_id in self.admin_ids
+
+    def is_owner(self, user_id: int | None) -> bool:
+        return self.is_admin(user_id)
+
+    def is_sudo(self, user_id: int | None) -> bool:
+        return bool(user_id) and user_id in self.sudo_ids
+
+    def is_privileged(self, user_id: int | None) -> bool:
+        """Owner + sudo: operational commands only (index, addchannel...)."""
+        return self.is_owner(user_id) or self.is_sudo(user_id)
 
 
 cfg = Config()

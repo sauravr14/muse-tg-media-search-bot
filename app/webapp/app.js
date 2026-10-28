@@ -62,11 +62,35 @@
     if (opt.signal) opt.signal.addEventListener("abort", () => ctl.abort());
     const timer = setTimeout(() => ctl.abort(), opt.ms || 15000);
     try {
-      const r = await fetch(API_BASE + path + (camOn ? sep + "hide_cam=1" : ""), { signal: ctl.signal });
+      const r = await fetch(API_BASE + path + (camOn ? sep + "hide_cam=1" : ""), {
+        signal: ctl.signal,
+        // Sent on every catalog call: when force-subscribe is on, the
+        // backend uses this to check channel membership. When it is off,
+        // the backend ignores the header and stays anonymous.
+        headers: { "x-telegram-init-data": tg ? tg.initData : "" },
+      });
+      if (r.status === 403) {
+        let d = null; try { d = await r.json(); } catch (e) {}
+        if (d && d.fsub_required) { const e = new Error("fsub_required"); e.fsub = d.channels || []; throw e; }
+        throw new Error("HTTP 403");
+      }
       if (!r.ok) throw new Error("HTTP " + r.status);
       return await r.json();
     } finally { clearTimeout(timer); }
   };
+  // Force-subscribe join screen: shown when the backend says this user
+  // must join channels first (only possible when force-subscribe is on).
+  function showFsub(channels) {
+    const links = (channels || []).map((ch) => {
+      const url = ch.invite_link || (ch.username ? "https://t.me/" + ch.username : "");
+      const name = esc(ch.title || ch.chat_id);
+      return url ? `<a class="btn ghost" href="${url}" target="_blank" rel="noopener">📢 Join ${name}</a>`
+                 : `<div class="empty" style="padding:8px">${name}</div>`;
+    }).join("");
+    view.innerHTML = `<div class="section-title">🔒 Join to continue</div>
+      <div class="pad" style="line-height:1.6">Join the channel(s) below, then reopen the app or search again.</div>
+      <div class="pad" style="display:flex;flex-direction:column;gap:8px;margin-top:12px">${links}</div>`;
+  }
 
   // ---------- components ----------
   const FALLBACK = `<div class="poster-fallback">🎬</div>`;
@@ -141,7 +165,8 @@
       store.set(ck, d);
       if (currentRoute() === "home") renderHome(d);
     } catch (e) {
-      if (!cached) view.innerHTML = `<div class="empty"><span class="big">📡</span>Couldn't load.<br><br><button class="btn" id="retry">Retry</button></div>`,
+      if (e.fsub) { showFsub(e.fsub); }
+      else if (!cached) view.innerHTML = `<div class="empty"><span class="big">📡</span>Couldn't load.<br><br><button class="btn" id="retry">Retry</button></div>`,
         ($("retry") || {}).onclick = home;
     } finally { progress(false); }
   }
@@ -158,7 +183,7 @@
       const d = await api(`/api/browse?kind=${kind}&sort=${bs.sort}&page=1&per=30`);
       bs.page = 2; bs.hasMore = d.has_more;
       renderBrowse(d);
-    } catch (e) { view.innerHTML = `<div class="empty"><span class="big">📡</span>Couldn't load.</div>`; }
+    } catch (e) { if (e.fsub) showFsub(e.fsub); else view.innerHTML = `<div class="empty"><span class="big">📡</span>Couldn't load.</div>`; }
     finally { progress(false); }
   }
   function renderBrowse(d) {
@@ -232,7 +257,8 @@
       if (searchInput.value.trim() === q) { renderSearch(q, d); if (d.results.length) pushRecent(q); }
     } catch (e) {
       if (myCtl.signal.aborted && searchCtl !== myCtl) return;
-      view.innerHTML = `<div class="empty"><span class="big">📡</span>Search failed. Try again.</div>`;
+      if (e.fsub) { showFsub(e.fsub); }
+      else view.innerHTML = `<div class="empty"><span class="big">📡</span>Search failed. Try again.</div>`;
     } finally { progress(false); }
   }
   function renderSearch(q, d) {
@@ -308,7 +334,7 @@
       }
       bindGet();
       bindPlay();
-    } catch (e) { view.innerHTML = `<div class="empty"><span class="big">⚠️</span>Couldn't load this title.</div>`; }
+    } catch (e) { if (e.fsub) showFsub(e.fsub); else view.innerHTML = `<div class="empty"><span class="big">⚠️</span>Couldn't load this title.</div>`; }
     finally { progress(false); }
   }
   function verRow(v, label) {
@@ -330,14 +356,15 @@
           headers: { "Content-Type": "application/json", "x-telegram-init-data": tg ? tg.initData : "" },
           body: JSON.stringify({ file_id: +b.dataset.file }), signal: ctl.signal,
         }).finally(() => clearTimeout(t));
-        if (!r.ok) { const msg = await r.text(); throw new Error(msg.includes("not_started") ? "not_started" : msg); }
+        if (!r.ok) { const msg = await r.text(); throw new Error(msg.includes("fsub_required") ? "fsub_required" : (msg.includes("not_started") ? "not_started" : msg)); }
         haptic("ok"); toast("📩 File sent to your chat!");
         b.textContent = "✓ Sent"; setTimeout(() => { b.textContent = old; b.disabled = false; }, 2500);
         return;
       } catch (e) {
         haptic("err");
         toast(e.message === "not_started" ? "Open the bot chat and press START first, then tap Get again."
-          : "Couldn't send the file. Try again.");
+          : (e.message === "fsub_required" ? "Join the required channels first, then tap Get again."
+          : "Couldn't send the file. Try again."));
       }
       b.disabled = false; b.textContent = old;
     }));
@@ -355,12 +382,13 @@
           headers: { "Content-Type": "application/json", "x-telegram-init-data": tg ? tg.initData : "" },
           body: JSON.stringify({ file_id: +b.dataset.play }), signal: ctl.signal,
         }).finally(() => clearTimeout(t));
-        if (!r.ok) throw new Error(await r.text());
+        if (!r.ok) { const msg = await r.text(); throw new Error(msg.includes("fsub_required") ? "fsub_required" : msg); }
         const d = await r.json();
         openPlayer(d.url, d.name || "Video");
       } catch (e) {
         haptic("err");
-        toast("Couldn't start playback. Try again.");
+        toast(e.message === "fsub_required" ? "Join the required channels first, then try playing again."
+          : "Couldn't start playback. Try again.");
       }
       b.disabled = false; b.textContent = old;
     }));

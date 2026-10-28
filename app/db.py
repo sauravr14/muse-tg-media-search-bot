@@ -195,6 +195,19 @@ class DB:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=30000")
+            # 2026-10-28: the reply outage. With the default FULL sync,
+            # every commit fsyncs on this VPS's slow disk, so a batch
+            # commit / title merge held the write lock for seconds at a
+            # time, back to back. Handler tasks waiting on that lock
+            # starved, and no command got a reply at all, while reads
+            # (Mini App) kept working. NORMAL in WAL mode skips the
+            # per-commit fsync (still safe across a process crash; only
+            # an OS crash could lose the last transactions, and this
+            # catalog is re-indexable), so commits drop to milliseconds
+            # and the lock stops starving user commands.
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-64000")
+            conn.execute("PRAGMA temp_store=MEMORY")
             self._local.conn = conn
         return conn
 

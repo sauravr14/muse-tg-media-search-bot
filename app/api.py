@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import Config
 from .db import DB, RES_ORDER, _uj
+from .owner import fsub_list
 from .dbthread import run_db
 from .streamer import (MAX_STREAMS, ByteStreamer, StreamFileNotFound,
                        parse_range, sign_token, stream_secret, verify_token)
@@ -99,6 +100,37 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
             raise HTTPException(403, "admin only")
         return int(data["user_id"])
 
+    # -- force subscribe ---------------------------------------------------------
+    # Catalog browsing is gated ONLY when fsub is non-empty. When it is
+    # empty, behaviour is exactly the old anonymous behaviour (no initData
+    # required). When non-empty, the webapp sends initData and we return
+    # 403 {"fsub_required": true, "channels": [...]} for unjoined users
+    # (or for unverifiable users, so the app can show the join list).
+    # Get/stream already require initData, so they gate on the real user id.
+    # If bot is None (test app without a client), catalog gating fails open
+    # — production always passes bot (main.py), so this only affects tests.
+    async def _fsub_gate(request: Request, user_id: int | None):
+        entries = await run_db(fsub_list, db)
+        if not entries:
+            return None
+        if user_id is None:
+            return entries
+        if bot is None:
+            return None
+        unjoined = await bot.unjoined_fsub(int(user_id))
+        return unjoined or None
+
+    def _fsub_response(channels):
+        return JSONResponse(status_code=403,
+                            content={"fsub_required": True, "channels": channels})
+
+    async def _catalog_gate(request: Request):
+        init_data = request.headers.get("x-telegram-init-data", "")
+        data = validate_init_data(init_data, cfg.bot_token) if init_data else None
+        user_id = (data or {}).get("user_id")
+        gated = await _fsub_gate(request, user_id)
+        return _fsub_response(gated) if gated else None
+
     @app.get("/healthz")
     async def healthz():
         return {"ok": True}
@@ -109,6 +141,9 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                      kind: str = "", page: int = 1, hide_cam: int = 0):
         if not limiter.check(request.client.host if request.client else "?"):
             raise HTTPException(429, "slow down")
+        gated = await _catalog_gate(request)
+        if gated is not None:
+            return gated
         q = q.strip()
         if not q:
             return {"results": [], "page": page}
@@ -143,7 +178,10 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         return {"results": [_title_card(t) for t in rows], "page": page}
 
     @app.get("/api/recent")
-    async def recent(kind: str = "", limit: int = 24, hide_cam: int = 0):
+    async def recent(request: Request, kind: str = "", limit: int = 24, hide_cam: int = 0):
+        gated = await _catalog_gate(request)
+        if gated is not None:
+            return gated
         limit = min(max(limit, 1), 60)
         where = " WHERE kind=? " if kind in ("movie", "series") else " WHERE 1=1 "
         rows = await run_db(
@@ -156,7 +194,10 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         return {"results": [_title_card(t) for t in rows]}
 
     @app.get("/api/home")
-    async def home(hide_cam: int = 0):
+    async def home(request: Request, hide_cam: int = 0):
+        gated = await _catalog_gate(request)
+        if gated is not None:
+            return gated
         """Everything the Home tab needs in one request: a hero carousel
         (TMDB-matched titles with backdrops) plus poster-first rails.
         Ported from the 2026-10-22 optimized build's /api/home onto this
@@ -211,6 +252,9 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         user_id = (data or {}).get("user_id")
         if not user_id:
             raise HTTPException(401, "open this app from Telegram")
+        gated = await _fsub_gate(request, int(user_id))
+        if gated:
+            return _fsub_response(gated)
         try:
             body = await request.json()
         except Exception:
@@ -234,6 +278,9 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         data = validate_init_data(init_data, cfg.bot_token) if init_data else None
         if not data or not data.get("user_id"):
             raise HTTPException(401, "open this app from Telegram")
+        gated = await _fsub_gate(request, int(data["user_id"]))
+        if gated:
+            return _fsub_response(gated)
         try:
             body = await request.json()
         except Exception:
@@ -309,9 +356,12 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                                  headers=headers)
 
     @app.get("/api/browse")
-    async def browse(kind: str = "", sort: str = "recent",
+    async def browse(request: Request, kind: str = "", sort: str = "recent",
                      page: int = 1, per: int = 30, hide_cam: int = 0):
         """Paginated full catalog for the Movies/Series tabs."""
+        gated = await _catalog_gate(request)
+        if gated is not None:
+            return gated
         sorts = {
             "recent": "last_file_at DESC",
             "az": "title COLLATE NOCASE ASC",
@@ -336,7 +386,10 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                 "per": per, "total": total, "has_more": page * per < total}
 
     @app.get("/api/title/{title_id}")
-    async def title_detail(title_id: int, hide_cam: int = 0):
+    async def title_detail(request: Request, title_id: int, hide_cam: int = 0):
+        gated = await _catalog_gate(request)
+        if gated is not None:
+            return gated
         t = await run_db(db.query_one, "SELECT * FROM titles WHERE id=?",
                          (title_id,))
         if not t:

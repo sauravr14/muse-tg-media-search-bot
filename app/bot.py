@@ -13,13 +13,14 @@ import logging
 import re
 import time
 
-from pyrogram import Client, filters
+from pyrogram import Client, StopPropagation, filters
 from pyrogram.enums import ParseMode
 import aiohttp
 
 from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
                             InlineKeyboardMarkup, Message, WebAppInfo)
 
+from . import owner as owner_mod
 from .config import Config
 from .db import DB, RES_ORDER
 from .dbthread import run_db
@@ -99,6 +100,12 @@ class MediaBot:
         self.username = ""
         self.panel = None  # IndexPanel, attached in main.py once indexer exists
         self._spam: dict[int, float] = {}
+        self._self_id = 0
+        # owner-only pending prompts: user_id -> {"kind": ..., "ts": ...}
+        # kinds: start_photo, fsub_add, log_set, broadcast (draft kept in
+        # _bc_draft). Expires after 10 min; /cancel clears it.
+        self._pending: dict[int, dict] = {}
+        self._bc_draft: dict[int, dict] = {}
         self._register()
 
     # -- search ---------------------------------------------------------------
@@ -182,10 +189,175 @@ class MediaBot:
         except Exception as e:
             log.warning("setChatMenuButton failed: %r", e)
 
+    # -- owner features -----------------------------------------------------------
+    def _is_owner(self, user_id) -> bool:
+        return self.cfg.is_owner(user_id)
+
+    def _is_privileged(self, user_id) -> bool:
+        return self.cfg.is_privileged(user_id)
+
+    async def _self_id(self) -> int:
+        if not self._self_id:
+            try:
+                me = await self.client.get_me()
+                self._self_id = me.id or 0
+            except Exception:
+                pass
+        return self._self_id
+
+    def _pending_get(self, user_id: int):
+        st = self._pending.get(user_id)
+        if not st or time.time() - st.get("ts", 0) > 600:
+            self._pending.pop(user_id, None)
+            return None
+        return st
+
+    def _pending_set(self, user_id: int, kind: str) -> None:
+        self._pending[user_id] = {"kind": kind, "ts": time.time()}
+
+    def _pending_clear(self, user_id: int) -> None:
+        self._pending.pop(user_id, None)
+        self._bc_draft.pop(user_id, None)
+
+    @staticmethod
+    def _chat_type_name(chat) -> str:
+        t = getattr(chat, "type", "") or ""
+        if hasattr(t, "value"):
+            t = t.value
+        return str(t).lower().split(".")[-1]
+
+    async def _track_private(self, m: Message) -> None:
+        u = m.from_user
+        if not u or getattr(u, "is_bot", False):
+            return
+        try:
+            await run_db(self.db.upsert_user, u.id, u.username or "",
+                         u.first_name or "", u.last_name or "",
+                         m.text or m.caption or "")
+        except Exception as e:
+            log.warning("user upsert failed: %r", e)
+        await self._log_user_message(m)
+
+    async def _log_user_message(self, m: Message) -> None:
+        u = m.from_user
+        if not u or not owner_mod.should_log_user(
+                u.id, self._is_privileged(u.id)):
+            return
+        try:
+            channel = await run_db(owner_mod.resolve_log_channel, self.db,
+                                   self.cfg.log_channel_id)
+            if not channel:
+                return
+            text = m.text or m.caption or "[non-text message]"
+            msg = owner_mod.format_log_message(
+                time.time(), u.id, u.username or "",
+                f"{u.first_name or ''} {u.last_name or ''}".strip(), text)
+            await self.client.send_message(channel, msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("live log failed: %r", e)
+
+    async def _unjoined(self, user_id: int) -> list:
+        entries = await run_db(owner_mod.fsub_list, self.db)
+        return await owner_mod.unjoined_channels(
+            self.client, user_id, entries, self._is_privileged(user_id))
+
+    async def _send_fsub_prompt(self, chat_id: int, unjoined: list) -> None:
+        await self.client.send_message(
+            chat_id,
+            "🔒 <b>Join these channels first</b> to use the bot and the "
+            "Media Library app, then tap “I've joined” below.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=owner_mod.fsub_join_keyboard(unjoined))
+
+    async def unjoined_fsub(self, user_id: int) -> list:
+        """Used by the Mini App API (api.py)."""
+        return await self._unjoined(user_id)
+
+    def _start_kb(self, is_owner: bool) -> InlineKeyboardMarkup:
+        return owner_mod.build_start_keyboard(self._app_button, is_owner)
+
+    async def _send_start(self, chat_id: int, user_id: int) -> None:
+        unjoined = await self._unjoined(user_id)
+        if unjoined:
+            await self._send_fsub_prompt(chat_id, unjoined)
+            return
+        text = await run_db(owner_mod.get_start_text, self.db)
+        photo = await run_db(owner_mod.get_start_photo, self.db)
+        kb = self._start_kb(self._is_owner(user_id))
+        if photo:
+            try:
+                await self.client.send_photo(chat_id, photo,
+                                             caption=text[:1024],
+                                             parse_mode=ParseMode.HTML,
+                                             reply_markup=kb)
+                return
+            except Exception as e:
+                log.warning("start photo failed, falling back to text: %r", e)
+        await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML,
+                                       reply_markup=kb)
+
     # -- handlers ---------------------------------------------------------------
     def _register(self):
         c = self.client
         admin_ids = list(self.cfg.admin_ids)
+        priv_ids = list(self.cfg.admin_ids) + list(self.cfg.sudo_ids)
+
+        # Tracking runs first and never stops other handlers: every private
+        # message records the user (+ live log), every group message records
+        # the chat. Bot's own messages are never recorded.
+        @c.on_message(filters.private)
+        async def track_private(_, m: Message):
+            await self._track_private(m)
+
+        @c.on_message(filters.group)
+        async def track_group(_, m: Message):
+            try:
+                await run_db(self.db.upsert_chat, m.chat.id,
+                             self._chat_type_name(m.chat),
+                             m.chat.title or "", m.chat.username or "")
+            except Exception as e:
+                log.warning("chat upsert failed: %r", e)
+
+        @c.on_chat_member_updated()
+        async def track_member(_, u):
+            try:
+                new = u.new_chat_member
+                if not new or not new.user:
+                    return
+                if new.user.id != await self._self_id() or not self._self_id:
+                    return
+                status = getattr(new, "status", "")
+                if hasattr(status, "value"):
+                    status = status.value
+                status = str(status).lower().split(".")[-1]
+                if status in ("member", "administrator", "creator", "restricted"):
+                    await run_db(self.db.upsert_chat, u.chat.id,
+                                 self._chat_type_name(u.chat),
+                                 u.chat.title or "", u.chat.username or "")
+                elif status in ("left", "kicked"):
+                    await run_db(self.db.execute,
+                                 "DELETE FROM chats WHERE chat_id=?",
+                                 (u.chat.id,))
+            except Exception as e:
+                log.warning("member track failed: %r", e)
+
+        # Owner-only pending prompts (settings flows). Consumes the message
+        # so it never also triggers a search or an index flow; /cancel or a
+        # command bypasses it.
+        @c.on_message(filters.private & filters.user(admin_ids)
+                       & (filters.text | filters.photo))
+        async def pending_owner(_, m: Message):
+            uid = m.from_user.id if m.from_user else 0
+            st = self._pending_get(uid)
+            if not st:
+                return
+            if (m.text or "").startswith("/"):
+                return
+            try:
+                await self._handle_pending(m, st["kind"])
+            except Exception as e:
+                log.warning("pending prompt failed: %r", e)
+            raise StopPropagation
 
         @c.on_message(filters.private & filters.command("start"))
         async def start(_, m: Message):
@@ -193,13 +365,7 @@ class MediaBot:
             if len(arg) > 1 and arg[1].startswith("file_"):
                 await self._deliver_file(m.chat.id, arg[1][5:], m.from_user.id)
                 return
-            kb = InlineKeyboardMarkup([[self._app_button("🌐 Open Media Library")]])
-            await m.reply_text(
-                "🎬 <b>Media Library</b>\n\n"
-                "Search movies & series from our channels.\n"
-                "Just type a name, or use:\n"
-                "/search <name> · /recent · /movies · /series · /help",
-                parse_mode=ParseMode.HTML, reply_markup=kb)
+            await self._send_start(m.chat.id, m.from_user.id)
 
         @c.on_message(filters.private & filters.command("id"))
         async def whoami(_, m: Message):
@@ -219,7 +385,7 @@ class MediaBot:
                 "Get / Play. Files you get self-destruct in 10 minutes, "
                 "so forward them to your saved messages.\n\n"
                 "Admin: /addchannel · /rmchannel · /channels · /index · "
-                "/reparse · /setskip · /stats",
+                "/reparse · /setskip · /stats · /settings · /users · /broadcast",
                 parse_mode=ParseMode.HTML)
 
         @c.on_message(filters.private & filters.command("search"))
@@ -232,6 +398,10 @@ class MediaBot:
 
         @c.on_message(filters.private & filters.command("recent"))
         async def recent(_, m: Message):
+            unjoined = await self._unjoined(m.from_user.id)
+            if unjoined:
+                await self._send_fsub_prompt(m.chat.id, unjoined)
+                return
             rows = await run_db(
                 self.db.query,
                 "SELECT * FROM titles ORDER BY (poster != '') DESC, "
@@ -250,6 +420,10 @@ class MediaBot:
 
         @c.on_message(filters.private & filters.command(["movies", "series"]))
         async def browse(_, m: Message):
+            unjoined = await self._unjoined(m.from_user.id)
+            if unjoined:
+                await self._send_fsub_prompt(m.chat.id, unjoined)
+                return
             kind = "movie" if m.command[0] == "movies" else "series"
             rows = await run_db(
                 self.db.query,
@@ -268,7 +442,7 @@ class MediaBot:
         # NOTE: uses the robust is_forwarded check (all origin attributes),
         # not filters.forwarded — forward_date alone can be None/0 on some
         # Pyrogram builds and the forward would be silently ignored.
-        @c.on_message(filters.private & is_forwarded & filters.user(admin_ids))
+        @c.on_message(filters.private & is_forwarded & filters.user(priv_ids))
         async def forward_index(_, m: Message):
             fwd = m.forward_from_chat
             fwd_id = m.forward_from_message_id
@@ -281,7 +455,7 @@ class MediaBot:
                     "Send a post link instead: <code>https://t.me/channelname/123</code>",
                     parse_mode=ParseMode.HTML)
 
-        @c.on_message(filters.private & filters.text & filters.user(admin_ids)
+        @c.on_message(filters.private & filters.text & filters.user(priv_ids)
                        & filters.regex(LINK_RE))
         async def link_index(_, m: Message):
             parsed = _parse_post_link(m.text)
@@ -326,6 +500,34 @@ class MediaBot:
                         await q.message.edit_text("Cancelled.")
                     except Exception:
                         pass
+                elif data in ("help", "about"):
+                    await self._help_about_callback(q, data)
+                elif data == "back_start":
+                    await q.answer()
+                    try:
+                        await q.message.delete()
+                    except Exception:
+                        pass
+                    await self._send_start(q.message.chat.id, q.from_user.id)
+                elif data == "fsub_check":
+                    unjoined = await self._unjoined(q.from_user.id)
+                    if unjoined:
+                        await q.answer("You haven't joined all channels yet.",
+                                       show_alert=True)
+                    else:
+                        await q.answer("Welcome back!")
+                        try:
+                            await q.message.delete()
+                        except Exception:
+                            pass
+                        await self._send_start(q.message.chat.id, q.from_user.id)
+                elif data.startswith("settings:") or data.startswith("fsub:") \
+                        or data.startswith("log:") or data.startswith("users:") \
+                        or data.startswith("bc:"):
+                    if not self._is_owner(q.from_user.id):
+                        await q.answer("Owner only.", show_alert=True)
+                    else:
+                        await self._owner_callback(q, data)
                 else:
                     await q.answer()
             except Exception as e:
@@ -344,8 +546,9 @@ class MediaBot:
 
     def _register_admin(self, c):
         admin_ids = list(self.cfg.admin_ids)
+        priv_ids = list(self.cfg.admin_ids) + list(self.cfg.sudo_ids)
 
-        @c.on_message(filters.private & filters.command("addchannel") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("addchannel") & filters.user(priv_ids))
         async def addchannel(_, m: Message):
             arg = m.text.partition(" ")[2].strip()
             if not arg:
@@ -381,7 +584,7 @@ class MediaBot:
             await run_db(self.db.remove_source, cid)
             await m.reply_text(f"Removed <code>{cid}</code>.", parse_mode=ParseMode.HTML)
 
-        @c.on_message(filters.private & filters.command("channels") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("channels") & filters.user(priv_ids))
         async def channels(_, m: Message):
             rows = await run_db(self.db.list_sources)
             if not rows:
@@ -398,20 +601,20 @@ class MediaBot:
                              f"— {n} files — {s['status']}")
             await m.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
-        @c.on_message(filters.private & filters.command("index") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("index") & filters.user(priv_ids))
         async def index(_, m: Message):
             await m.reply_text("🔄 Full scan started in the background — "
                                "I'll report here when it's done.")
             asyncio.create_task(self._index_all_report(m.chat.id))
 
-        @c.on_message(filters.private & filters.command("indexstatus") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("indexstatus") & filters.user(priv_ids))
         async def indexstatus(_, m: Message):
             if self.panel:
                 await self.panel.show(m)
             else:
                 await m.reply_text("Panel not ready yet — try again in a few seconds.")
 
-        @c.on_message(filters.private & filters.command("stopindex") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("stopindex") & filters.user(priv_ids))
         async def stopindex(_, m: Message):
             """Stop the running scan (/stopindex [channel_id]); the scan
             finishes its current batch, keeps its checkpoint, and stays
@@ -449,7 +652,7 @@ class MediaBot:
                                "posters and matches stay intact. I'll report when done.")
             asyncio.create_task(self._cleanup_report(m.chat.id))
 
-        @c.on_message(filters.private & filters.command("setskip") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("setskip") & filters.user(priv_ids))
         async def setskip(_, m: Message):
             """Skip the first N messages of a channel when scanning.
 
@@ -501,7 +704,7 @@ class MediaBot:
             await m.reply_text(f"✅ Skip set to <b>{n}</b> for <code>{cid}</code>.",
                                parse_mode=ParseMode.HTML)
 
-        @c.on_message(filters.private & filters.command("stats") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("stats") & filters.user(priv_ids))
         async def stats(_, m: Message):
             s = await run_db(self.db.stats)
             await m.reply_text(
@@ -510,6 +713,422 @@ class MediaBot:
                 f"Series: <b>{s['series']}</b> · Episodes: <b>{s['episodes']}</b>\n"
                 f"Sources: <b>{s['sources']}</b> · Unmatched: <b>{s['unmatched']}</b>",
                 parse_mode=ParseMode.HTML)
+
+        # ---- owner-only: settings, users, broadcast, cancel ----
+        @c.on_message(filters.private & filters.command("settings") & filters.user(admin_ids))
+        async def settings_cmd(_, m: Message):
+            await self._settings_send(m.chat.id)
+
+        @c.on_message(filters.private & filters.command("cancel") & filters.user(admin_ids))
+        async def cancel_cmd(_, m: Message):
+            self._pending_clear(m.from_user.id)
+            await m.reply_text("Cancelled — no setting was changed.")
+
+        @c.on_message(filters.private & filters.command("users") & filters.user(admin_ids))
+        async def users_cmd(_, m: Message):
+            await self._users_send(m.chat.id, 0)
+
+        @c.on_message(filters.private & filters.command("broadcast") & filters.user(admin_ids))
+        async def broadcast_cmd(_, m: Message):
+            text = m.text.partition(" ")[2].strip()
+            if not text:
+                self._pending_set(m.from_user.id, "broadcast")
+                await m.reply_text(
+                    "📣 Send the broadcast message now (text, or a photo with a "
+                    "caption). I'll show a preview with Send / Cancel before "
+                    "anything goes out. /cancel to abort.")
+                return
+            self._bc_draft[m.from_user.id] = {"text": text, "photo": None}
+            await self._broadcast_preview(m.chat.id, m.from_user.id)
+
+    # -- owner flows (settings, users, broadcast, pending prompts) --------------
+    HELP_TEXT = (
+        "🔎 <b>Search</b> — just type a movie/series name.\n"
+        "/search &lt;name&gt; — search the catalog\n"
+        "/recent — recently added\n"
+        "/movies · /series — browse\n\n"
+        "Search replies with <b>one message and one button</b> — tap it "
+        "and the app opens straight on your results, with posters, all "
+        "qualities (480p/720p/1080p) grouped under one title, and "
+        "Get / Play. Files you get self-destruct in 10 minutes, "
+        "so forward them to your saved messages.")
+    ABOUT_TEXT = (
+        "🎬 <b>Core TG Media Library</b>\n\n"
+        "Find movies & series from our channels, instantly, with posters "
+        "and every quality grouped under one title.\n\n"
+        "Just type a movie or series name in this chat, or open the app.")
+
+    async def _help_about_callback(self, q: CallbackQuery, which: str) -> None:
+        text = self.HELP_TEXT if which == "help" else self.ABOUT_TEXT
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "⬅ Back", callback_data="back_start")]])
+        try:
+            await q.message.edit_text(text, parse_mode=ParseMode.HTML,
+                                      reply_markup=kb)
+        except Exception:
+            await q.answer("Open the start card again with /start.")
+            return
+        await q.answer()
+
+    async def _settings_text(self) -> str:
+        photo = await run_db(owner_mod.get_start_photo, self.db)
+        fsub = await run_db(owner_mod.fsub_list, self.db)
+        log_ch = await run_db(owner_mod.resolve_log_channel, self.db,
+                              self.cfg.log_channel_id)
+        return (
+            "⚙️ <b>Settings</b> (owner only)\n\n"
+            f"📸 Start photo: {'set ✅' if photo else 'not set'}\n"
+            f"🔒 Force subscribe: {len(fsub)} channel(s)\n"
+            f"📋 Live logs: {'<code>' + str(log_ch) + '</code>' if log_ch else 'off'}\n"
+            f"👥 Users recorded: <b>{await run_db(self.db.count_users)}</b>")
+
+    def _settings_kb(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📸 Start Photo", callback_data="settings:photo")],
+            [InlineKeyboardButton("🔒 Force Subscribe", callback_data="settings:fsub")],
+            [InlineKeyboardButton("📋 Live Logs", callback_data="settings:logs")],
+            [InlineKeyboardButton("👥 Users", callback_data="settings:users"),
+             InlineKeyboardButton("📣 Broadcast", callback_data="settings:broadcast")],
+        ])
+
+    async def _settings_send(self, chat_id: int) -> None:
+        await self.client.send_message(chat_id, await self._settings_text(),
+                                       parse_mode=ParseMode.HTML,
+                                       reply_markup=self._settings_kb())
+
+    async def _edit_or_send(self, q: CallbackQuery, text: str,
+                            kb: InlineKeyboardMarkup) -> None:
+        try:
+            await q.message.edit_text(text, parse_mode=ParseMode.HTML,
+                                      reply_markup=kb)
+        except Exception:
+            await self.client.send_message(q.message.chat.id, text,
+                                           parse_mode=ParseMode.HTML,
+                                           reply_markup=kb)
+        await q.answer()
+
+    async def _users_text(self, offset: int) -> tuple[str, InlineKeyboardMarkup]:
+        total = await run_db(self.db.count_users)
+        rows = await run_db(self.db.list_users, owner_mod.USERS_PAGE, offset)
+        lines = [f"👥 <b>Users</b> — {total} total "
+                 f"(showing {offset + 1}–{offset + len(rows)} of {total})"]
+        if not rows:
+            lines.append("\nNo users recorded yet. Users are recorded from "
+                         "this deploy onward — Telegram gives no retroactive "
+                         "list of past users.")
+        for r in rows:
+            name = html.escape(f"{r['first_name'] or ''} {r['last_name'] or ''}".strip()
+                               or r["username"] or "—")
+            who = f"@{r['username']}" if r["username"] else name
+            first = time.strftime("%Y-%m-%d", time.localtime(r["first_seen"])) \
+                if r["first_seen"] else "—"
+            last = time.strftime("%Y-%m-%d", time.localtime(r["last_seen"])) \
+                if r["last_seen"] else "—"
+            lines.append(f"• <code>{r['user_id']}</code> {html.escape(who)} "
+                         f"({first} → {last})")
+        kb_rows: list = []
+        nav: list = []
+        if offset > 0:
+            nav.append(InlineKeyboardButton("⬅ Prev",
+                                            callback_data=f"users:{max(0, offset - owner_mod.USERS_PAGE)}"))
+        if offset + owner_mod.USERS_PAGE < total:
+            nav.append(InlineKeyboardButton("Next ➡",
+                                            callback_data=f"users:{offset + owner_mod.USERS_PAGE}"))
+        if nav:
+            kb_rows.append(nav)
+        kb_rows.append([InlineKeyboardButton("⬅ Settings", callback_data="settings:main")])
+        return "\n".join(lines), InlineKeyboardMarkup(kb_rows)
+
+    async def _users_send(self, chat_id: int, offset: int) -> None:
+        text, kb = await self._users_text(offset)
+        await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML,
+                                       reply_markup=kb)
+
+    async def _broadcast_preview(self, chat_id: int, user_id: int) -> None:
+        draft = self._bc_draft.get(user_id)
+        if not draft:
+            await self.client.send_message(chat_id, "No broadcast draft. "
+                                           "Use /broadcast or Settings → Broadcast.")
+            return
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Send broadcast", callback_data="bc:send"),
+            InlineKeyboardButton("❌ Cancel", callback_data="bc:cancel")]])
+        preview = draft["text"] or draft.get("caption") or "[photo]"
+        if draft.get("photo"):
+            await self.client.send_photo(
+                chat_id, draft["photo"], caption=f"📣 <b>Broadcast preview</b>\n\n{preview[:1000]}",
+                parse_mode=ParseMode.HTML, reply_markup=kb)
+        else:
+            await self.client.send_message(
+                chat_id, f"📣 <b>Broadcast preview</b>\n\n{preview}",
+                parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    async def _run_broadcast(self, owner_chat: int, draft: dict) -> None:
+        log_ch = await run_db(owner_mod.resolve_log_channel, self.db,
+                              self.cfg.log_channel_id)
+        recipients = await run_db(owner_mod.collect_broadcast_recipients,
+                                  self.db, log_ch)
+        delivered = failed = 0
+        for i, rid in enumerate(recipients):
+            try:
+                if draft.get("photo"):
+                    await self.client.send_photo(rid, draft["photo"],
+                                                 caption=draft.get("caption") or "")
+                else:
+                    await self.client.send_message(rid, draft.get("text") or "")
+                delivered += 1
+            except Exception as e:
+                if type(e).__name__ == "FloodWait":
+                    wait = getattr(e, "value", 60) or 60
+                    await asyncio.sleep(wait)
+                    try:
+                        if draft.get("photo"):
+                            await self.client.send_photo(rid, draft["photo"],
+                                                         caption=draft.get("caption") or "")
+                        else:
+                            await self.client.send_message(rid, draft.get("text") or "")
+                        delivered += 1
+                        continue
+                    except Exception:
+                        pass
+                failed += 1
+            if i and i % 10 == 0:
+                await asyncio.sleep(1)
+        try:
+            await self.client.send_message(
+                owner_chat,
+                f"📣 <b>Broadcast done</b> — delivered: <b>{delivered}</b>, "
+                f"failed: <b>{failed}</b>, total: <b>{len(recipients)}</b>.",
+                parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("broadcast report failed: %r", e)
+
+    async def _owner_callback(self, q: CallbackQuery, data: str) -> None:
+        uid, cid = q.from_user.id, q.message.chat.id
+        if data == "settings:main":
+            await self._edit_or_send(q, await self._settings_text(),
+                                     self._settings_kb())
+        elif data == "settings:photo":
+            photo = await run_db(owner_mod.get_start_photo, self.db)
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 Send new photo",
+                                      callback_data="settings:photo_new")],
+                [InlineKeyboardButton("🗑 Remove photo",
+                                      callback_data="settings:photo_remove")],
+                [InlineKeyboardButton("⬅ Settings", callback_data="settings:main")]])
+            await self._edit_or_send(
+                q, f"📸 <b>Start photo</b>\n\nCurrently: {'set ✅' if photo else 'not set'}\n\n"
+                   "Tap “Send new photo”, then send a photo here (or /cancel).",
+                kb)
+        elif data == "settings:photo_new":
+            self._pending_set(uid, "start_photo")
+            await q.answer()
+            await self.client.send_message(
+                cid, "📸 Send the new start photo now (or /cancel).")
+        elif data == "settings:photo_remove":
+            await run_db(owner_mod.set_start_photo, self.db, "")
+            await q.answer("Start photo removed.")
+            await self._edit_or_send(q, await self._settings_text(),
+                                     self._settings_kb())
+        elif data == "settings:fsub":
+            entries = await run_db(owner_mod.fsub_list, self.db)
+            rows = [[InlineKeyboardButton("➕ Add channel",
+                                          callback_data="settings:fsub_add")]]
+            for e in entries:
+                rows.append([InlineKeyboardButton(
+                    f"🗑 {e.get('title') or e.get('chat_id')}",
+                    callback_data=f"fsub:rm:{e['chat_id']}")])
+            rows.append([InlineKeyboardButton("⬅ Settings",
+                                              callback_data="settings:main")])
+            text = ("🔒 <b>Force subscribe</b>\n\n" +
+                    ("\n".join(f"• <code>{e['chat_id']}</code> "
+                               f"{html.escape(str(e.get('title') or ''))}"
+                               for e in entries) if entries
+                     else "No channels set — nobody is blocked."))
+            await self._edit_or_send(q, text, InlineKeyboardMarkup(rows))
+        elif data == "settings:fsub_add":
+            self._pending_set(uid, "fsub_add")
+            await q.answer()
+            await self.client.send_message(
+                cid, "🔒 Send a channel @username or -100 id now (or /cancel). "
+                     "The bot must be able to access it, and I need an invite "
+                     "link (admin) or a username, or I won't store it.")
+        elif data.startswith("fsub:rm:"):
+            try:
+                target = int(data[8:])
+            except ValueError:
+                await q.answer("Bad channel id.")
+                return
+            entries = [e for e in await run_db(owner_mod.fsub_list, self.db)
+                       if e.get("chat_id") != target]
+            await run_db(owner_mod.set_fsub, self.db, entries)
+            await q.answer("Removed.")
+            await self._owner_callback(q, "settings:fsub")
+        elif data == "settings:logs":
+            log_ch = await run_db(owner_mod.resolve_log_channel, self.db,
+                                  self.cfg.log_channel_id)
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Set channel",
+                                      callback_data="settings:logs_set"),
+                 InlineKeyboardButton("✅ Test", callback_data="log:test")],
+                [InlineKeyboardButton("🚫 Disable", callback_data="log:disable")],
+                [InlineKeyboardButton("⬅ Settings", callback_data="settings:main")]])
+            await self._edit_or_send(
+                q, f"📋 <b>Live logs</b>\n\nCurrent: "
+                   f"{'<code>' + str(log_ch) + '</code>' if log_ch else 'off'}\n\n"
+                   "Every private message from a non-admin user is logged "
+                   "there (time, user, text up to 300 chars — never media). "
+                   "Keep that channel private.",
+                kb)
+        elif data == "settings:logs_set":
+            self._pending_set(uid, "log_set")
+            await q.answer()
+            await self.client.send_message(
+                cid, "📋 Send the logs channel -100 id now (or /cancel). "
+                     "The bot must be admin there, or I won't store it.")
+        elif data == "log:test":
+            log_ch = await run_db(owner_mod.resolve_log_channel, self.db,
+                                  self.cfg.log_channel_id)
+            if not log_ch:
+                await q.answer("Live logs are off.", show_alert=True)
+                return
+            try:
+                await self.client.send_message(log_ch, "✅ Live logs test — "
+                                               "the bot can post here.")
+                await q.answer("Test sent ✅")
+            except Exception as e:
+                await q.answer(f"Test failed: {type(e).__name__}",
+                               show_alert=True)
+        elif data == "log:disable":
+            await run_db(owner_mod.set_log_channel, self.db, 0)
+            await q.answer("Live logs disabled.")
+            await self._edit_or_send(q, await self._settings_text(),
+                                     self._settings_kb())
+        elif data == "settings:users":
+            text, kb = await self._users_text(0)
+            await self._edit_or_send(q, text, kb)
+        elif data.startswith("users:"):
+            try:
+                offset = int(data[6:])
+            except ValueError:
+                offset = 0
+            text, kb = await self._users_text(max(0, offset))
+            await self._edit_or_send(q, text, kb)
+        elif data == "settings:broadcast":
+            self._pending_set(uid, "broadcast")
+            await q.answer()
+            await self.client.send_message(
+                cid, "📣 Send the broadcast message now (text, or a photo with "
+                     "a caption). I'll show a preview with Send / Cancel "
+                     "before anything goes out. /cancel to abort.")
+        elif data == "bc:send":
+            draft = self._bc_draft.pop(uid, None)
+            if not draft:
+                await q.answer("No draft.")
+                return
+            await q.answer("Broadcasting…")
+            try:
+                await q.message.edit_text("📣 Broadcasting…")
+            except Exception:
+                pass
+            asyncio.create_task(self._run_broadcast(cid, draft))
+        elif data == "bc:cancel":
+            self._pending_clear(uid)
+            await q.answer("Cancelled.")
+            try:
+                await q.message.edit_text("Broadcast cancelled.")
+            except Exception:
+                pass
+        else:
+            await q.answer()
+
+    async def _handle_pending(self, m: Message, kind: str) -> None:
+        uid, cid = m.from_user.id, m.chat.id
+        if kind == "start_photo":
+            photo = getattr(m, "photo", None)
+            file_id = None
+            if photo is not None:
+                file_id = getattr(photo, "file_id", None)
+                if not file_id and isinstance(photo, (list, tuple)) and photo:
+                    file_id = getattr(photo[-1], "file_id", None)
+            if not file_id:
+                await m.reply_text("That's not a photo — send a photo, or /cancel.")
+                return
+            await run_db(owner_mod.set_start_photo, self.db, file_id)
+            self._pending_clear(uid)
+            await m.reply_text("✅ Start photo updated. Try /start to see it.")
+        elif kind == "fsub_add":
+            target = owner_mod.parse_chat_arg(m.text or "")
+            if target is None:
+                await m.reply_text("Send a channel @username or -100 id, or /cancel.")
+                return
+            try:
+                chat = await self.client.get_chat(target)
+            except Exception as e:
+                await m.reply_text(f"Can't access that chat: {e}")
+                return
+            invite = ""
+            try:
+                invite = await self.client.export_chat_invite_link(chat.id) or ""
+            except Exception:
+                invite = ""
+            username = getattr(chat, "username", "") or ""
+            if not invite and not username:
+                await m.reply_text(
+                    "⚠️ I can't get an invite link for this channel (I'm not "
+                    "admin there) and it has no username, so users couldn't "
+                    "join it. Not stored — make me admin first, or use a "
+                    "public channel, then try again.")
+                return
+            entries = await run_db(owner_mod.fsub_list, self.db)
+            entries = [e for e in entries if e.get("chat_id") != chat.id]
+            entries.append({"chat_id": chat.id, "title": chat.title or "",
+                            "username": username, "invite_link": invite})
+            await run_db(owner_mod.set_fsub, self.db, entries)
+            self._pending_clear(uid)
+            await m.reply_text(f"✅ Force-subscribe added: "
+                               f"<b>{html.escape(chat.title or str(chat.id))}</b> "
+                               f"(<code>{chat.id}</code>).",
+                               parse_mode=ParseMode.HTML)
+        elif kind == "log_set":
+            target = owner_mod.parse_chat_arg(m.text or "")
+            if not isinstance(target, int):
+                await m.reply_text("Send a numeric -100 channel id, or /cancel.")
+                return
+            try:
+                await self.client.get_chat(target)
+                me = await self._self_id()
+                member = await self.client.get_chat_member(target, me) if me else None
+                status = owner_mod._status_name(member) if member else ""
+                if status not in ("administrator", "creator"):
+                    await m.reply_text(
+                        "⚠️ I'm not admin in that channel, so I can't post "
+                        "logs there. Not stored — make me admin first.")
+                    return
+            except Exception as e:
+                await m.reply_text(f"Can't verify that channel: {e}")
+                return
+            await run_db(owner_mod.set_log_channel, self.db, target)
+            self._pending_clear(uid)
+            await m.reply_text(f"✅ Live logs channel set to <code>{target}</code>.",
+                               parse_mode=ParseMode.HTML)
+        elif kind == "broadcast":
+            text = (m.text or "").strip()
+            photo = getattr(m, "photo", None)
+            file_id = None
+            if photo is not None:
+                file_id = getattr(photo, "file_id", None)
+                if not file_id and isinstance(photo, (list, tuple)) and photo:
+                    file_id = getattr(photo[-1], "file_id", None)
+            if not text and not file_id:
+                await m.reply_text("Send text or a photo with a caption, or /cancel.")
+                return
+            self._pending.pop(uid, None)
+            self._bc_draft[uid] = {"text": text, "photo": file_id,
+                                   "caption": m.caption or ""}
+            await self._broadcast_preview(cid, uid)
+        else:
+            self._pending_clear(uid)
 
     # -- flows ------------------------------------------------------------------
     async def _do_search(self, chat_id: int, q: str, user_id: int):
@@ -520,6 +1139,10 @@ class MediaBot:
         button that opens straight on the search results (the query is
         carried in the start_param).
         """
+        unjoined = await self._unjoined(user_id)
+        if unjoined:
+            await self._send_fsub_prompt(chat_id, unjoined)
+            return
         now = time.time()
         if now - self._spam.get(user_id, 0) < 1.5:
             return
@@ -625,7 +1248,11 @@ class MediaBot:
 
         Used by the Mini App backend (no deep-link round-trip needed).
         Returns (ok, message). Fails cleanly if the user never started the bot.
+        Force-subscribe is checked first (the API checks it too, so this is
+        the bot-path net for deep links and callbacks).
         """
+        if await self._unjoined(user_id):
+            return False, "fsub_required"
         try:
             fid = int(file_id)
         except (ValueError, TypeError):
@@ -658,6 +1285,10 @@ class MediaBot:
     async def _deliver_file(self, chat_id: int, file_id: str, user_id: int):
         ok, msg = await self.deliver_to_user(chat_id, file_id)
         if not ok:
+            if msg == "fsub_required":
+                unjoined = await self._unjoined(user_id)
+                await self._send_fsub_prompt(chat_id, unjoined)
+                return
             if msg == "not_started":
                 text = ("👋 Press <b>START</b> below first, then tap Get again.")
             elif msg in ("File not found.", "Source file unavailable."):

@@ -28,11 +28,26 @@ themselves while the loop is recovering, instead of piling more work on.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import functools
 import logging
 import time
 
 log = logging.getLogger("mediabot.dbthread")
+
+# 2026-10-28 reply-latency fix: asyncio.to_thread uses the loop's default
+# executor, which on this 2-vCPU VPS is only 6 threads — shared by EVERY
+# run_db call in the process (bot handlers, enricher, scans, API,
+# tracking). When enricher title merges held the SQLite write lock, pool
+# threads piled up waiting on it and even tiny reply-path reads queued
+# behind them; users saw /start and search replies arrive 3-4 minutes
+# late while the container looked healthy. Two dedicated pools fix the
+# sharing: a roomy general pool, and a small reply-only pool that heavy
+# jobs never touch, so a reply read always has a thread immediately.
+_DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=24, thread_name_prefix="db")
+_REPLY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="db-reply")
 
 
 async def run_db(func, *args, **kwargs):
@@ -42,7 +57,23 @@ async def run_db(func, *args, **kwargs):
     disk stall delays only the caller — never Telegram keepalives, never
     /healthz, never other requests.
     """
-    return await asyncio.to_thread(functools.partial(func, *args, **kwargs))
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _DB_EXECUTOR, functools.partial(func, *args, **kwargs))
+
+
+async def run_db_fast(func, *args, **kwargs):
+    """Reply-path reads only (/start, search, browse, stats, Get lookups).
+
+    Runs on the reserved reply executor, which enricher/scan/API work
+    never uses — so a user command's database read cannot queue behind
+    a title merge or a scan batch, no matter how busy indexing gets.
+    Writes and admin/heavy reads stay on run_db; never route a write
+    through here, or the reservation stops meaning anything.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _REPLY_EXECUTOR, functools.partial(func, *args, **kwargs))
 
 
 class LoopGuard:

@@ -372,14 +372,27 @@ class MediaBot:
 
         @c.on_message(filters.private & filters.command("start"))
         async def start(_, m: Message):
-            arg = (m.text or "").split(maxsplit=1)
-            if len(arg) > 1 and arg[1].startswith("file_"):
-                await self._deliver_file(m.chat.id, arg[1][5:], m.from_user.id)
-                return
-            await self._send_start(m.chat.id, m.from_user.id)
+            # TEMP DEBUG2 (2026-10-28): reply handlers still silent after
+            # the fire-and-forget tracking fix, though tracking now
+            # completes. Log entry + send result to see if this runs.
+            log.info("DEBUG2 start user=%s text=%r",
+                     m.from_user.id if m.from_user else 0, (m.text or "")[:40])
+            try:
+                arg = (m.text or "").split(maxsplit=1)
+                if len(arg) > 1 and arg[1].startswith("file_"):
+                    await self._deliver_file(m.chat.id, arg[1][5:], m.from_user.id)
+                    return
+                await self._send_start(m.chat.id, m.from_user.id)
+                log.info("DEBUG2 start sent ok user=%s",
+                         m.from_user.id if m.from_user else 0)
+            except Exception:
+                log.exception("DEBUG2 start failed user=%s",
+                              m.from_user.id if m.from_user else 0)
 
         @c.on_message(filters.private & filters.command("id"))
         async def whoami(_, m: Message):
+            log.info("DEBUG2 whoami user=%s",
+                     m.from_user.id if m.from_user else 0)
             await m.reply_text(f"Your Telegram user id: <code>{m.from_user.id}</code>",
                                parse_mode=ParseMode.HTML)
 
@@ -482,6 +495,8 @@ class MediaBot:
 
         @c.on_message(filters.private & filters.text & ~filters.regex(r"^/"))
         async def plain_search(_, m: Message):
+            log.info("DEBUG2 plain_search user=%s text=%r",
+                     m.from_user.id if m.from_user else 0, (m.text or "")[:40])
             await self._do_search(m.chat.id, m.text.strip(), m.from_user.id)
 
         @c.on_callback_query()

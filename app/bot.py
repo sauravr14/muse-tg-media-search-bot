@@ -277,35 +277,24 @@ class MediaBot:
         return owner_mod.build_start_keyboard(self._app_button, is_owner)
 
     async def _send_start(self, chat_id: int, user_id: int) -> None:
-        # TEMP DEBUG (2026-10-28): see start-handler debug note above.
-        log.info("DEBUG _send_start chat=%s user=%s", chat_id, user_id)
-        try:
-            unjoined = await self._unjoined(user_id)
-            log.info("DEBUG _send_start unjoined=%s", len(unjoined))
-            if unjoined:
-                await self._send_fsub_prompt(chat_id, unjoined)
+        unjoined = await self._unjoined(user_id)
+        if unjoined:
+            await self._send_fsub_prompt(chat_id, unjoined)
+            return
+        text = await run_db(owner_mod.get_start_text, self.db)
+        photo = await run_db(owner_mod.get_start_photo, self.db)
+        kb = self._start_kb(self._is_owner(user_id))
+        if photo:
+            try:
+                await self.client.send_photo(chat_id, photo,
+                                             caption=text[:1024],
+                                             parse_mode=ParseMode.HTML,
+                                             reply_markup=kb)
                 return
-            text = await run_db(owner_mod.get_start_text, self.db)
-            photo = await run_db(owner_mod.get_start_photo, self.db)
-            log.info("DEBUG _send_start photo_set=%s text_len=%s",
-                     bool(photo), len(text))
-            kb = self._start_kb(self._is_owner(user_id))
-            if photo:
-                try:
-                    await self.client.send_photo(chat_id, photo,
-                                                 caption=text[:1024],
-                                                 parse_mode=ParseMode.HTML,
-                                                 reply_markup=kb)
-                    return
-                except Exception as e:
-                    log.warning("start photo failed, falling back to text: %r", e)
-            await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML,
-                                           reply_markup=kb)
-            log.info("DEBUG _send_start sent ok chat=%s", chat_id)
-        except Exception:
-            log.exception("DEBUG _send_start failed chat=%s user=%s",
-                          chat_id, user_id)
-            raise
+            except Exception as e:
+                log.warning("start photo failed, falling back to text: %r", e)
+        await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML,
+                                       reply_markup=kb)
 
     # -- handlers ---------------------------------------------------------------
     def _register(self):
@@ -318,20 +307,27 @@ class MediaBot:
         # the chat. Bot's own messages are never recorded.
         @c.on_message(filters.private)
         async def track_private(_, m: Message):
-            # TEMP DEBUG (2026-10-28): proves the update reached this client.
-            log.info("DEBUG track_private user=%s text=%r",
-                     m.from_user.id if m.from_user else 0,
-                     (m.text or m.caption or "")[:40])
-            await self._track_private(m)
+            # Fire-and-forget, never awaited: Pyrogram runs an update's
+            # handlers in order on one task, so awaiting a DB write here
+            # blocked /start, /id and search replies for as long as a
+            # long enricher merge held the SQLite write lock (seen live
+            # 2026-10-28: track logged, no reply handler ever ran, and a
+            # fresh connection could not get BEGIN IMMEDIATE for minutes).
+            # Tracking is best-effort: it completes when the lock frees,
+            # and a lost update on restart costs one row, not a reply.
+            asyncio.create_task(self._track_private(m))
 
         @c.on_message(filters.group)
         async def track_group(_, m: Message):
-            try:
-                await run_db(self.db.upsert_chat, m.chat.id,
-                             self._chat_type_name(m.chat),
-                             m.chat.title or "", m.chat.username or "")
-            except Exception as e:
-                log.warning("chat upsert failed: %r", e)
+            # Same fire-and-forget reason as track_private above.
+            async def _track_group():
+                try:
+                    await run_db(self.db.upsert_chat, m.chat.id,
+                                 self._chat_type_name(m.chat),
+                                 m.chat.title or "", m.chat.username or "")
+                except Exception as e:
+                    log.warning("chat upsert failed: %r", e)
+            asyncio.create_task(_track_group())
 
         @c.on_chat_member_updated()
         async def track_member(_, u):
@@ -376,12 +372,6 @@ class MediaBot:
 
         @c.on_message(filters.private & filters.command("start"))
         async def start(_, m: Message):
-            # TEMP DEBUG (2026-10-28): /start replies stopped arriving after
-            # the owner-features deploy while tracking still records the
-            # message. Log entry/exit so the live log shows which step stops.
-            log.info("DEBUG start handler user=%s chat=%s text=%r",
-                     m.from_user.id if m.from_user else 0, m.chat.id,
-                     (m.text or "")[:40])
             arg = (m.text or "").split(maxsplit=1)
             if len(arg) > 1 and arg[1].startswith("file_"):
                 await self._deliver_file(m.chat.id, arg[1][5:], m.from_user.id)
@@ -492,9 +482,6 @@ class MediaBot:
 
         @c.on_message(filters.private & filters.text & ~filters.regex(r"^/"))
         async def plain_search(_, m: Message):
-            log.info("DEBUG plain_search user=%s text=%r",
-                     m.from_user.id if m.from_user else 0,
-                     (m.text or "")[:40])
             await self._do_search(m.chat.id, m.text.strip(), m.from_user.id)
 
         @c.on_callback_query()

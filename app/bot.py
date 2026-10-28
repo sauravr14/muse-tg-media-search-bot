@@ -23,7 +23,7 @@ from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
 from . import owner as owner_mod
 from .config import Config
 from .db import DB, RES_ORDER
-from .dbthread import run_db
+from .dbthread import run_db, run_db_fast
 from .indexer import Indexer
 
 log = logging.getLogger("mediabot.bot")
@@ -95,15 +95,17 @@ class MediaBot:
         self.cfg = cfg
         self.db = db
         self.indexer = indexer
-        # workers=16 (Pyrogram default is 6): with only 6 dispatcher
+        # workers=32 (Pyrogram default is 6): with only 6 dispatcher
         # workers, a few slow handlers (live channel ingest, a large file
         # delivery) starved user commands entirely in the 2026-10-28
-        # outage. More workers give user commands headroom while
-        # background work runs; the real fix is still the fire-and-
-        # forget handlers + fast commits, this is just margin.
+        # outage; 16 helped, but the 3-4 minute reply delays the same
+        # day showed bursts still queue. More workers give user commands
+        # headroom while background work runs; the real fix is still the
+        # fire-and-forget handlers + fast commits + the reserved reply
+        # DB executor, this is just margin.
         self.client = Client("mediabot", api_id=cfg.api_id, api_hash=cfg.api_hash,
                              bot_token=cfg.bot_token, in_memory=True,
-                             workers=16)
+                             workers=32)
         self.username = ""
         self.panel = None  # IndexPanel, attached in main.py once indexer exists
         self._spam: dict[int, float] = {}
@@ -264,7 +266,7 @@ class MediaBot:
             log.warning("live log failed: %r", e)
 
     async def _unjoined(self, user_id: int) -> list:
-        entries = await run_db(owner_mod.fsub_list, self.db)
+        entries = await run_db_fast(owner_mod.fsub_list, self.db)
         return await owner_mod.unjoined_channels(
             self.client, user_id, entries, self._is_privileged(user_id))
 
@@ -284,12 +286,13 @@ class MediaBot:
         return owner_mod.build_start_keyboard(self._app_button, is_owner)
 
     async def _send_start(self, chat_id: int, user_id: int) -> None:
+        t0 = time.monotonic()
         unjoined = await self._unjoined(user_id)
         if unjoined:
             await self._send_fsub_prompt(chat_id, unjoined)
             return
-        text = await run_db(owner_mod.get_start_text, self.db)
-        photo = await run_db(owner_mod.get_start_photo, self.db)
+        text = await run_db_fast(owner_mod.get_start_text, self.db)
+        photo = await run_db_fast(owner_mod.get_start_photo, self.db)
         kb = self._start_kb(self._is_owner(user_id))
         if photo:
             try:
@@ -302,6 +305,9 @@ class MediaBot:
                 log.warning("start photo failed, falling back to text: %r", e)
         await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML,
                                        reply_markup=kb)
+        dt = time.monotonic() - t0
+        if dt > 10:
+            log.warning("slow /start reply: %.1fs for user %s", dt, user_id)
 
     # -- handlers ---------------------------------------------------------------
     def _register(self):
@@ -436,7 +442,7 @@ class MediaBot:
             if unjoined:
                 await self._send_fsub_prompt(m.chat.id, unjoined)
                 return
-            rows = await run_db(
+            rows = await run_db_fast(
                 self.db.query,
                 "SELECT * FROM titles ORDER BY (poster != '') DESC, "
                 "last_file_at DESC LIMIT 8")
@@ -459,7 +465,7 @@ class MediaBot:
                 await self._send_fsub_prompt(m.chat.id, unjoined)
                 return
             kind = "movie" if m.command[0] == "movies" else "series"
-            rows = await run_db(
+            rows = await run_db_fast(
                 self.db.query,
                 "SELECT * FROM titles WHERE kind=? ORDER BY title LIMIT ?",
                 (kind, PAGE))
@@ -747,7 +753,7 @@ class MediaBot:
 
         @c.on_message(filters.private & filters.command("stats") & filters.user(priv_ids))
         async def stats(_, m: Message):
-            s = await run_db(self.db.stats)
+            s = await run_db_fast(self.db.stats)
             await m.reply_text(
                 f"📊 <b>Catalog stats</b>\n"
                 f"Files: <b>{s['files']}</b> · Movies: <b>{s['movies']}</b> · "
@@ -1180,6 +1186,7 @@ class MediaBot:
         button that opens straight on the search results (the query is
         carried in the start_param).
         """
+        t0 = time.monotonic()
         unjoined = await self._unjoined(user_id)
         if unjoined:
             await self._send_fsub_prompt(chat_id, unjoined)
@@ -1188,7 +1195,7 @@ class MediaBot:
         if now - self._spam.get(user_id, 0) < 1.5:
             return
         self._spam[user_id] = now
-        rows = await run_db(self.search_titles, q, limit=PAGE + 1)
+        rows = await run_db_fast(self.search_titles, q, limit=PAGE + 1)
         if not rows:
             kb = InlineKeyboardMarkup([[self._app_button("🌐 Open Media Library")]])
             await self.client.send_message(
@@ -1210,11 +1217,14 @@ class MediaBot:
                                      _search_start_param(q))]]
         await self.client.send_message(chat_id, text, parse_mode=ParseMode.HTML,
                                        reply_markup=InlineKeyboardMarkup(kb_rows))
+        dt = time.monotonic() - t0
+        if dt > 10:
+            log.warning("slow search reply: %.1fs for user %s q=%r", dt, user_id, q)
 
     async def _show_seasons(self, q: CallbackQuery, title_id: int):
-        t = await run_db(self.db.query_one, "SELECT * FROM titles WHERE id=?",
-                         (title_id,))
-        seasons = await run_db(
+        t = await run_db_fast(self.db.query_one, "SELECT * FROM titles WHERE id=?",
+                              (title_id,))
+        seasons = await run_db_fast(
             self.db.query,
             "SELECT * FROM seasons WHERE title_id=? ORDER BY season_no",
             (title_id,))
@@ -1230,16 +1240,16 @@ class MediaBot:
         await q.answer()
 
     async def _show_episodes(self, q: CallbackQuery, season_id: int):
-        se = await run_db(self.db.query_one, "SELECT * FROM seasons WHERE id=?",
-                          (season_id,))
-        t = await run_db(self.db.query_one, "SELECT * FROM titles WHERE id=?",
-                         (se["title_id"],))
-        eps = await run_db(
+        se = await run_db_fast(self.db.query_one, "SELECT * FROM seasons WHERE id=?",
+                               (season_id,))
+        t = await run_db_fast(self.db.query_one, "SELECT * FROM titles WHERE id=?",
+                              (se["title_id"],))
+        eps = await run_db_fast(
             self.db.query,
             "SELECT * FROM episodes WHERE season_id=? ORDER BY ep_no",
             (season_id,))
         rows = []
-        packs = await run_db(
+        packs = await run_db_fast(
             self.db.query,
             "SELECT * FROM files WHERE season_id=? AND episode_id IS NULL "
             "AND status='ok' ORDER BY " + RES_ORDER + " DESC", (season_id,))
@@ -1247,7 +1257,7 @@ class MediaBot:
             label = f"📦 {f['pack_label'] or 'Pack'} ({f['resolution'] or '?'})"
             rows.append([InlineKeyboardButton(label, callback_data=f"getf:{f['id']}")])
         for e in eps:
-            n = (await run_db(
+            n = (await run_db_fast(
                 self.db.query_one,
                 "SELECT COUNT(*) c FROM files WHERE episode_id=?",
                 (e["id"],)))["c"]
@@ -1265,13 +1275,13 @@ class MediaBot:
         await q.answer()
 
     async def _show_episode(self, q: CallbackQuery, episode_id: int):
-        e = await run_db(self.db.query_one, "SELECT * FROM episodes WHERE id=?",
-                         (episode_id,))
-        se = await run_db(self.db.query_one, "SELECT * FROM seasons WHERE id=?",
-                          (e["season_id"],))
-        t = await run_db(self.db.query_one, "SELECT * FROM titles WHERE id=?",
-                         (e["title_id"],))
-        files = await run_db(self._versions, t["id"], episode_id)
+        e = await run_db_fast(self.db.query_one, "SELECT * FROM episodes WHERE id=?",
+                              (episode_id,))
+        se = await run_db_fast(self.db.query_one, "SELECT * FROM seasons WHERE id=?",
+                               (e["season_id"],))
+        t = await run_db_fast(self.db.query_one, "SELECT * FROM titles WHERE id=?",
+                              (e["title_id"],))
+        files = await run_db_fast(self._versions, t["id"], episode_id)
         kb = self._kb_versions(files) or InlineKeyboardMarkup([[]])
         kb.inline_keyboard.append([InlineKeyboardButton(
             "⬅ Episodes", callback_data=f"season:{se['id']}")])
@@ -1298,8 +1308,8 @@ class MediaBot:
             fid = int(file_id)
         except (ValueError, TypeError):
             return False, "bad file id"
-        f = await run_db(self.db.query_one, "SELECT * FROM files WHERE id=?",
-                         (fid,))
+        f = await run_db_fast(self.db.query_one, "SELECT * FROM files WHERE id=?",
+                              (fid,))
         if not f:
             return False, "File not found."
         try:

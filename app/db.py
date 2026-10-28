@@ -144,6 +144,28 @@ CREATE TABLE IF NOT EXISTS kv (
     value TEXT NOT NULL
 );
 
+-- owner features: users/chats the bot has seen (for /users + broadcast).
+-- Additive only; filled from this deploy onward — Telegram gives no
+-- retroactive list of past users, so /users starts empty on old bots.
+CREATE TABLE IF NOT EXISTS users (
+    user_id     INTEGER PRIMARY KEY,
+    username    TEXT NOT NULL DEFAULT '',
+    first_name  TEXT NOT NULL DEFAULT '',
+    last_name   TEXT NOT NULL DEFAULT '',
+    first_seen  REAL NOT NULL DEFAULT 0,
+    last_seen   REAL NOT NULL DEFAULT 0,
+    msg_count   INTEGER NOT NULL DEFAULT 0,
+    last_text   TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS chats (
+    chat_id     INTEGER PRIMARY KEY,
+    type        TEXT NOT NULL DEFAULT '',
+    title       TEXT NOT NULL DEFAULT '',
+    username    TEXT NOT NULL DEFAULT '',
+    first_seen  REAL NOT NULL DEFAULT 0,
+    last_seen   REAL NOT NULL DEFAULT 0
+);
+
 -- messages the bot must delete after the self-destruct timer expires
 -- (survives restarts: pending rows are re-scheduled on boot)
 CREATE TABLE IF NOT EXISTS pending_deletes (
@@ -269,6 +291,47 @@ class DB:
 
     def remove_source(self, chat_id: int) -> None:
         self.execute("DELETE FROM sources WHERE chat_id=?", (chat_id,))
+
+    # -- users / chats (owner features) -----------------------------------
+    def upsert_user(self, user_id: int, username: str = "", first_name: str = "",
+                    last_name: str = "", text: str = "") -> None:
+        now = time.time()
+        self.execute(
+            "INSERT INTO users(user_id, username, first_name, last_name, "
+            "first_seen, last_seen, msg_count, last_text) VALUES(?,?,?,?,?,?,1,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, "
+            "first_name=excluded.first_name, last_name=excluded.last_name, "
+            "first_seen=COALESCE(users.first_seen, excluded.first_seen), "
+            "last_seen=excluded.last_seen, msg_count=users.msg_count+1, "
+            "last_text=excluded.last_text",
+            (user_id, username or "", first_name or "", last_name or "",
+             now, now, (text or "")[:300]),
+        )
+
+    def upsert_chat(self, chat_id: int, type_: str = "", title: str = "",
+                    username: str = "") -> None:
+        now = time.time()
+        self.execute(
+            "INSERT INTO chats(chat_id, type, title, username, first_seen, "
+            "last_seen) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET type=excluded.type, "
+            "title=excluded.title, username=excluded.username, "
+            "first_seen=COALESCE(chats.first_seen, excluded.first_seen), "
+            "last_seen=excluded.last_seen",
+            (chat_id, type_ or "", title or "", username or "", now, now),
+        )
+
+    def list_users(self, limit: int = 25, offset: int = 0) -> list:
+        return self.query(
+            "SELECT * FROM users ORDER BY last_seen DESC LIMIT ? OFFSET ?",
+            (limit, offset))
+
+    def count_users(self) -> int:
+        row = self.query_one("SELECT COUNT(*) c FROM users")
+        return int(row["c"]) if row else 0
+
+    def list_chats(self) -> list:
+        return self.query("SELECT * FROM chats ORDER BY chat_id")
 
     # -- self-destructing deliveries --------------------------------------
     def add_pending_delete(self, chat_id: int, msg_id: int, delete_at: float) -> None:

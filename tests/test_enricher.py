@@ -80,6 +80,9 @@ class EnricherDeferralTest(unittest.TestCase):
 
         idx._enrich_one = fake_enrich
         idx._enrich_queue.put_nowait(123)
+        # Nightly window gate is tested separately (test_enrich_window.py);
+        # force it open here so this test exercises the scan-lock deferral.
+        idx._enrich_pause_seconds = lambda now=None: 0.0
 
         async def main():
             async with idx._scan_lock:

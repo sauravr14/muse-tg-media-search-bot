@@ -390,7 +390,12 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         order = sorts.get(sort, sorts["recent"])
         per = min(max(per, 1), 60)
         page = max(page, 1)
-        where = "WHERE kind=? " if kind in ("movie", "series") else "WHERE 1=1 "
+        # tmdb_id IS NOT NULL AND poster != '' is load-bearing: it lets
+        # SQLite use the partial indexes (idx_titles_home/az/rating/year).
+        # Without it every sort was a full-catalog temp-b-tree sort (40-60s),
+        # which is why the Movies/Series tabs never loaded (2026-10-29).
+        where = ("WHERE tmdb_id IS NOT NULL AND poster != '' "
+                 + ("AND kind=? " if kind in ("movie", "series") else ""))
         params: list = [kind] if kind in ("movie", "series") else []
         if hide_cam:
             where += CLEAN_ONLY

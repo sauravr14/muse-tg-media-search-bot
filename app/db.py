@@ -7,12 +7,25 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
-SCHEMA = """
+log = logging.getLogger("mediabot.db")
+
+# FTS5 table for title search. prefix='2 3 4' keeps prefix queries like
+# "robin"* on the index; without it every prefix MATCH scans the whole
+# 1M+ row index (that was the 16s search on 2026-10-29).
+TITLES_FTS_DDL = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS titles_fts USING fts5("
+    "title, orig_title, alt_titles, norm_title, "
+    "content='titles', content_rowid='id', "
+    "tokenize='unicode61 remove_diacritics 2', prefix='2 3 4')"
+)
+
+SCHEMA = f"""
 PRAGMA journal_mode=WAL;
 
 CREATE TABLE IF NOT EXISTS sources (
@@ -54,11 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_titles_norm ON titles(norm_title, year);
 CREATE INDEX IF NOT EXISTS idx_titles_kind ON titles(kind);
 CREATE INDEX IF NOT EXISTS idx_titles_recent ON titles(last_file_at DESC);
 
-CREATE VIRTUAL TABLE IF NOT EXISTS titles_fts USING fts5(
-    title, orig_title, alt_titles, norm_title,
-    content='titles', content_rowid='id',
-    tokenize='unicode61 remove_diacritics 2'
-);
+{TITLES_FTS_DDL};
 CREATE TRIGGER IF NOT EXISTS trg_titles_ai AFTER INSERT ON titles BEGIN
     INSERT INTO titles_fts(rowid, title, orig_title, alt_titles, norm_title)
     VALUES (new.id, new.title, new.orig_title, new.alt_titles, new.norm_title);
@@ -231,6 +240,34 @@ class DB:
             if "is_cam" not in cols:
                 conn.execute("ALTER TABLE files ADD COLUMN is_cam INTEGER "
                              "NOT NULL DEFAULT 0")
+            # one-time: FTS5 prefix indexes for fast prefix search (2026-10-29).
+            # The table predates the prefix= option, so it must be rebuilt
+            # from the titles table. Runs once; the sqlite_master check
+            # short-circuits on every later start. Holds the write lock for
+            # a few minutes on a 1M-row catalog — background indexing waits,
+            # reply reads (which never take the lock) are unaffected.
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='titles_fts'").fetchone()
+            if row and "prefix=" not in (row[0] or ""):
+                log.warning("rebuilding titles_fts with prefix indexes "
+                            "(one-time, ~1M rows)")
+                t0 = time.monotonic()
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute("DROP TABLE IF EXISTS titles_fts")
+                    conn.execute(TITLES_FTS_DDL)
+                    conn.execute(
+                        "INSERT INTO titles_fts(rowid, title, orig_title, "
+                        "alt_titles, norm_title) SELECT id, title, "
+                        "orig_title, alt_titles, norm_title FROM titles")
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+                n = conn.execute("SELECT COUNT(*) FROM titles_fts").fetchone()[0]
+                log.warning("titles_fts rebuilt with prefix indexes: %d rows "
+                            "in %.0fs", n, time.monotonic() - t0)
             conn.commit()
 
     # -- generic helpers -------------------------------------------------

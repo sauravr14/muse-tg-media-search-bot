@@ -67,20 +67,25 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(d["results"], [])
 
     def test_recent(self):
+        # recent requires TMDB-matched titles with posters (2026-10-29:
+        # the poster filter is what lets the query use the partial index
+        # instead of a full-catalog sort)
+        self.db.execute(
+            "UPDATE titles SET tmdb_id=id, poster='p.jpg'")
         d = self.client.get("/api/recent").json()
         self.assertEqual(len(d["results"]), 2)
 
     def test_home_shape(self):
         # give Inception full TMDB dressing so it qualifies for hero + rails
         self.db.execute(
-            "UPDATE titles SET poster='p.jpg', backdrop='b.jpg',"
-            " overview='A dream heist.' WHERE title='Inception'")
+            "UPDATE titles SET tmdb_id=27205, poster='p.jpg', backdrop='b.jpg',"
+            " overview='A dream heist.', year=2026 WHERE title='Inception'")
         d = self.client.get("/api/home").json()
         self.assertEqual([h["title"] for h in d["hero"]], ["Inception"])
         self.assertEqual(d["hero"][0]["backdrop"], "b.jpg")
         rails = {r["title"]: r["results"] for r in d["rows"]}
-        self.assertIn("Recently added movies", rails)
-        self.assertEqual([t["title"] for t in rails["Recently added movies"]],
+        self.assertIn("2026 Movies", rails)
+        self.assertEqual([t["title"] for t in rails["2026 Movies"]],
                          ["Inception"])
         # poster-less titles (Dark) stay out of the poster rails
         self.assertNotIn("Recently added series", rails)

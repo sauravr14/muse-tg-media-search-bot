@@ -291,7 +291,7 @@
     if (tg && tg.BackButton) tg.BackButton.show();
     window.scrollTo(0, 0); progress(true);
     try {
-      const t = await api("/api/title/" + id);
+      const t = await api("/api/title/" + id, {ms: 30000});
       let h = `<div class="detail-top"><button class="back" onclick="history.back()">‹ Back</button>
         ${t.backdrop ? `<img class="bd" src="${esc(t.backdrop)}" alt="" decoding="async">` : ""}</div>
         <div class="detail-head"><div class="poster-box">${t.poster ? "" : FALLBACK}

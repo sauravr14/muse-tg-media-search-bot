@@ -23,7 +23,7 @@ from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
 
 from . import owner as owner_mod
 from .config import Config
-from .db import DB, RES_ORDER
+from .db import DB, RES_ORDER, fts_terms
 from .dbthread import run_db, run_db_fast
 from .indexer import Indexer
 
@@ -174,8 +174,10 @@ class MediaBot:
         q = q.strip()
         if not q:
             return []
-        # quote for FTS5; prefix match each term
-        terms = [t for t in q.replace('"', "").split() if t]
+        # quote for FTS5; prefix match each term. Stopwords ("the", "of",
+        # ...) are stripped first: a lone common-word prefix query scans a
+        # huge slice of the catalog and takes 15-30s to rank.
+        terms = fts_terms(q)
         if not terms:
             return []
         match = " ".join(f'"{t}"*' for t in terms)

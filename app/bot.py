@@ -10,11 +10,12 @@ import asyncio
 import base64
 import html
 import logging
+import random
 import re
 import time
 
 from pyrogram import Client, ContinuePropagation, StopPropagation, filters
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ChatAction, ParseMode
 import aiohttp
 
 from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
@@ -31,6 +32,53 @@ PAGE = 6
 LINK_RE = re.compile(
     r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/(c/)?([A-Za-z0-9_]+|\d+)/(\d+)/?$"
 )
+
+# Loading indicator for slow searches (2026-10-29): an animated sticker
+# from the Mixpackk pack, sent only if the search is still running after
+# LOADING_STICKER_DELAY_S, then deleted when the result arrives so the
+# chat stays clean. Typing action covers the first seconds.
+LOADING_STICKER_DELAY_S = 2.5
+LOADING_STICKER_FILE_IDS: list[str] = [
+    # 🌀 and ⏰ from https://t.me/addstickers/Mixpackk — Saurav's pick;
+    # swap file_ids here to change the sticker.
+    "CAACAgUAAxUAAWrjIZhL3cSNlyKTsnEtYlESaz-7AAIKAAPfKKQwKcldOqxkq_g9BA",
+    "CAACAgUAAxkBAAIEP2rjH6h7Lveg4xOwzQvHa0upe55AAAIRAAPfKKQw27gJ-6gfoQY9BA",
+]
+
+
+async def send_loading_sticker_later(client, chat_id: int,
+                                     file_ids: list[str],
+                                     delay: float = LOADING_STICKER_DELAY_S,
+                                     ) -> int | None:
+    """Send a loading sticker only if the caller is still waiting after
+    `delay` seconds. Returns the sent message id, or None when nothing was
+    sent. Never raises — a missing sticker must never break a search."""
+    await asyncio.sleep(delay)
+    if not file_ids:
+        return None
+    try:
+        msg = await client.send_sticker(chat_id, random.choice(file_ids))
+        return msg.id
+    except Exception as e:
+        log.warning("loading sticker failed: %r", e)
+        return None
+
+
+async def settle_loading_sticker(task: "asyncio.Task[int | None]") -> int | None:
+    """Cancel a pending loading-sticker task. Returns the sent message id if
+    the sticker already went out (so the caller can delete it), else None.
+    Never raises."""
+    if not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return None
+    try:
+        return task.result()
+    except Exception:
+        return None
 
 
 def _parse_post_link(text: str):
@@ -1232,7 +1280,24 @@ class MediaBot:
         if unjoined:
             await self._send_fsub_prompt(chat_id, unjoined)
             return
-        rows = await run_db_fast(self.search_titles, q, limit=PAGE + 1)
+        # instant acknowledgement: native typing now, loading sticker if the
+        # search drags past LOADING_STICKER_DELAY_S (deleted on arrival).
+        try:
+            await self.client.send_chat_action(chat_id, ChatAction.TYPING)
+        except Exception:
+            pass
+        loading_task = asyncio.create_task(
+            send_loading_sticker_later(self.client, chat_id,
+                                       LOADING_STICKER_FILE_IDS))
+        try:
+            rows = await run_db_fast(self.search_titles, q, limit=PAGE + 1)
+        finally:
+            sticker_msg_id = await settle_loading_sticker(loading_task)
+        if sticker_msg_id:
+            try:
+                await self.client.delete_messages(chat_id, sticker_msg_id)
+            except Exception:
+                pass
         if not rows:
             kb = InlineKeyboardMarkup([[self._app_button("🌐 Open Media Library")]])
             await self.client.send_message(

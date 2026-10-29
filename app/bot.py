@@ -143,17 +143,22 @@ class MediaBot:
         self.cfg = cfg
         self.db = db
         self.indexer = indexer
-        # workers=32 (Pyrogram default is 6): with only 6 dispatcher
+        # workers=150 (VJ-filter-bot parity): with only 6 dispatcher
         # workers, a few slow handlers (live channel ingest, a large file
         # delivery) starved user commands entirely in the 2026-10-28
-        # outage; 16 helped, but the 3-4 minute reply delays the same
-        # day showed bursts still queue. More workers give user commands
-        # headroom while background work runs; the real fix is still the
-        # fire-and-forget handlers + fast commits + the reserved reply
-        # DB executor, this is just margin.
-        self.client = Client("mediabot", api_id=cfg.api_id, api_hash=cfg.api_hash,
-                             bot_token=cfg.bot_token, in_memory=True,
-                             workers=32)
+        # outage; 32 helped, but slow searches still queued updates behind
+        # them ("not replying"). Handler workers are lightweight asyncio
+        # tasks pulling off the updates queue; 150 gives bursty traffic
+        # headroom. The real fix is still the fire-and-forget handlers +
+        # fast commits + the reserved reply DB executor, this is margin.
+        # Session is file-backed at /app/data (bind-mounted, survives
+        # container rebuilds, never in git): restarts resume the session
+        # instead of re-authenticating every time, which removes the
+        # auth.ImportBotAuthorization FloodWait exposure from the
+        # 2026-10-25 outage and makes restarts faster.
+        self.client = Client("/app/data/mediabot", api_id=cfg.api_id, api_hash=cfg.api_hash,
+                             bot_token=cfg.bot_token,
+                             workers=150)
         self.username = ""
         self.panel = None  # IndexPanel, attached in main.py once indexer exists
         self._spam: dict[int, float] = {}

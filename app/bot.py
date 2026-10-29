@@ -109,7 +109,11 @@ class MediaBot:
         self.username = ""
         self.panel = None  # IndexPanel, attached in main.py once indexer exists
         self._spam: dict[int, float] = {}
-        self._self_id = 0
+        self._log_q = None
+        self._log_ch = 0
+        self._log_ch_at = -999.0
+        self._stats_cache = (0.0, None)
+        self._me_id = 0
         # owner-only pending prompts: user_id -> {"kind": ..., "ts": ...}
         # kinds: start_photo, fsub_add, log_set, broadcast (draft kept in
         # _bc_draft). Expires after 10 min; /cancel clears it.
@@ -206,13 +210,13 @@ class MediaBot:
         return self.cfg.is_privileged(user_id)
 
     async def _self_id(self) -> int:
-        if not self._self_id:
+        if not self._me_id:
             try:
                 me = await self.client.get_me()
-                self._self_id = me.id or 0
+                self._me_id = me.id or 0
             except Exception:
                 pass
-        return self._self_id
+        return self._me_id
 
     def _pending_get(self, user_id: int):
         st = self._pending.get(user_id)
@@ -239,13 +243,21 @@ class MediaBot:
         u = m.from_user
         if not u or getattr(u, "is_bot", False):
             return
+        await self._log_user_message(m)
         try:
             await run_db(self.db.upsert_user, u.id, u.username or "",
                          u.first_name or "", u.last_name or "",
                          m.text or m.caption or "")
         except Exception as e:
             log.warning("user upsert failed: %r", e)
-        await self._log_user_message(m)
+
+    async def _log_channel(self) -> int:
+        now = time.monotonic()
+        if now - self._log_ch_at > 15:
+            self._log_ch = await run_db_fast(owner_mod.resolve_log_channel,
+                                             self.db, self.cfg.log_channel_id)
+            self._log_ch_at = now
+        return self._log_ch
 
     async def _log_user_message(self, m: Message) -> None:
         u = m.from_user
@@ -253,17 +265,34 @@ class MediaBot:
                 u.id, self._is_privileged(u.id)):
             return
         try:
-            channel = await run_db(owner_mod.resolve_log_channel, self.db,
-                                   self.cfg.log_channel_id)
+            channel = await self._log_channel()
             if not channel:
                 return
             text = m.text or m.caption or "[non-text message]"
             msg = owner_mod.format_log_message(
                 time.time(), u.id, u.username or "",
                 f"{u.first_name or ''} {u.last_name or ''}".strip(), text)
-            await self.client.send_message(channel, msg, parse_mode=ParseMode.HTML)
+            if self._log_q is None:
+                self._log_q = asyncio.Queue(maxsize=500)
+                asyncio.create_task(self._log_sender())
+            try:
+                self._log_q.put_nowait((channel, msg))
+            except asyncio.QueueFull:
+                pass  # logs are best-effort; never slow replies
         except Exception as e:
             log.warning("live log failed: %r", e)
+
+    async def _log_sender(self) -> None:
+        """One sender for all live-log lines: ordered, and a Telegram
+        flood-wait on the log channel only delays logs, never replies."""
+        while True:
+            channel, msg = await self._log_q.get()
+            try:
+                await self.client.send_message(channel, msg,
+                                               parse_mode=ParseMode.HTML)
+            except Exception as e:
+                log.warning("live log failed: %r", e)
+            await asyncio.sleep(0.4)
 
     async def _unjoined(self, user_id: int) -> list:
         entries = await run_db_fast(owner_mod.fsub_list, self.db)
@@ -291,8 +320,9 @@ class MediaBot:
         if unjoined:
             await self._send_fsub_prompt(chat_id, unjoined)
             return
-        text = await run_db_fast(owner_mod.get_start_text, self.db)
-        photo = await run_db_fast(owner_mod.get_start_photo, self.db)
+        text, photo = await asyncio.gather(
+            run_db_fast(owner_mod.get_start_text, self.db),
+            run_db_fast(owner_mod.get_start_photo, self.db))
         kb = self._start_kb(self._is_owner(user_id))
         if photo:
             try:
@@ -358,7 +388,8 @@ class MediaBot:
                 new = u.new_chat_member
                 if not new or not new.user:
                     return
-                if new.user.id != await self._self_id() or not self._self_id:
+                me_id = await self._self_id()
+                if not me_id or new.user.id != me_id:
                     return
                 status = getattr(new, "status", "")
                 if hasattr(status, "value"):
@@ -550,6 +581,7 @@ class MediaBot:
                         pass
                     await self._send_start(q.message.chat.id, q.from_user.id)
                 elif data == "fsub_check":
+                    owner_mod.fsub_forget(q.from_user.id)
                     unjoined = await self._unjoined(q.from_user.id)
                     if unjoined:
                         await q.answer("You haven't joined all channels yet.",
@@ -753,7 +785,10 @@ class MediaBot:
 
         @c.on_message(filters.private & filters.command("stats") & filters.user(priv_ids))
         async def stats(_, m: Message):
-            s = await run_db_fast(self.db.stats)
+            ts, s = self._stats_cache
+            if s is None or time.monotonic() - ts > 30:
+                s = await run_db_fast(self.db.stats)
+                self._stats_cache = (time.monotonic(), s)
             await m.reply_text(
                 f"📊 <b>Catalog stats</b>\n"
                 f"Files: <b>{s['files']}</b> · Movies: <b>{s['movies']}</b> · "
@@ -1187,14 +1222,16 @@ class MediaBot:
         carried in the start_param).
         """
         t0 = time.monotonic()
-        unjoined = await self._unjoined(user_id)
-        if unjoined:
-            await self._send_fsub_prompt(chat_id, unjoined)
-            return
         now = time.time()
         if now - self._spam.get(user_id, 0) < 1.5:
             return
         self._spam[user_id] = now
+        if len(self._spam) > 5000:
+            self._spam.clear()
+        unjoined = await self._unjoined(user_id)
+        if unjoined:
+            await self._send_fsub_prompt(chat_id, unjoined)
+            return
         rows = await run_db_fast(self.search_titles, q, limit=PAGE + 1)
         if not rows:
             kb = InlineKeyboardMarkup([[self._app_button("🌐 Open Media Library")]])

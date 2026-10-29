@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from .config import Config
-from .db import DB, RES_ORDER, _uj
+from .db import DB, RES_ORDER, _uj, fts_terms
 from .owner import fsub_list
 from .dbthread import run_db
 from .streamer import (MAX_STREAMS, ByteStreamer, StreamFileNotFound,
@@ -147,7 +147,11 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         q = q.strip()
         if not q:
             return {"results": [], "page": page}
-        terms = [t for t in q.replace('"', "").split() if t]
+        # strip stopwords first: a lone common-word prefix query ("the")
+        # scans a huge slice of the catalog and takes 15-30s to rank.
+        terms = fts_terms(q)
+        if not terms:
+            return {"results": [], "page": page}
         # each term matches itself OR its singular form: FTS prefix
         # matching is one-directional, so "dragons" alone never matched
         # the title token "dragon" and the real House of the Dragon

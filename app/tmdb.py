@@ -17,6 +17,7 @@ from typing import Any
 import aiohttp
 
 from .db import DB, _j, _uj
+from .dbthread import run_db
 from .parser import ParsedName, normalize_title
 
 log = logging.getLogger("mediabot.tmdb")
@@ -81,7 +82,7 @@ class TMDB:
         if not self.api_key:
             return None
         key = f"GET:{path}:{_j(sorted(params.items()))}"
-        cached = self._cache_get(key)
+        cached = await run_db(self._cache_get, key)
         if isinstance(cached, dict) and cached.get("__miss__"):
             return None
         if cached is not None:
@@ -98,10 +99,10 @@ class TMDB:
                 ) as resp:
                     if resp.status != 200:
                         log.warning("tmdb %s -> %s", path, resp.status)
-                        self._cache_set_miss(key)
+                        await run_db(self._cache_set_miss, key)
                         return None
                     data = await resp.json()
-            self._cache_set(key, data)
+            await run_db(self._cache_set, key, data)
             return data
         except Exception as e:  # never break indexing on TMDB trouble
             log.warning("tmdb %s failed: %r", path, e)

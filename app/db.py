@@ -25,6 +25,29 @@ TITLES_FTS_DDL = (
     "tokenize='unicode61 remove_diacritics 2', prefix='2 3 4')"
 )
 
+# 2026-10-29: FTS5 prefix queries over a single common word match a huge
+# slice of the catalog and take 15-30s to rank ("the" -> 29s, "of" -> 15s
+# on 363k titles) while occupying a reply-executor thread; users saw
+# searches arrive minutes late. Strip these filler words before building
+# the MATCH expression. A query left with no terms returns no results
+# instantly instead of burning a thread for half a minute.
+SEARCH_STOPWORDS = frozenset({
+    "a", "an", "the", "of", "to", "in", "on", "at", "and", "or", "for",
+    "with", "by", "from", "is", "it", "as", "be", "are", "was", "were",
+    "this", "that", "these", "those", "into", "over", "under", "vs",
+    "de", "la", "le", "der", "die", "das", "el",
+})
+
+
+def fts_terms(q: str) -> list:
+    """Split a search query into FTS terms, dropping stopwords.
+
+    Returns [] when nothing searchable remains (e.g. the query was just
+    "the") — callers should return empty results immediately.
+    """
+    terms = [t for t in q.replace('"', "").split() if t]
+    return [t for t in terms if t.lower() not in SEARCH_STOPWORDS]
+
 SCHEMA = f"""
 PRAGMA journal_mode=WAL;
 

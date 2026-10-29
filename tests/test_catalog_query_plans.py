@@ -49,6 +49,28 @@ QUERIES = {
         " AND kind=? ORDER BY last_file_at DESC LIMIT 24",
         ("movie",),
     ),
+    "browse recent": (
+        "SELECT * FROM titles WHERE tmdb_id IS NOT NULL AND poster != ''"
+        " AND kind=? ORDER BY last_file_at DESC LIMIT 30 OFFSET 0",
+        ("movie",),
+    ),
+    "browse az": (
+        "SELECT * FROM titles WHERE tmdb_id IS NOT NULL AND poster != ''"
+        " AND kind=? ORDER BY title COLLATE NOCASE ASC LIMIT 30 OFFSET 0",
+        ("series",),
+    ),
+    "browse rating": (
+        "SELECT * FROM titles WHERE tmdb_id IS NOT NULL AND poster != ''"
+        " AND kind=? ORDER BY rating DESC NULLS LAST, popularity DESC NULLS LAST"
+        " LIMIT 30 OFFSET 0",
+        ("movie",),
+    ),
+    "browse year": (
+        "SELECT * FROM titles WHERE tmdb_id IS NOT NULL AND poster != ''"
+        " AND kind=? ORDER BY year DESC NULLS LAST, title COLLATE NOCASE ASC"
+        " LIMIT 30 OFFSET 0",
+        ("movie",),
+    ),
 }
 
 

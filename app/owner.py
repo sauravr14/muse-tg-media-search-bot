@@ -130,6 +130,40 @@ def format_log_message(ts: float, user_id: int, username: str,
 
 
 # -- force subscribe ---------------------------------------------------------------
+_FSUB_CACHE: dict = {}        # (chat_id, user_id) -> (joined: bool, expires_at)
+_FSUB_JOINED_TTL = 300.0       # joined users are re-checked every 5 min
+_FSUB_LEFT_TTL = 5.0           # not-joined: re-check fast so "I've joined" works
+
+
+def fsub_forget(user_id: int) -> None:
+    for k in [k for k in _FSUB_CACHE if k[1] == user_id]:
+        _FSUB_CACHE.pop(k, None)
+
+
+async def _check_one(client, cid, user_id: int) -> bool:
+    """True if joined (or unverifiable -> fail open). Cached."""
+    now = time.monotonic()
+    hit = _FSUB_CACHE.get((cid, user_id))
+    if hit and hit[1] > now:
+        return hit[0]
+    joined = True
+    ttl = _FSUB_JOINED_TTL
+    try:
+        member = await client.get_chat_member(cid, user_id)
+        if _status_name(member) in NOT_JOINED_STATUSES:
+            joined, ttl = False, _FSUB_LEFT_TTL
+    except Exception as e:
+        if type(e).__name__ == "UserNotParticipant":
+            joined, ttl = False, _FSUB_LEFT_TTL
+        else:
+            log.warning("fsub check failed for %s: %r", cid, e)
+            ttl = 30.0
+    if len(_FSUB_CACHE) > 20000:
+        _FSUB_CACHE.clear()
+    _FSUB_CACHE[(cid, user_id)] = (joined, now + ttl)
+    return joined
+
+
 async def unjoined_channels(client, user_id: int, entries: list,
                             is_privileged: bool = False) -> list:
     """Channels from `entries` the user has NOT joined.
@@ -139,23 +173,11 @@ async def unjoined_channels(client, user_id: int, entries: list,
     """
     if is_privileged or not entries:
         return []
-    unjoined = []
-    for entry in entries:
-        cid = entry.get("chat_id")
-        if not cid:
-            continue
-        try:
-            member = await client.get_chat_member(cid, user_id)
-            status = _status_name(member)
-            if status in NOT_JOINED_STATUSES:
-                unjoined.append(entry)
-            # joined / restricted / unknown -> treated as joined (fail open)
-        except Exception as e:
-            if type(e).__name__ == "UserNotParticipant":
-                unjoined.append(entry)
-            else:
-                log.warning("fsub check failed for %s: %r", cid, e)
-    return unjoined
+    import asyncio
+    todo = [e for e in entries if e.get("chat_id")]
+    results = await asyncio.gather(
+        *(_check_one(client, e["chat_id"], user_id) for e in todo))
+    return [e for e, ok in zip(todo, results) if not ok]
 
 
 def fsub_join_keyboard(entries: list) -> InlineKeyboardMarkup:

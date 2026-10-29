@@ -208,6 +208,7 @@ class DB:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA cache_size=-64000")
             conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA mmap_size=268435456")
             self._local.conn = conn
         return conn
 

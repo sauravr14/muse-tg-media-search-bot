@@ -187,13 +187,18 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         if gated is not None:
             return gated
         limit = min(max(limit, 1), 60)
-        where = " WHERE kind=? " if kind in ("movie", "series") else " WHERE 1=1 "
+        # tmdb_id IS NOT NULL is load-bearing: it lets SQLite use the
+        # idx_titles_home partial index. The old ORDER BY (poster != '')
+        # forced a full-catalog temp sort (~60s); poster-first ordering now
+        # comes from the index's WHERE clause instead.
+        where = " WHERE tmdb_id IS NOT NULL AND poster != '' "
+        if kind in ("movie", "series"):
+            where += "AND kind=? "
         rows = await run_db(
             db.query,
             "SELECT * FROM titles" + where
             + (CLEAN_ONLY if hide_cam else "")
-            # titles with posters first — keeps Recently Added looking clean
-            + " ORDER BY (poster != '') DESC, last_file_at DESC LIMIT ?",
+            + " ORDER BY last_file_at DESC LIMIT ?",
             tuple(([kind] if kind in ("movie", "series") else []) + [limit]))
         return {"results": [_title_card(t) for t in rows]}
 
@@ -217,25 +222,35 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         for kind in ("movie", "series"):
             heroes += await run_db(
                 db.query,
-                "SELECT * FROM titles WHERE kind=? AND backdrop != ''"
-                " AND overview != '' AND poster != ''" + clean
+                # tmdb_id IS NOT NULL is load-bearing: it lets SQLite use
+                # the idx_titles_home partial index. Without it the planner
+                # sorts every title of that kind in a temp b-tree (~40s).
+                "SELECT * FROM titles WHERE kind=? AND tmdb_id IS NOT NULL"
+                " AND backdrop != '' AND overview != '' AND poster != ''"
+                + clean
                 + " ORDER BY last_file_at DESC LIMIT 4", (kind,))
         heroes.sort(key=lambda t: t["last_file_at"], reverse=True)
 
-        async def rail(kind: str) -> list:
+        async def rail(kind: str, label: str) -> dict:
             rows = await run_db(
                 db.query,
-                "SELECT * FROM titles WHERE kind=? AND poster != ''" + clean
-                + " ORDER BY last_file_at DESC LIMIT 18", (kind,))
-            return [_title_card(t) for t in rows]
+                # 2026 releases with posters (2026-10-29): "recently added"
+                # by file date went stale when the channel scans finished,
+                # so the rails now show the current year's releases instead.
+                # tmdb_id IS NOT NULL keeps idx_titles_year usable.
+                "SELECT * FROM titles WHERE kind=? AND tmdb_id IS NOT NULL"
+                " AND poster != '' AND year=2026" + clean
+                + " ORDER BY popularity DESC NULLS LAST LIMIT 18", (kind,))
+            return {"title": label, "results": [_title_card(t) for t in rows]}
 
         trending = await run_db(
             db.query,
-            "SELECT * FROM titles WHERE poster != ''" + clean
+            "SELECT * FROM titles WHERE tmdb_id IS NOT NULL AND poster != ''"
+            + clean
             + " ORDER BY popularity DESC NULLS LAST LIMIT 18")
         rows = [
-            {"title": "Recently added movies", "results": await rail("movie")},
-            {"title": "Recently added series", "results": await rail("series")},
+            await rail("movie", "2026 Movies"),
+            await rail("series", "2026 Series"),
             {"title": "Trending now",
              "results": [_title_card(t) for t in trending]},
         ]

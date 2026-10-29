@@ -424,14 +424,25 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                     by_ep.setdefault(f["episode_id"], []).append(f)
                 elif f["season_id"]:
                     packs_by_season.setdefault(f["season_id"], []).append(f)
+            season_rows = await run_db(
+                db.query, "SELECT * FROM seasons WHERE title_id=? ORDER BY season_no",
+                (title_id,))
+            # ONE episode query for all seasons (was: one query per season,
+            # so a 7-season series burned 7 sequential pool round-trips).
+            eps_by_season: dict[int, list] = {}
+            sids = [se["id"] for se in season_rows]
+            if sids:
+                ph = ",".join("?" for _ in sids)
+                for e in await run_db(
+                        db.query,
+                        f"SELECT * FROM episodes WHERE season_id IN ({ph}) "
+                        "ORDER BY season_id, ep_no",
+                        tuple(sids)):
+                    eps_by_season.setdefault(e["season_id"], []).append(e)
             seasons = []
-            for se in await run_db(db.query,
-                                   "SELECT * FROM seasons WHERE title_id=? ORDER BY season_no",
-                                   (title_id,)):
+            for se in season_rows:
                 eps = []
-                for e in await run_db(db.query,
-                                      "SELECT * FROM episodes WHERE season_id=? ORDER BY ep_no",
-                                      (se["id"],)):
+                for e in eps_by_season.get(se["id"], []):
                     vers = by_ep.get(e["id"], [])
                     eps.append({"ep_no": e["ep_no"], "title": e["ep_title"],
                                 "air_date": e["air_date"], "overview": e["overview"],

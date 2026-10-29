@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from pyrogram.errors import FloodWait
@@ -30,6 +31,15 @@ from .parser import ParsedName, parse_filename
 from .tmdb import TMDB
 
 log = logging.getLogger("mediabot.indexer")
+
+# Nightly enrichment window (IST). The enricher (TMDB/LLM/poster pipeline)
+# is the main background CPU consumer on this 2-vCPU box; since 2026-10-29
+# it runs 01:00-06:00 IST only, so daytime user traffic gets both vCPUs.
+# New files still index during the day — they queue up and are enriched at
+# night. IST has no DST, so a fixed UTC+5:30 offset is exact.
+ENRICH_TZ = timezone(timedelta(hours=5, minutes=30))
+ENRICH_START_HOUR = 1
+ENRICH_END_HOUR = 6
 
 MEDIA_TYPES = ("video", "document")
 BATCH = 100
@@ -823,6 +833,25 @@ class Indexer:
             log.warning("live ingest failed: %r", e)
 
     # -- TMDB enricher -----------------------------------------------------------
+    def _enrich_pause_seconds(self, now=None) -> float:
+        """Seconds until the nightly enrichment window opens; 0 if open.
+
+        The window is 01:00-06:00 IST. A title already being enriched is
+        never interrupted — the gate is checked between titles only.
+        `now` is injectable for tests.
+        """
+        now = now or datetime.now(ENRICH_TZ)
+        h = now.hour + now.minute / 60 + now.second / 3600
+        if ENRICH_START_HOUR <= h < ENRICH_END_HOUR:
+            return 0.0
+        if h < ENRICH_START_HOUR:
+            target = now.replace(hour=ENRICH_START_HOUR, minute=0,
+                                 second=0, microsecond=0)
+        else:
+            target = (now + timedelta(days=1)).replace(
+                hour=ENRICH_START_HOUR, minute=0, second=0, microsecond=0)
+        return max(0.0, (target - now).total_seconds())
+
     async def enricher_loop(self) -> None:
         """Background: attach TMDB metadata to unmatched titles.
 
@@ -838,6 +867,13 @@ class Indexer:
         self._running = True
         backlog: list[int] = []
         while self._running:
+            # Night-only schedule: outside 01:00-06:00 IST the enricher
+            # sleeps so both vCPUs serve user traffic. Sleep in capped
+            # chunks so shutdown stays responsive.
+            pause_s = self._enrich_pause_seconds()
+            if pause_s > 0:
+                await asyncio.sleep(min(pause_s, 300))
+                continue
             # Heavy jobs (history scans, /cleanup) hold the scan lock for
             # hours and saturate the same event loop + DB. The enricher
             # must not compete with them: while the lock is held it waits

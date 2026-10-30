@@ -206,6 +206,24 @@ class OwnerTest(unittest.TestCase):
         self.assertTrue(cfg.is_admin(6500072213))
         self.assertFalse(cfg.is_admin(111))
 
+    # -- sudo kv storage ----------------------------------------------------------
+    def _tmp_db(self):
+        tmp = tempfile.mkdtemp()
+        return DB(str(Path(tmp) / "t.db"))
+
+    def test_sudo_kv_roundtrip(self):
+        db = self._tmp_db()
+        self.assertIsNone(owner_mod.get_sudo_ids(db))
+        owner_mod.set_sudo_ids(db, [111, 222])
+        self.assertEqual(owner_mod.get_sudo_ids(db), {111, 222})
+        owner_mod.set_sudo_ids(db, [])
+        self.assertEqual(owner_mod.get_sudo_ids(db), set())
+
+    def test_sudo_kv_bad_data(self):
+        db = self._tmp_db()
+        db.set_kv(owner_mod.KV_SUDO_IDS, "not-json")
+        self.assertEqual(owner_mod.get_sudo_ids(db), set())
+
 
 if __name__ == "__main__":
     unittest.main()

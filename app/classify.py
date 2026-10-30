@@ -19,27 +19,53 @@ log = logging.getLogger("mediabot.classify")
 
 
 class Classifier:
+    # In-memory cache for find_title: during a channel scan the same
+    # titles repeat hundreds of times (series episodes, multi-part
+    # movies) and every lookup is up to 3 DB queries. Keyed by
+    # (norm_title, year, kind) -> title id (or None for a miss).
+    # Titles are append-mostly — rows are created, never renamed — so a
+    # process-lifetime cache is safe; create_title refreshes the entry
+    # and the cache is dropped if it ever grows past the bound.
+    _TITLE_CACHE_MAX = 20000
+    _CACHE_MISS = object()
+
     def __init__(self, db: DB):
         self.db = db
+        self._title_cache: dict[tuple, int | None] = {}
+
+    def _cache_title(self, norm_title: str, year, kind: str,
+                     title_id: int | None) -> None:
+        if len(self._title_cache) >= self._TITLE_CACHE_MAX:
+            self._title_cache.clear()
+        self._title_cache[(norm_title, year, kind)] = title_id
 
     # -- title lookup ------------------------------------------------------
     def find_title(self, p: ParsedName) -> dict | None:
         db = self.db
+        key = (p.norm_title, p.year, p.kind)
+        cached = self._title_cache.get(key, self._CACHE_MISS)
+        if cached is not self._CACHE_MISS:
+            # Only the id is relied upon downstream (ingest uses
+            # title["id"]), so a minimal dict is enough on a hit.
+            return {"id": cached} if cached is not None else None
         if p.year:
             row = db.query_one(
                 "SELECT * FROM titles WHERE norm_title=? AND year=? AND kind=?",
                 (p.norm_title, p.year, p.kind),
             )
             if row:
+                self._cache_title(p.norm_title, p.year, p.kind, row["id"])
                 return dict(row)
         rows = db.query(
             "SELECT * FROM titles WHERE norm_title=? AND kind=?", (p.norm_title, p.kind)
         )
         if len(rows) == 1:
+            self._cache_title(p.norm_title, p.year, p.kind, rows[0]["id"])
             return dict(rows[0])
         if len(rows) > 1 and p.year:
             for r in rows:
                 if r["year"] == p.year:
+                    self._cache_title(p.norm_title, p.year, p.kind, r["id"])
                     return dict(r)
         # FTS fallback for minor differences (e.g. word order). The phrase
         # query also matches titles that merely START with the parsed title
@@ -57,7 +83,9 @@ class Classifier:
                 if sorted((r["norm_title"] or "").split()) != want:
                     continue
                 if r["kind"] == p.kind and (not p.year or r["year"] in (p.year, None)):
+                    self._cache_title(p.norm_title, p.year, p.kind, r["id"])
                     return dict(r)
+        self._cache_title(p.norm_title, p.year, p.kind, None)
         return None
 
     def create_title(self, p: ParsedName, meta: dict | None) -> dict:
@@ -89,6 +117,10 @@ class Classifier:
              row["year"], row["tmdb_id"], row["poster"], row["backdrop"], row["overview"],
              row["genres"], row["rating"], row["popularity"], row["lang"], now, now, now),
         )
+        # Refresh the cache: a find_title miss just before this create
+        # would have cached None for the same key.
+        self._cache_title(row["norm_title"], row["year"], row["kind"],
+                          cur.lastrowid)
         return self.db.query_one("SELECT * FROM titles WHERE id=?", (cur.lastrowid,))  # type: ignore[return-value]
 
     # -- series structure ----------------------------------------------------

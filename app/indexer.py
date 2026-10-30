@@ -306,6 +306,37 @@ class Indexer:
         right = await self._fetch_ids(chat_id, ids[mid:], POISON_TIMEOUT)
         return left + right
 
+    async def _fetch_batch_with_retries(self, chat_id: int, lo: int,
+                                        hi: int) -> list:
+        """Fetch one ID batch [lo, hi] with the standard retry policy.
+
+        Used by the pipelined scan loop so the fetch (with its backoffs)
+        can run as a task while the previous batch ingests. Raises
+        RuntimeError after MAX_BATCH_RETRIES failed attempts — the caller
+        treats that as a scan abort and resumes from the checkpoint.
+        """
+        ids = list(range(lo, hi + 1))
+        msgs = None
+        for attempt in range(MAX_BATCH_RETRIES):
+            try:
+                msgs = await self._fetch_ids(chat_id, ids, GET_TIMEOUT)
+                break
+            except FloodWait as e:
+                await asyncio.sleep(e.value + 1)
+            except (asyncio.TimeoutError, OSError) as e:
+                # hung/flaky connection: back off and retry the
+                # same batch instead of dying or wedging the lock
+                log.warning("scan of %s: batch %s-%s %s (try %d/%d)",
+                            chat_id, lo, hi,
+                            type(e).__name__, attempt + 1,
+                            MAX_BATCH_RETRIES)
+                await asyncio.sleep(5 * (attempt + 1))
+        if msgs is None:
+            raise RuntimeError(
+                f"batch {lo}-{hi} failed {MAX_BATCH_RETRIES}x; "
+                "will resume from checkpoint")
+        return msgs
+
     async def _exists_above(self, chat_id: int, mid: int) -> bool:
         """Neighbourhood check: did a doubling probe just land in a deletion
         gap while higher messages still exist?"""
@@ -422,38 +453,53 @@ class Indexer:
                 "started_at": time.time(),
             }
             try:
+                # Pipeline: fetch batch N+1 from Telegram while batch N is
+                # being ingested on the db thread. The old loop was strictly
+                # sequential (fetch -> save -> fetch), which capped scans at
+                # ~165 files/min on Telegram's network; overlapping the two
+                # stages roughly doubles throughput on a healthy connection.
+                # Ordering is preserved: each batch is ingested and
+                # checkpointed strictly in ID order, and a failed prefetch
+                # aborts the scan exactly as a failed direct fetch did.
+                pending_fetch: asyncio.Task | None = None
                 while cur <= hi:
                     if chat_id in self._stop_ids:
                         self._stop_ids.discard(chat_id)
                         log.info("scan of %s stopped by admin at %s", chat_id, cur)
+                        if pending_fetch is not None and not pending_fetch.done():
+                            pending_fetch.cancel()
                         break
                     await self._guard_wait()
                     batch_end = min(cur + BATCH - 1, hi)
-                    ids = list(range(cur, batch_end + 1))
-                    msgs = None
-                    for attempt in range(MAX_BATCH_RETRIES):
-                        try:
-                            msgs = await self._fetch_ids(chat_id, ids,
-                                                         GET_TIMEOUT)
-                            break
-                        except FloodWait as e:
-                            await asyncio.sleep(e.value + 1)
-                        except (asyncio.TimeoutError, OSError) as e:
-                            # hung/flaky connection: back off and retry the
-                            # same batch instead of dying or wedging the lock
-                            log.warning("scan of %s: batch %s-%s %s (try %d/%d)",
-                                        chat_id, cur, batch_end,
-                                        type(e).__name__, attempt + 1,
-                                        MAX_BATCH_RETRIES)
-                            await asyncio.sleep(5 * (attempt + 1))
-                    if msgs is None:
-                        raise RuntimeError(
-                            f"batch {cur}-{batch_end} failed {MAX_BATCH_RETRIES}x; "
-                            "will resume from checkpoint")
+                    if pending_fetch is None:
+                        pending_fetch = asyncio.create_task(
+                            self._fetch_batch_with_retries(chat_id, cur, batch_end),
+                            name=f"scanfetch-{chat_id}-{cur}")
+                    # Prefetch the following batch while this one ingests.
+                    next_fetch: asyncio.Task | None = None
+                    if batch_end < hi:
+                        next_fetch = asyncio.create_task(
+                            self._fetch_batch_with_retries(
+                                chat_id, batch_end + 1,
+                                min(batch_end + BATCH, hi)),
+                            name=f"scanfetch-{chat_id}-{batch_end + 1}")
+                    try:
+                        msgs = await pending_fetch
+                    except BaseException:
+                        if next_fetch is not None and not next_fetch.done():
+                            next_fetch.cancel()
+                        raise
+                    finally:
+                        pending_fetch = None
                     # Batch ingest runs on a worker thread: one transaction
                     # per batch, and its commit/fsync can never stall the
                     # event loop (the 2026-10-24 outage pattern).
-                    res = await run_db(self._ingest_batch, msgs)
+                    try:
+                        res = await run_db(self._ingest_batch, msgs)
+                    except BaseException:
+                        if next_fetch is not None and not next_fetch.done():
+                            next_fetch.cancel()
+                        raise
                     done += res["done"]
                     new += res["new"]
                     for tid in res["enrich_ids"]:
@@ -466,6 +512,7 @@ class Indexer:
                     if progress_cb:
                         progress_cb(done, total)
                     cur = batch_end + 1
+                    pending_fetch = next_fetch
                     await asyncio.sleep(0.4)
             except Exception as e:
                 log.warning("scan of %s failed: %r", chat_id, e)

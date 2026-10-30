@@ -20,6 +20,7 @@ KV_START_PHOTO = "settings:start_photo"
 KV_START_TEXT = "settings:start_text"
 KV_FSUB = "settings:fsub"
 KV_LOG_CHANNEL = "settings:log_channel"
+KV_SUDO_IDS = "settings:sudo_ids"
 LOG_TEXT_MAX = 300
 USERS_PAGE = 25
 
@@ -82,6 +83,21 @@ def get_start_photo(db) -> str:
 
 def set_start_photo(db, file_id: str) -> None:
     db.set_kv(KV_START_PHOTO, file_id or "")
+
+
+def get_sudo_ids(db) -> set[int] | None:
+    """Sudo admin ids from kv. Returns None if never set (caller seeds from env)."""
+    raw = db.get_kv(KV_SUDO_IDS, "")
+    if not raw:
+        return None
+    try:
+        return {int(x) for x in json.loads(raw)}
+    except (ValueError, TypeError):
+        return set()
+
+
+def set_sudo_ids(db, ids) -> None:
+    db.set_kv(KV_SUDO_IDS, json.dumps(sorted(int(x) for x in ids)))
 
 
 def get_start_text(db) -> str:

@@ -172,6 +172,15 @@ class MediaBot:
         # _bc_draft). Expires after 10 min; /cancel clears it.
         self._pending: dict[int, dict] = {}
         self._bc_draft: dict[int, dict] = {}
+        # Sudo admins: kv is the source of truth (managed via /addsudo),
+        # seeded once from SUDO_USER_IDS env. In-memory set so permission
+        # checks stay synchronous; updated on every /addsudo//rmsudo.
+        kv_sudo = owner_mod.get_sudo_ids(self.db)
+        if kv_sudo is None:
+            self._sudo_ids: set[int] = set(self.cfg.sudo_ids)
+            owner_mod.set_sudo_ids(self.db, self._sudo_ids)
+        else:
+            self._sudo_ids = set(kv_sudo)
         self._register()
 
     # -- search ---------------------------------------------------------------
@@ -261,8 +270,21 @@ class MediaBot:
     def _is_owner(self, user_id) -> bool:
         return self.cfg.is_owner(user_id)
 
+    def _is_sudo(self, user_id) -> bool:
+        return bool(user_id) and int(user_id) in self._sudo_ids
+
     def _is_privileged(self, user_id) -> bool:
-        return self.cfg.is_privileged(user_id)
+        return self._is_owner(user_id) or self._is_sudo(user_id)
+
+    def _owner_filter(self):
+        """Dynamic owner check — evaluated per message, not at registration."""
+        return filters.create(
+            lambda _, __, m: self._is_owner(m.from_user.id if m.from_user else 0))
+
+    def _priv_filter(self):
+        """Dynamic owner+sudo check — evaluated per message, not at registration."""
+        return filters.create(
+            lambda _, __, m: self._is_privileged(m.from_user.id if m.from_user else 0))
 
     async def _self_id(self) -> int:
         if not self._me_id:
@@ -397,8 +419,9 @@ class MediaBot:
     # -- handlers ---------------------------------------------------------------
     def _register(self):
         c = self.client
-        admin_ids = list(self.cfg.admin_ids)
-        priv_ids = list(self.cfg.admin_ids) + list(self.cfg.sudo_ids)
+        # NOTE: permission filters are dynamic (self._owner_filter /
+        # self._priv_filter) so /addsudo takes effect immediately without
+        # a restart. Never use static filters.user(...) lists here.
 
         # Tracking runs first and never stops other handlers: every private
         # message records the user (+ live log), every group message records
@@ -463,8 +486,10 @@ class MediaBot:
 
         # Owner-only pending prompts (settings flows). Consumes the message
         # so it never also triggers a search or an index flow; /cancel or a
-        # command bypasses it.
-        @c.on_message(filters.private & filters.user(admin_ids)
+        # command bypasses it. Sudo admins may only complete the
+        # start_photo kind (via /setstartphoto); all other kinds stay
+        # owner-only.
+        @c.on_message(filters.private & self._priv_filter()
                        & (filters.text | filters.photo))
         async def pending_owner(_, m: Message):
             uid = m.from_user.id if m.from_user else 0
@@ -478,6 +503,10 @@ class MediaBot:
             if (m.text or "").startswith("/"):
                 # Commands bypass a pending prompt (e.g. /cancel, /start)
                 # — again, continue instead of shadowing the command.
+                raise ContinuePropagation
+            if st["kind"] != "start_photo" and not self._is_owner(uid):
+                # Sudo tried to complete a non-photo pending prompt
+                # (shouldn't happen — they can't set those). Ignore.
                 raise ContinuePropagation
             try:
                 await self._handle_pending(m, st["kind"])
@@ -511,7 +540,8 @@ class MediaBot:
                 "Get / Play. Files you get self-destruct in 10 minutes, "
                 "so forward them to your saved messages.\n\n"
                 "Admin: /addchannel · /rmchannel · /channels · /index · "
-                "/reparse · /setskip · /stats · /settings · /users · /broadcast",
+                "/reparse · /setskip · /stats · /settings · /users · /broadcast · "
+                "/setstartphoto · /addsudo · /rmsudo · /sudos",
                 parse_mode=ParseMode.HTML)
 
         @c.on_message(filters.private & filters.command("search"))
@@ -568,7 +598,7 @@ class MediaBot:
         # NOTE: uses the robust is_forwarded check (all origin attributes),
         # not filters.forwarded — forward_date alone can be None/0 on some
         # Pyrogram builds and the forward would be silently ignored.
-        @c.on_message(filters.private & is_forwarded & filters.user(priv_ids))
+        @c.on_message(filters.private & is_forwarded & self._priv_filter())
         async def forward_index(_, m: Message):
             fwd = m.forward_from_chat
             fwd_id = m.forward_from_message_id
@@ -581,7 +611,7 @@ class MediaBot:
                     "Send a post link instead: <code>https://t.me/channelname/123</code>",
                     parse_mode=ParseMode.HTML)
 
-        @c.on_message(filters.private & filters.text & filters.user(priv_ids)
+        @c.on_message(filters.private & filters.text & self._priv_filter()
                        & filters.regex(LINK_RE))
         async def link_index(_, m: Message):
             parsed = _parse_post_link(m.text)
@@ -648,8 +678,14 @@ class MediaBot:
                         except Exception:
                             pass
                         await self._send_start(q.message.chat.id, q.from_user.id)
+                elif data.startswith("users:"):
+                    # /users list is view-only — sudo admins may paginate it.
+                    if not self._is_privileged(q.from_user.id):
+                        await q.answer("Owner/sudo only.", show_alert=True)
+                    else:
+                        await self._owner_callback(q, data)
                 elif data.startswith("settings:") or data.startswith("fsub:") \
-                        or data.startswith("log:") or data.startswith("users:") \
+                        or data.startswith("log:") \
                         or data.startswith("bc:"):
                     if not self._is_owner(q.from_user.id):
                         await q.answer("Owner only.", show_alert=True)
@@ -679,10 +715,10 @@ class MediaBot:
             asyncio.create_task(self.indexer.on_channel_post(_, m))
 
     def _register_admin(self, c):
-        admin_ids = list(self.cfg.admin_ids)
-        priv_ids = list(self.cfg.admin_ids) + list(self.cfg.sudo_ids)
+        # Dynamic permission filters (see _register note): /addsudo changes
+        # take effect immediately, no restart needed.
 
-        @c.on_message(filters.private & filters.command("addchannel") & filters.user(priv_ids))
+        @c.on_message(filters.private & filters.command("addchannel") & self._priv_filter())
         async def addchannel(_, m: Message):
             arg = m.text.partition(" ")[2].strip()
             if not arg:
@@ -704,7 +740,7 @@ class MediaBot:
                                f"and tap ✅ Yes.",
                                parse_mode=ParseMode.HTML)
 
-        @c.on_message(filters.private & filters.command("rmchannel") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("rmchannel") & self._owner_filter())
         async def rmchannel(_, m: Message):
             arg = m.text.partition(" ")[2].strip()
             if not arg:
@@ -718,7 +754,7 @@ class MediaBot:
             await run_db(self.db.remove_source, cid)
             await m.reply_text(f"Removed <code>{cid}</code>.", parse_mode=ParseMode.HTML)
 
-        @c.on_message(filters.private & filters.command("channels") & filters.user(priv_ids))
+        @c.on_message(filters.private & filters.command("channels") & self._priv_filter())
         async def channels(_, m: Message):
             rows = await run_db(self.db.list_sources)
             if not rows:
@@ -735,20 +771,20 @@ class MediaBot:
                              f"— {n} files — {s['status']}")
             await m.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
-        @c.on_message(filters.private & filters.command("index") & filters.user(priv_ids))
+        @c.on_message(filters.private & filters.command("index") & self._priv_filter())
         async def index(_, m: Message):
             await m.reply_text("🔄 Full scan started in the background — "
                                "I'll report here when it's done.")
             asyncio.create_task(self._index_all_report(m.chat.id))
 
-        @c.on_message(filters.private & filters.command("indexstatus") & filters.user(priv_ids))
+        @c.on_message(filters.private & filters.command("indexstatus") & self._priv_filter())
         async def indexstatus(_, m: Message):
             if self.panel:
                 await self.panel.show(m)
             else:
                 await m.reply_text("Panel not ready yet — try again in a few seconds.")
 
-        @c.on_message(filters.private & filters.command("stopindex") & filters.user(priv_ids))
+        @c.on_message(filters.private & filters.command("stopindex") & self._priv_filter())
         async def stopindex(_, m: Message):
             """Stop the running scan (/stopindex [channel_id]); the scan
             finishes its current batch, keeps its checkpoint, and stays
@@ -773,20 +809,20 @@ class MediaBot:
             await m.reply_text(f"🛑 Stopping the scan of <b>{html.escape(name)}</b> — "
                                f"it will halt after its current batch and keep its checkpoint.")
 
-        @c.on_message(filters.private & filters.command("reparse") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("reparse") & self._owner_filter())
         async def reparse(_, m: Message):
             await m.reply_text("🔄 Re-parsing all filenames and regrouping titles — "
                                "I'll report here when it's done.")
             asyncio.create_task(self._reparse_report(m.chat.id))
 
-        @c.on_message(filters.private & filters.command("cleanup") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("cleanup") & self._owner_filter())
         async def cleanup(_, m: Message):
             await m.reply_text("🧹 Cleaning up mis-grouped files — only files whose "
                                "title changed under the current parser get moved; "
                                "posters and matches stay intact. I'll report when done.")
             asyncio.create_task(self._cleanup_report(m.chat.id))
 
-        @c.on_message(filters.private & filters.command("setskip") & filters.user(priv_ids))
+        @c.on_message(filters.private & filters.command("setskip") & self._priv_filter())
         async def setskip(_, m: Message):
             """Skip the first N messages of a channel when scanning.
 
@@ -838,7 +874,7 @@ class MediaBot:
             await m.reply_text(f"✅ Skip set to <b>{n}</b> for <code>{cid}</code>.",
                                parse_mode=ParseMode.HTML)
 
-        @c.on_message(filters.private & filters.command("stats") & filters.user(priv_ids))
+        @c.on_message(filters.private & filters.command("stats") & self._priv_filter())
         async def stats(_, m: Message):
             ts, s = self._stats_cache
             if s is None or time.monotonic() - ts > 30:
@@ -852,20 +888,30 @@ class MediaBot:
                 parse_mode=ParseMode.HTML)
 
         # ---- owner-only: settings, users, broadcast, cancel ----
-        @c.on_message(filters.private & filters.command("settings") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("settings") & self._owner_filter())
         async def settings_cmd(_, m: Message):
             await self._settings_send(m.chat.id)
 
-        @c.on_message(filters.private & filters.command("cancel") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("cancel") & self._priv_filter())
         async def cancel_cmd(_, m: Message):
             self._pending_clear(m.from_user.id)
             await m.reply_text("Cancelled — no setting was changed.")
 
-        @c.on_message(filters.private & filters.command("users") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("users") & self._priv_filter())
         async def users_cmd(_, m: Message):
             await self._users_send(m.chat.id, 0)
 
-        @c.on_message(filters.private & filters.command("broadcast") & filters.user(admin_ids))
+        @c.on_message(filters.private & filters.command("setstartphoto") & self._priv_filter())
+        async def setstartphoto_cmd(_, m: Message):
+            arg = m.text.partition(" ")[2].strip().lower()
+            if arg == "remove":
+                await run_db(owner_mod.set_start_photo, self.db, "")
+                await m.reply_text("📸 Start photo removed.")
+                return
+            self._pending_set(m.from_user.id, "start_photo")
+            await m.reply_text("📸 Send the new start photo now (or /cancel).")
+
+        @c.on_message(filters.private & filters.command("broadcast") & self._owner_filter())
         async def broadcast_cmd(_, m: Message):
             text = m.text.partition(" ")[2].strip()
             if not text:
@@ -877,6 +923,60 @@ class MediaBot:
                 return
             self._bc_draft[m.from_user.id] = {"text": text, "photo": None}
             await self._broadcast_preview(m.chat.id, m.from_user.id)
+
+        # ---- owner-only: sudo admin management ----
+        @c.on_message(filters.private & filters.command("addsudo") & self._owner_filter())
+        async def addsudo_cmd(_, m: Message):
+            arg = m.text.partition(" ")[2].strip()
+            if not arg.lstrip("-").isdigit():
+                await m.reply_text("Usage: /addsudo &lt;user_id&gt;\n"
+                                   "Get someone's id via /id.", parse_mode=ParseMode.HTML)
+                return
+            uid = int(arg)
+            if self._is_owner(uid):
+                await m.reply_text("That user is already the owner.")
+                return
+            if uid in self._sudo_ids:
+                await m.reply_text(f"<code>{uid}</code> is already a sudo admin.",
+                                   parse_mode=ParseMode.HTML)
+                return
+            self._sudo_ids.add(uid)
+            await run_db(owner_mod.set_sudo_ids, self.db, sorted(self._sudo_ids))
+            await m.reply_text(
+                f"✅ Added sudo admin <code>{uid}</code>.\n\n"
+                f"They can now: /index, /indexstatus, /stopindex, /addchannel, "
+                f"/channels, /setskip, /stats, /users, /setstartphoto, and "
+                f"approve channel indexing.\n"
+                f"They <b>cannot</b>: /broadcast, /rmchannel, /cleanup, /reparse, "
+                f"/settings, force-subscribe, or live logs.",
+                parse_mode=ParseMode.HTML)
+
+        @c.on_message(filters.private & filters.command("rmsudo") & self._owner_filter())
+        async def rmsudo_cmd(_, m: Message):
+            arg = m.text.partition(" ")[2].strip()
+            if not arg.lstrip("-").isdigit():
+                await m.reply_text("Usage: /rmsudo &lt;user_id&gt;",
+                                   parse_mode=ParseMode.HTML)
+                return
+            uid = int(arg)
+            if uid not in self._sudo_ids:
+                await m.reply_text(f"<code>{uid}</code> is not a sudo admin.",
+                                   parse_mode=ParseMode.HTML)
+                return
+            self._sudo_ids.discard(uid)
+            await run_db(owner_mod.set_sudo_ids, self.db, sorted(self._sudo_ids))
+            await m.reply_text(f"✅ Removed sudo admin <code>{uid}</code>.",
+                               parse_mode=ParseMode.HTML)
+
+        @c.on_message(filters.private & filters.command("sudos") & self._owner_filter())
+        async def sudos_cmd(_, m: Message):
+            if not self._sudo_ids:
+                await m.reply_text("No sudo admins set. Use /addsudo &lt;user_id&gt;.",
+                                   parse_mode=ParseMode.HTML)
+                return
+            lines = "\n".join(f"• <code>{u}</code>" for u in sorted(self._sudo_ids))
+            await m.reply_text(f"👥 <b>Sudo admins:</b>\n{lines}",
+                               parse_mode=ParseMode.HTML)
 
     # -- owner flows (settings, users, broadcast, pending prompts) --------------
     HELP_TEXT = (

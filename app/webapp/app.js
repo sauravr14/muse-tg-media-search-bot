@@ -337,11 +337,60 @@
     } catch (e) { if (e.fsub) showFsub(e.fsub); else view.innerHTML = `<div class="empty"><span class="big">⚠️</span>Couldn't load this title.</div>`; }
     finally { progress(false); }
   }
+  // ---- audio language detection from the raw filename ----
+  // full names and the short forms uploaders use (hin = Hindi, tam = Tamil, ...)
+  const LANGS = [
+    ["hindi", "Hindi"], ["hin", "Hindi"],
+    ["english", "English"], ["eng", "English"],
+    ["tamil", "Tamil"], ["tam", "Tamil"],
+    ["telugu", "Telugu"], ["tel", "Telugu"],
+    ["malayalam", "Malayalam"], ["mal", "Malayalam"],
+    ["kannada", "Kannada"], ["kan", "Kannada"],
+    ["punjabi", "Punjabi"], ["pun", "Punjabi"],
+    ["bengali", "Bengali"], ["ben", "Bengali"], ["beng", "Bengali"], ["bng", "Bengali"],
+    ["marathi", "Marathi"], ["mar", "Marathi"],
+    ["gujarati", "Gujarati"], ["guj", "Gujarati"],
+    ["urdu", "Urdu"], ["urd", "Urdu"],
+    ["russian", "Russian"], ["rus", "Russian"],
+    ["chinese", "Chinese"], ["chi", "Chinese"], ["mandarin", "Chinese"],
+    ["japanese", "Japanese"], ["jpn", "Japanese"],
+    ["korean", "Korean"], ["kor", "Korean"],
+    ["spanish", "Spanish"], ["spa", "Spanish"],
+    ["french", "French"], ["fre", "French"], ["fra", "French"],
+    ["german", "German"], ["ger", "German"], ["deu", "German"],
+    ["italian", "Italian"], ["ita", "Italian"],
+    ["portuguese", "Portuguese"], ["por", "Portuguese"],
+    ["arabic", "Arabic"], ["ara", "Arabic"],
+    ["persian", "Persian"], ["per", "Persian"], ["farsi", "Persian"],
+    ["turkish", "Turkish"], ["tur", "Turkish"],
+    ["thai", "Thai"], ["tha", "Thai"],
+    ["vietnamese", "Vietnamese"], ["vie", "Vietnamese"],
+    ["indonesian", "Indonesian"], ["ind", "Indonesian"],
+  ];
+  function detectAudio(name) {
+    if (!name) return [];
+    // tokenize on any non-alphanumeric so "HIN"/"hin"/"[Tam]" all become whole tokens;
+    // whole-token matching avoids false hits like "eng" inside "challenge"
+    const toks = String(name).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    const set = new Set(toks);
+    const found = [];
+    for (const [tok, label] of LANGS) {
+      if (set.has(tok) && !found.includes(label)) found.push(label);
+    }
+    if (found.length) return found;
+    const joined = toks.join(" ");
+    if (/dual\s?audi?o/.test(joined)) return ["Dual Audio"];
+    if (/(multi|triple)\s?audi?o/.test(joined)) return ["Multi Audio"];
+    if (/org\s?audi?o/.test(joined)) return ["Original Audio"];
+    return [];
+  }
   function verRow(v, label) {
     const res = v.resolution || "";
+    const langs = detectAudio(v.name);
     return `<div class="ver"><div><div class="q">${label ? esc(label) : ""}${res ? `<span class="res r${esc(res)}">${esc(res.replace("2160p", "4K"))}</span>` : ""}
       ${v.quality ? `<span>${esc(v.quality)}</span>` : ""}${!res && !v.quality && !label ? "Unknown" : ""}</div>
-      <div class="s">${fmtSize(v.size)}${v.codec ? " · " + esc(v.codec) : ""}</div></div>
+      <div class="s">${fmtSize(v.size)}${v.codec ? " · " + esc(v.codec) : ""}</div>
+      ${langs.length ? `<div class="langs">${langs.map((l) => `<span class="lang">${esc(l)}</span>`).join("")}</div>` : ""}</div>
       <div class="ver-btns"><button class="btn ghost" data-play="${v.id}">▶ Play</button><button class="btn" data-file="${v.id}">Get</button></div></div>`;
   }
   function bindGet() {

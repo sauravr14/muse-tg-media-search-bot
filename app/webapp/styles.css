@@ -161,6 +161,11 @@ button { font-family: inherit; }
 .res { font-size: 11px; font-weight: 900; padding: 2px 7px; border-radius: 6px; background: var(--red); color: #fff; }
 .res.r2160p { background: linear-gradient(135deg, #f5c518, #ff8a00); color: #000; }
 .res.r1080p { background: #5b3cff; } .res.r720p { background: #0a8f6a; } .res.r480p, .res.r360p { background: #4a4a5c; }
+.langs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.lang { font-size: 10px; font-weight: 800; letter-spacing: .4px; text-transform: uppercase; padding: 2px 9px; border-radius: 999px;
+  color: #ffd9d9; background: rgba(255, 45, 45, .10); border: 1px solid rgba(255, 80, 80, .60);
+  box-shadow: 0 0 10px rgba(255, 60, 60, .55), inset 0 0 8px rgba(255, 60, 60, .22);
+  text-shadow: 0 0 7px rgba(255, 110, 110, .9); white-space: nowrap; }
 .ep { background: rgba(20, 20, 28, .85); border: 1px solid var(--line); border-radius: 14px; margin: 8px 14px; overflow: hidden; }
 .ep-head { padding: 13px 14px; font-weight: 700; cursor: pointer; display: flex; justify-content: space-between; align-items: center; font-size: 14px; }
 .ep-body { padding: 0 0 8px; }

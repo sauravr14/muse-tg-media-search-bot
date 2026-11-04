@@ -168,6 +168,20 @@ class Classifier:
             return {"title_id": existing["title_id"], "episode_id": existing["episode_id"],
                     "file_id": existing["id"], "duplicate": True}
 
+        # 2026-11-04 DB-lock fix: the whole ingest is ONE transaction, like
+        # the two other clf.ingest() call sites already do. Before this, the
+        # live path ran each write as its own autocommit - when a mid-ingest
+        # statement failed (FK IntegrityError), the pool thread's connection
+        # was left in an open aborted transaction and every later write on
+        # every thread failed with "database is locked" until a restart.
+        # transaction() rolls back on exception, so the lock can never stick.
+        with db.transaction():
+            return self._ingest_tx(p, file_meta, tmdb_meta)
+
+    def _ingest_tx(self, p, file_meta, tmdb_meta):
+        """Ingest body, run inside db.transaction() by ingest()."""
+        db = self.db
+        now = time.time()
         title = self.find_title(p)
         if title is None:
             title = self.create_title(p, tmdb_meta)

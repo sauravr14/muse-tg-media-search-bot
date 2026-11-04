@@ -321,9 +321,23 @@ class DB:
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._write_lock:
-            cur = self._conn().execute(sql, params)
+            conn = self._conn()
+            try:
+                cur = conn.execute(sql, params)
+            except sqlite3.Error:
+                # 2026-11-04 DB-lock fix: a failed statement (e.g. a FK
+                # IntegrityError mid-ingest) used to leave this thread-local
+                # connection in an open ABORTED transaction - SQLite keeps
+                # the transaction active, so every later write on every
+                # thread failed with "database is locked" until a restart.
+                # Rolling back here means a failed write can never stick a
+                # connection again. Inside an explicit transaction() the
+                # outer block owns rollback on exception, so leave it alone.
+                if not self._in_tx():
+                    conn.rollback()
+                raise
             if not self._in_tx():
-                self._conn().commit()
+                conn.commit()
             return cur
 
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:

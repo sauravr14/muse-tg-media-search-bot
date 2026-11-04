@@ -951,8 +951,16 @@ class Indexer:
                     except asyncio.TimeoutError:
                         continue
             if title_id is not None:
-                await self._guard_wait()
-                await self._enrich_one(title_id)
+                # 2026-11-04: one bad title must never kill the whole loop.
+                # A transient DB error (e.g. 'database is locked' when two
+                # processes write at once) used to propagate out of
+                # enricher_loop and stop the enricher silently.
+                try:
+                    await self._guard_wait()
+                    await self._enrich_one(title_id)
+                except Exception:
+                    log.exception("enricher: title %s failed, continuing",
+                                  title_id)
                 await asyncio.sleep(0.3)
 
     def _backlog_ids(self, limit: int) -> list[int]:

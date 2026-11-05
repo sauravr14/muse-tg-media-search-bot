@@ -90,6 +90,26 @@ class ApiTest(unittest.TestCase):
         # poster-less titles (Dark) stay out of the poster rails
         self.assertNotIn("Recently added series", rails)
 
+    def test_home_new_rails(self):
+        # "New posters" reads the enricher-maintained recent_matches kv;
+        # "Top rated" is rating>=7.5 ordered by popularity (famous+liked,
+        # not obscure one-vote 10.0s). Both are empty without their data.
+        tid = self.db.query_one(
+            "SELECT id FROM titles WHERE title='Inception'")["id"]
+        self.db.execute(
+            "UPDATE titles SET tmdb_id=27205, poster='p.jpg', backdrop='b.jpg',"
+            " overview='A dream heist.', year=2026, rating=8.5,"
+            " popularity=500 WHERE id=?", (tid,))
+        self.db.set_kv("recent_matches", json.dumps([tid]))
+        d = self.client.get("/api/home").json()
+        rails = {r["title"]: r["results"] for r in d["rows"]}
+        self.assertIn("New posters", rails)
+        self.assertEqual([t["title"] for t in rails["New posters"]],
+                         ["Inception"])
+        self.assertIn("Top rated", rails)
+        self.assertEqual([t["title"] for t in rails["Top rated"]],
+                         ["Inception"])
+
     def test_movie_detail_versions(self):
         # note: test_admin_hide runs first alphabetically and hides the 1080p file
         tid = self.client.get("/api/search", params={"q": "Inception"}).json()["results"][0]["id"]

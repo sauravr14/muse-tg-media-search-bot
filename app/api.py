@@ -248,11 +248,49 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
             "SELECT * FROM titles WHERE tmdb_id IS NOT NULL AND poster != ''"
             + clean
             + " ORDER BY popularity DESC NULLS LAST LIMIT 18")
+
+        # "New posters" (2026-11-05): the freshest TMDB matches, newest
+        # first. The enricher keeps a capped id list in kv
+        # ("recent_matches") because joining titles to the 96k-row kv
+        # table on tmdb_try: costs ~14s per home load (measured) — the
+        # list makes this rail one cheap id lookup instead. Order comes
+        # from the list (Python), not SQL: IN (...) preserves nothing.
+        new_posters: list = []
+        try:
+            recent_ids = json.loads(
+                await run_db(db.get_kv, "recent_matches", "[]") or "[]")
+        except Exception:
+            recent_ids = []
+        recent_ids = [int(i) for i in recent_ids
+                      if isinstance(i, int)][:18]
+        if recent_ids:
+            fetched = await run_db(
+                db.query,
+                "SELECT * FROM titles WHERE id IN (%s)"
+                " AND tmdb_id IS NOT NULL AND poster != ''"
+                % ",".join(["?"] * len(recent_ids)) + clean,
+                tuple(recent_ids))
+            by_id = {t["id"]: t for t in fetched}
+            new_posters = [by_id[i] for i in recent_ids if i in by_id]
+
+        # "Top rated" (2026-11-05): famous AND liked — rating >= 7.5
+        # ordered by popularity. Pure rating DESC surfaces obscure 10.0s
+        # (one-vote titles); the popularity order keeps it to titles
+        # people actually watch. Measured 0.00s on the live catalog.
+        top_rated = await run_db(
+            db.query,
+            "SELECT * FROM titles WHERE tmdb_id IS NOT NULL AND poster != ''"
+            " AND rating >= 7.5" + clean
+            + " ORDER BY popularity DESC NULLS LAST LIMIT 18")
         rows = [
+            {"title": "New posters",
+             "results": [_title_card(t) for t in new_posters]},
             await rail("movie", "2026 Movies"),
             await rail("series", "2026 Series"),
             {"title": "Trending now",
              "results": [_title_card(t) for t in trending]},
+            {"title": "Top rated",
+             "results": [_title_card(t) for t in top_rated]},
         ]
         return {"hero": [hero_card(t) for t in heroes[:6]],
                 "rows": [r for r in rows if r["results"]]}

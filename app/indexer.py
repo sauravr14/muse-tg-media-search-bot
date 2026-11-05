@@ -1142,6 +1142,31 @@ class Indexer:
                 self.db.execute("UPDATE episodes SET ep_title=? WHERE id=?",
                                 (name, ep_id))
 
+    def _note_recent_match_sync(self, title_id: int) -> None:
+        """Record a fresh TMDB match for the homepage "New posters" rail.
+
+        Keeps a capped (50) newest-first id list in kv ("recent_matches").
+        A join against tmdb_try: costs ~14s per home load on the live
+        catalog (96k kv rows), so the rail reads this list instead.
+        Never raises: a kv failure must not break the enrich loop.
+        """
+        import json
+        try:
+            raw = self.db.get_kv("recent_matches", "[]") or "[]"
+            ids = json.loads(raw)
+            if not isinstance(ids, list):
+                ids = []
+        except Exception:
+            ids = []
+        ids = [title_id] + [i for i in ids if i != title_id]
+        try:
+            self.db.set_kv("recent_matches", json.dumps(ids[:50]))
+        except Exception:
+            log.warning("recent_matches kv write failed", exc_info=True)
+
+    async def _note_recent_match(self, title_id: int) -> None:
+        await run_db(self._note_recent_match_sync, title_id)
+
     async def _adopt_meta(self, row, meta: dict) -> None:
         from .parser import normalize_title
         db = self.db
@@ -1152,6 +1177,7 @@ class Indexer:
                              (meta["tmdb_id"], row["id"]))
         if other:
             await self._merge_titles(row["id"], other["id"])
+            await self._note_recent_match(other["id"])
             return
         await run_db(
             db.execute,
@@ -1165,6 +1191,7 @@ class Indexer:
              __import__("json").dumps(meta.get("genres", [])),
              meta.get("rating"), meta.get("popularity"), meta.get("lang", ""), now, row["id"]),
         )
+        await self._note_recent_match(row["id"])
         # fill episode titles for series — capped and batched: episode
         # names are garnish, and an uncapped fill once meant one TMDB
         # call per episode (500+ for a long anime) inside a single enrich.

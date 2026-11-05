@@ -81,6 +81,69 @@ PACK_RANGE_RE = re.compile(r"[\(\[\{]\s*[Ee](\d{1,3})\s*[-–_\s]\s*(?:[Ee])?(\d
 SEASON_NUM_RE = re.compile(r"\b[Ss](\d{1,2})\b")
 SEASON_WORD_RE = re.compile(r"\b[Ss]eason\s+(\d{1,2})\b", re.I)
 
+# --- spec v2 (2026-11-05) "boundary first, lists last" -------------------
+# Soft phrases that end a title even with no year/hard marker.
+SOFT_PHRASE_RE = re.compile(
+    r"\b(?:hindi\s+dubbed|dual\s+audio|multi\s+audio|full\s+movie|"
+    r"watch\s+online|download|"
+    r"\d*\s*movies?\s+in\s+multiple\s+languages?|"
+    r"complete|combined|unrated|extended|proper|repack)\b",
+    re.I,
+)
+# Language words: only a RUN (>=2 consecutive) ends a title (R9); a single
+# word may be the title ("Hindi Medium").
+LANG_WORDS = {
+    "hindi", "hin", "tamil", "tam", "telugu", "tel", "malayalam", "mal",
+    "kannada", "kan", "bengali", "bangla", "punjabi", "marathi", "gujarati",
+    "urdu", "english", "eng", "engli", "korean", "japanese", "chinese",
+    "spanish", "french", "german", "russian", "thai", "turkish", "arabic",
+    "farsi", "multi", "dual",
+}
+# Non-video extensions: never get a title row (R12, S0 gate).
+NON_VIDEO_EXTS = {
+    "apk", "exe", "zip", "rar", "7z", "pdf", "srt", "ass", "sub", "txt",
+    "jpg", "png", "torrent", "nfo", "iso", "dmg",
+}
+
+
+def _boundary_cut(name: str, include_soft: bool = True) -> int | None:
+    """Earliest title-ending boundary in the flattened name, or None.
+
+    Candidates: first hard marker (resolution/codec/source/cam), first
+    season word, and — only when include_soft — first soft phrase and
+    first language run (>=2 consecutive language tokens, never starting
+    at position 0). A candidate only counts when title-like text
+    (letters) precedes it, so number-only titles ("1917", "2012") and
+    marker-leading names are never cut bare. Soft candidates are skipped
+    when a year is already known: the year-cut is authoritative there,
+    and a soft word before it may be the title ("A Complete Unknown").
+    """
+    cands = []
+    for rx, _ in RES_PATTERNS + CODEC_PATTERNS + SOURCE_PATTERNS:
+        m = rx.search(name)
+        if m and re.search(r"[A-Za-z]", name[: m.start()]):
+            cands.append(m.start())
+    for rx in CAM_PATTERNS:
+        m = rx.search(name)
+        if m and re.search(r"[A-Za-z]", name[: m.start()]):
+            cands.append(m.start())
+    m = SEASON_WORD_RE.search(name)
+    if m and re.search(r"[A-Za-z]", name[: m.start()]):
+        cands.append(m.start())
+    if include_soft:
+        m = SOFT_PHRASE_RE.search(name)
+        if m and re.search(r"[A-Za-z]", name[: m.start()]):
+            cands.append(m.start())
+        spans = [(mm.group(0), mm.start()) for mm in re.finditer(r"\S+", name)]
+        for i in range(1, len(spans)):
+            j = i
+            while j < len(spans) and spans[j][0].strip("+-.,").lower() in LANG_WORDS:
+                j += 1
+            if j - i >= 2:
+                cands.append(spans[i][1])
+                break
+    return min(cands) if cands else None
+
 
 def _detect_pack(name: str, p: "ParsedName", pack_range: tuple | None = None) -> str:
     """Detect season-pack filenames ("S01 COMBINED", "[E01-04]").
@@ -224,7 +287,7 @@ TAG_STRIP_RE = re.compile(
     r"\b\d+\s*CH\b|"
     r"\bPSAOyeSale\b|\bHarsh\b|\bPSA\b|"
     r"AAC\s+5(?!\s*1)|DD\b|"
-    r"AAC|AC3|EAC3|DTS(?:-HD)?|DDP?\s*2\s*0|DDP?\s*5\s*1|\b5\s*1\b|\b2\s*0\b|ATMOS|TRUEHD|"
+    r"AAC|AC3|EAC3|DTS(?:-HD)?|DDP?\s*2\s*0|DDP?\s*5\s*1|\b5\s+1\b|\b2\s+0\b|ATMOS|TRUEHD|"
     r"AAC\s*5\s*1|"
     r"H\s*26[45]\b|"
     r"ESUBS?|SUBS|SUBBED|DUBBED|DUAL|MULTI|"
@@ -306,6 +369,12 @@ def normalize_title(title: str) -> str:
 
 def parse_filename(raw: str) -> ParsedName:
     p = ParsedName(raw=raw)
+    # S0 gate (spec v2 R12): non-video files never get a title row — both
+    # ingest call sites already skip when p.title is empty.
+    _m_ext = re.search(r"\.([A-Za-z0-9]{2,5})$", raw.strip())
+    if _m_ext and _m_ext.group(1).lower() in NON_VIDEO_EXTS:
+        p.extra["skip"] = "non-video"
+        return p
     name = _strip_ext(raw.strip())
     # UUIDs must go before separators are flattened ("a-b-c" -> "a b c")
     name = UUID_RE.sub(" ", name)
@@ -318,6 +387,18 @@ def parse_filename(raw: str) -> ParsedName:
     # pack episode range like [E01-04]: read before "-" is flattened
     rm = PACK_RANGE_RE.search(name)
     pack_range = (int(rm.group(1)), int(rm.group(2))) if rm else None
+    # v2 R15: protect dotted acronyms ("S.W.A.T." -> "SWAT") before the
+    # separators are flattened; dots followed by a space or digit are
+    # untouched ("Mr. Smith", "5.1").
+    name = re.sub(r"(?<=\b[A-Za-z])\.(?=[A-Za-z]\b)", "", name)
+    # v2 R13: anime absolute episode ("[Group] Title - 12 (1080p)") — the
+    # " - NN" separator is flattened away below, so record it now; it is
+    # applied at the end only when a leading group tag is present.
+    _anime_ep = None
+    if re.match(r"\s*[\[{]", name):
+        _am = re.search(r"-\s*(\d{1,3})\s*[\(\[]", name)
+        if _am:
+            _anime_ep = int(_am.group(1))
     # flatten separators FIRST so \b-anchored patterns work on
     # underscore/dot filenames ("Lanterns_2026_S01E01_720p")
     name = re.sub(r"[._\-+]+", " ", name)
@@ -327,6 +408,24 @@ def parse_filename(raw: str) -> ParsedName:
     # leading site domain spelled out as words: "www 1TamilMV cool Spider..."
     # (from "www_1TamilMV_cool_...") — the domain is never the title
     name = re.sub(r"^www\s+\S+\s+(?:com|net|cool|org|me|to|info)\s+", " ", name, flags=re.I)
+    # v2 S2: strip leading [tag]/{tag} release-group tags ("[CC]",
+    # "[SubsPlease]"); parens are NOT stripped here — "(500) Days of
+    # Summer" is a real title. The first tag is remembered for
+    # strip-then-rescue (R8) at the end. Bracketed season/episode
+    # markers ("[S01E01]", "[E01-08]") are never stripped — they are
+    # content, and the pack range was already read from the raw name.
+    lead_tag = ""
+    while True:
+        _lm = re.match(r"\s*[\[\{]([^\[\]{}]{1,24})[\]\}][\s._\-]*", name)
+        if not _lm:
+            break
+        _content = _lm.group(1).strip()
+        if (re.fullmatch(r"(?i)S\d{1,2}(E\d{1,3})?", _content)
+                or re.fullmatch(r"E\d{1,3}\s*[-–]\s*E?\d{1,3}", _content)):
+            break
+        if not lead_tag:
+            lead_tag = _content
+        name = name[_lm.end():]
 
     # episode-range mini-packs ("S01 E01-05") BEFORE season packs and
     # series markers: a range must never be filed as its first episode
@@ -361,11 +460,13 @@ def parse_filename(raw: str) -> ParsedName:
     series_tail = ""
     if not p.is_pack:
         m = (SE_RE.search(name) or SE_SPACED_RE.search(name) or X_RE.search(name)
-             or SEASON_EP_WORDS_RE.search(name) or SE_BARE_RE.search(name))
+             or SEASON_EP_WORDS_RE.search(name) or SE_BARE_RE.search(name)
+             or SEASON_NUM_RE.search(name))
         if m:
             p.kind = "series"
             p.season = int(m.group(1))
-            p.episode = int(m.group(2))
+            # season-only markers ("S01", "Season 2") have no group 2
+            p.episode = int(m.group(2)) if m.lastindex and m.lastindex >= 2 else None
             if re.search(r"[A-Za-z]", name[: m.start()]):
                 # The title is the text BEFORE the marker. Words after it
                 # are the episode's own name or release tags, never the
@@ -395,6 +496,17 @@ def parse_filename(raw: str) -> ParsedName:
             # ("Kick Bollywood Fi", "Spider Man No Way Home X26", ...).
             # Cut the tail wholesale; the pre-year part is the title.
             name = before
+            # v2 R7: if nothing but release tags follows the year, the
+            # year was the last real token — offer "Title Year" as a
+            # matcher alternate ("Wonder Woman 1984").
+            _after_clean = after
+            for _rx, _ in RES_PATTERNS + CODEC_PATTERNS + SOURCE_PATTERNS:
+                _after_clean = _rx.sub(" ", _after_clean)
+            for _rx in CAM_PATTERNS:
+                _after_clean = _rx.sub(" ", _after_clean)
+            _after_clean = TAG_STRIP_RE.sub(" ", _after_clean)
+            if not re.search(r"[A-Za-z]", _after_clean):
+                p.extra["year_was_last"] = True
             # ...except an episode-only marker hiding in the tail
             # ("Some Show 2019 E02") — rescue it before the tail goes.
             if p.kind == "movie" and not p.is_pack:
@@ -425,6 +537,30 @@ def parse_filename(raw: str) -> ParsedName:
             p.episode = int(m.group(1))
             name = name[: m.start()] + " " + name[m.end():]
 
+    # v2 S6 boundary cut: the title ends at the FIRST hard marker, soft
+    # phrase, or language run — even with no year. Everything after the
+    # first known marker is metadata by construction, which is what kills
+    # unknown trailing junk ("... BluRay 720p MoviesVerse"). The year
+    # rescue above already ran, so cutting the name here cannot lose it.
+    # Soft candidates are skipped when a year is known: the year-cut is
+    # authoritative there ("A Complete Unknown 2024" keeps "Complete").
+    _cut = _boundary_cut(name, include_soft=(p.year is None))
+    if _cut is not None:
+        name = name[:_cut]
+
+    # v2 R10: parenthesised non-year text is an alias candidate
+    # ("LGM (let's get married)"), kept for the matcher; the group itself
+    # is still dropped from the title below.
+    for _am in re.finditer(r"\(([^()]{3,60})\)", name):
+        _t = _am.group(1).strip()
+        if (not YEAR_RE.search(_t)
+                and not any(_rx.search(_t) for _rx, _ in RES_PATTERNS + CODEC_PATTERNS + SOURCE_PATTERNS)
+                and re.search(r"[A-Za-z]{3}", _t)
+                and not all(_w.lower() in LANG_WORDS for _w in re.split(r"\s+", _t) if _w)):
+            p.extra.setdefault("aliases", []).append(_t)
+    # v2 R14: remember whether a parenthesised group was present — a bare
+    # 2-3 digit number straight after one is an episode, not title.
+    had_paren_group = bool(re.search(r"\([^()]{3,}\)", name))
     # drop anything in brackets/parens/braces (release info, not title)
     name = re.sub(r"[\(\[].*?[\)\]]", " ", name)
     name = re.sub(r"\{.*?\}", " ", name)
@@ -446,9 +582,16 @@ def parse_filename(raw: str) -> ParsedName:
     # truncated tag letter: "... 10bit N" (was "NF"), "... WEBRip x"
     # (was "x264") — case-insensitive, the flattened name is not cased yet
     name = re.sub(r"\s+[A-Z]\s*$", " ", name, flags=re.I)
-    name = re.sub(r"\b(Season|Series|Episode|Ep|Dual|Audio|Hindi|Hin|English|Engli|Eng|"
-                r"Tam|Tel|Mal|Kan|Multi|ESub|Farsi|"
+    name = re.sub(r"\b(Season|Series|Episode|Ep|Dual|Audio|Multi|ESub|"
                 r"Bollywood|Tollywood|Kollywood|Mollywood|Sandalwood)\b", " ", name, flags=re.I)
+    # v2 R9: languages only in the tail — a TRAILING language word is
+    # metadata ("Movie Hindi"), but a leading one may be the title
+    # ("Hindi Medium"). Runs of >=2 were already cut by _boundary_cut.
+    name = re.sub(
+        r"\s+\b(Hindi|Hin|Tamil|Tam|Telugu|Tel|Malayalam|Mal|Kannada|Kan|"
+        r"Bengali|Bangla|Punjabi|Marathi|Gujarati|Urdu|English|Engli|Eng|"
+        r"Korean|Japanese|Chinese|Spanish|French|German|Russian|Thai|"
+        r"Turkish|Arabic|Farsi)\b\s*$", " ", name, flags=re.I)
     # site suffix: "MoviesMod Com" (was ".com")
     name = re.sub(r"\s+\bCom\b\s*$", " ", name, flags=re.I)
     # trailing release-group / site watermarks, applied until stable so
@@ -472,13 +615,49 @@ def parse_filename(raw: str) -> ParsedName:
             toks = m.group(1).split()
             # never strip the name bare: a number-only title ("1917",
             # "2012") keeps its number — it IS the title
+            # v2 R7: a 4-digit trailing token is a year-like title number
+            # ("Blade Runner 2049", "Wonder Woman 1984") — never strip it.
             if (any(len(t) >= 2 or t == "0" or len(toks) > 1 for t in toks)
+                    and not any(len(t) == 4 for t in toks)
                     and name[: m.start()].strip()):
                 name = name[: m.start()].strip()
     name = re.sub(r"\s+", " ", name).strip(" -")
     # leading emoji / punctuation junk from captions ("🎬 Vivah" -> "Vivah")
     name = re.sub(r"^[^\w\s]+", "", name).strip()
 
-    p.title = name.strip().title() if name.strip() else _strip_ext(raw).strip()
+    if name.strip():
+        p.title = name.strip().title()
+    elif lead_tag:
+        # v2 R8 strip-then-rescue: the bracket text WAS the title
+        # ("[REC] 2007 720p" -> "Rec").
+        p.title = lead_tag.strip().title()
+    else:
+        p.title = _strip_ext(raw).strip()
+    # v2 R7 alternate: "Wonder Woman 1984" (title does not already end
+    # in a number — "Blade Runner 2049" needs no alternate).
+    if p.extra.pop("year_was_last", False) and p.year and p.title and not re.search(r"\d$", p.title):
+        p.extra["alts"] = [f"{p.title} {p.year}"]
+    # v2 R13: anime absolute episode recorded before flattening.
+    if _anime_ep is not None and p.kind == "movie" and not p.is_pack:
+        _mm = re.search(r"\s+(\d{1,3})$", p.title)
+        if _mm and int(_mm.group(1)) == _anime_ep:
+            p.kind = "series"
+            p.episode = _anime_ep
+            p.title = p.title[: _mm.start()].strip()
+    # v2 R14: bare 2-3 digit number straight after a parenthesised alias
+    # group is an episode, not title ("Throne Of Seal (alias) 20").
+    if p.kind == "movie" and not p.is_pack and had_paren_group:
+        _mm = re.search(r"\s+(\d{2,3})$", p.title)
+        if _mm:
+            p.kind = "series"
+            p.episode = int(_mm.group(1))
+            p.title = p.title[: _mm.start()].strip()
+    # v2 R6: a title that is only a season/episode marker (or a bare
+    # number) is unknowable — leave it unmatched, never mint junk.
+    if p.title and re.fullmatch(
+            r"[\s\[\]()\-]*(?:[Ss]\d{1,2})?[\s\-]*(?:[Ee](?:p(?:isode)?)?)?\s*\d{1,3}[\s\[\]()\-]*",
+            p.title):
+        p.title = ""
+        p.extra["skip"] = "no-title"
     p.norm_title = normalize_title(p.title)
     return p

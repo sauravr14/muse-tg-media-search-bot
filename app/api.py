@@ -249,7 +249,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
             + clean
             + " ORDER BY popularity DESC NULLS LAST LIMIT 18")
 
-        # "New posters" (2026-11-05): the freshest TMDB matches, newest
+        # "Recently🔥" (2026-11-05): the freshest TMDB matches, newest
         # first. The enricher keeps a capped id list in kv
         # ("recent_matches") because joining titles to the 96k-row kv
         # table on tmdb_try: costs ~14s per home load (measured) — the
@@ -283,7 +283,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
             " AND rating >= 7.5" + clean
             + " ORDER BY popularity DESC NULLS LAST LIMIT 18")
         rows = [
-            {"title": "New posters",
+            {"title": "Recently🔥",
              "results": [_title_card(t) for t in new_posters]},
             await rail("movie", "2026 Movies"),
             await rail("series", "2026 Series"),

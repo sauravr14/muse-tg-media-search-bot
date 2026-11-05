@@ -1143,7 +1143,7 @@ class Indexer:
                                 (name, ep_id))
 
     def _note_recent_match_sync(self, title_id: int) -> None:
-        """Record a fresh TMDB match for the homepage "New posters" rail.
+        """Record a fresh TMDB match for the homepage "Recently🔥" rail.
 
         Keeps a capped (50) newest-first id list in kv ("recent_matches").
         A join against tmdb_try: costs ~14s per home load on the live

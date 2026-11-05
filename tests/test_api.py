@@ -91,7 +91,7 @@ class ApiTest(unittest.TestCase):
         self.assertNotIn("Recently added series", rails)
 
     def test_home_new_rails(self):
-        # "New posters" reads the enricher-maintained recent_matches kv;
+        # "Recently🔥" reads the enricher-maintained recent_matches kv;
         # "Top rated" is rating>=7.5 ordered by popularity (famous+liked,
         # not obscure one-vote 10.0s). Both are empty without their data.
         tid = self.db.query_one(
@@ -103,8 +103,8 @@ class ApiTest(unittest.TestCase):
         self.db.set_kv("recent_matches", json.dumps([tid]))
         d = self.client.get("/api/home").json()
         rails = {r["title"]: r["results"] for r in d["rows"]}
-        self.assertIn("New posters", rails)
-        self.assertEqual([t["title"] for t in rails["New posters"]],
+        self.assertIn("Recently🔥", rails)
+        self.assertEqual([t["title"] for t in rails["Recently🔥"]],
                          ["Inception"])
         self.assertIn("Top rated", rails)
         self.assertEqual([t["title"] for t in rails["Top rated"]],

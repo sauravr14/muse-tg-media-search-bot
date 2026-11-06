@@ -874,8 +874,15 @@ class Indexer:
         if not src:
             return
         try:
-            await run_db(self.note_seen, msg.chat.id, msg.id)
+            # 2026-11-06: mark seen only AFTER a successful ingest. The old
+            # order (note_seen first) silently skipped any post whose ingest
+            # failed (e.g. FK race with an enricher title merge) until a
+            # full rescan. A failed ingest now leaves max_seen unmoved, so
+            # the next scan retries the post; ingest is idempotent on
+            # (tg_chat_id, tg_msg_id), so a retry is harmless. Non-file
+            # posts still get marked seen (ingest_message returns None).
             await self.ingest_message(msg)
+            await run_db(self.note_seen, msg.chat.id, msg.id)
         except Exception as e:
             log.warning("live ingest failed: %r", e)
 

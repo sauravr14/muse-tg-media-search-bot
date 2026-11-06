@@ -2,6 +2,7 @@
 in-memory title cache in Classifier.find_title."""
 import asyncio
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -130,6 +131,60 @@ class TestPipelinedScan(unittest.TestCase):
             res = asyncio.run(idx.scan_source(self.chat_id, top_id=250))
         finally:
             im.MAX_BATCH_RETRIES = old_retries
+        self.assertIn("error", res)
+        row = self.db.query_one(
+            "SELECT last_msg_id, status FROM sources WHERE chat_id=?",
+            (self.chat_id,))
+        self.assertEqual(row["last_msg_id"], 100)
+        self.assertEqual(row["status"], "error")
+
+    def test_batch_integrity_error_skips_bad_file(self):
+        # One file in batch 2 fails with an FK IntegrityError (the
+        # 2026-11-06 onemillianhub failure mode: the enricher merged
+        # the parent title between lookup and INSERT). The old code
+        # rolled back the whole 100-file batch and the supervisor
+        # retried it forever; the scan must now ingest the other 99
+        # and move past the bad file.
+        msgs = {i: make_msg(i, self.chat_id) for i in range(1, 251)}
+        client = FakeClient(msgs)
+        idx = Indexer(client, self.db, TMDB(self.db, ""))
+        orig_one = idx._ingest_one
+
+        def flaky_one(meta):
+            if meta["tg_msg_id"] == 150:
+                raise sqlite3.IntegrityError(
+                    "FOREIGN KEY constraint failed")
+            return orig_one(meta)
+
+        idx._ingest_one = flaky_one
+        res = asyncio.run(idx.scan_source(self.chat_id, top_id=250))
+        self.assertNotIn("error", res)
+        self.assertEqual(res["scanned"], 250)
+        row = self.db.query_one(
+            "SELECT last_msg_id, status FROM sources WHERE chat_id=?",
+            (self.chat_id,))
+        self.assertEqual(row["last_msg_id"], 250)
+        self.assertEqual(row["status"], "idle")
+        # the other 249 files landed; only msg 150 was skipped
+        n = self.db.query_one("SELECT COUNT(*) c FROM files")["c"]
+        self.assertEqual(n, 249)
+
+    def test_batch_non_integrity_error_still_aborts(self):
+        # A systemic error (not an FK failure) must still abort the
+        # scan with the checkpoint preserved — never silently skip 100
+        # files on e.g. a disk or lock failure.
+        msgs = {i: make_msg(i, self.chat_id) for i in range(1, 251)}
+        client = FakeClient(msgs)
+        idx = Indexer(client, self.db, TMDB(self.db, ""))
+        orig_one = idx._ingest_one
+
+        def broken_one(meta):
+            if meta["tg_msg_id"] == 150:
+                raise OSError("disk full")
+            return orig_one(meta)
+
+        idx._ingest_one = broken_one
+        res = asyncio.run(idx.scan_source(self.chat_id, top_id=250))
         self.assertIn("error", res)
         row = self.db.query_one(
             "SELECT last_msg_id, status FROM sources WHERE chat_id=?",

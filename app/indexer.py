@@ -16,6 +16,7 @@ import hashlib
 import inspect
 import json
 import logging
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -158,7 +159,26 @@ class Indexer:
         transaction (~7 commits/file -> 1 commit/batch), on a worker
         thread so the commit/fsync can never stall the event loop.
         Returns counts plus title ids that need enrichment (enqueued by
-        the caller on the loop thread)."""
+        the caller on the loop thread).
+
+        If the whole batch fails with an IntegrityError (the known
+        failure mode: one file's parent title/season was merged or
+        deleted by the enricher between lookup and INSERT, so the
+        single transaction rolls back and the checkpoint never
+        advances), retry message-by-message and skip just the bad
+        files, so the scan moves past them instead of looping on the
+        same batch forever. Any other error still aborts the batch —
+        a systemic failure must not silently skip 100 files.
+        """
+        try:
+            return self._ingest_batch_tx(msgs)
+        except sqlite3.IntegrityError as e:
+            log.warning("scan batch failed as a whole (%r); retrying "
+                        "message-by-message and skipping bad files", e)
+            return self._ingest_batch_single(msgs)
+
+    def _ingest_batch_tx(self, msgs) -> dict:
+        """Fast path: the whole batch in one transaction."""
         done = new = 0
         enrich_ids: list[int] = []
         with self.db.transaction():
@@ -174,7 +194,40 @@ class Indexer:
                     new += 1
                 if enrich_id is not None:
                     enrich_ids.append(enrich_id)
-        return {"done": done, "new": new, "enrich_ids": enrich_ids}
+        return {"done": done, "new": new, "enrich_ids": enrich_ids,
+                "skipped": 0}
+
+    def _ingest_batch_single(self, msgs) -> dict:
+        """Slow path: one transaction per message, skipping the ones
+        that still fail with an IntegrityError. Any other error
+        re-raises so the scan aborts (and the supervisor retries)
+        instead of silently skipping files on a systemic failure."""
+        done = new = skipped = 0
+        enrich_ids: list[int] = []
+        for msg in msgs:
+            done += 1
+            if msg is None or getattr(msg, "empty", False):
+                continue
+            meta = _file_meta_from_msg(msg)
+            if meta is None:
+                continue
+            try:
+                with self.db.transaction():
+                    res, enrich_id = self._ingest_one(meta)
+            except sqlite3.IntegrityError as e:
+                skipped += 1
+                log.warning("scan: skipping msg %s: %r",
+                            getattr(msg, "id", "?"), e)
+                continue
+            if res and not res.get("duplicate"):
+                new += 1
+            if enrich_id is not None:
+                enrich_ids.append(enrich_id)
+        if skipped:
+            log.warning("scan batch: skipped %d bad file(s) after "
+                        "per-message retry", skipped)
+        return {"done": done, "new": new, "enrich_ids": enrich_ids,
+                "skipped": skipped}
 
     # -- historical scan -----------------------------------------------------
     def max_seen(self, chat_id: int) -> int:

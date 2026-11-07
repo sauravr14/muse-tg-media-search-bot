@@ -208,6 +208,22 @@ CREATE TABLE IF NOT EXISTS pending_deletes (
     UNIQUE(chat_id, msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_pending_deletes_due ON pending_deletes(delete_at);
+
+-- user movie/show requests (2026-11-07): one row per /request, closed by
+-- /done <code>. code is the short id printed in the #requested log line.
+CREATE TABLE IF NOT EXISTS requests (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    code       TEXT NOT NULL UNIQUE,
+    user_id    INTEGER NOT NULL,
+    username   TEXT NOT NULL DEFAULT '',
+    first_name TEXT NOT NULL DEFAULT '',
+    title      TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'open',
+    created_at REAL NOT NULL,
+    done_at    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_requests_code ON requests(code);
+CREATE INDEX IF NOT EXISTS idx_requests_user_day ON requests(user_id, created_at);
 """
 
 

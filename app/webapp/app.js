@@ -488,6 +488,17 @@
     camOn = !camOn; store.set("camFilter2", camOn); renderCamToggle(); haptic(); route();
   });
   renderCamToggle();
+  // Request button: open the bot DM with /start request armed, so the
+  // user's next message is captured as the request title. Telegram links
+  // cannot pre-fill the input box, so the deep link is the closest
+  // faithful equivalent — one tap, no command to type.
+  const reqBtn = $("reqBtn");
+  if (reqBtn) reqBtn.addEventListener("click", () => {
+    haptic();
+    const url = "https://t.me/CORETGOFFICIALBOT?start=request";
+    if (tg && tg.openTelegramLink) tg.openTelegramLink(url);
+    else window.open(url, "_blank");
+  });
   $("camInfo").addEventListener("click", () => { $("camModal").hidden = false; });
   $("camModalClose").addEventListener("click", () => { $("camModal").hidden = true; });
   $("camModal").addEventListener("click", (e) => { if (e.target.id === "camModal") e.target.hidden = true; });

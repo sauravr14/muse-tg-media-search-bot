@@ -64,6 +64,14 @@ button { font-family: inherit; }
 .cam-toggle.on { background: linear-gradient(135deg, #e50914, #ff6a3d); color: #fff; border-color: transparent; box-shadow: 0 0 16px rgba(229, 9, 20, .55); }
 .info-btn { width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--line); background: rgba(20, 20, 28, .8);
   color: var(--muted); font: italic 800 13px Georgia, serif; cursor: pointer; line-height: 1; }
+/* Request button: full-width red CTA directly under the top row, above
+   search — the most visible spot in the header, on every tab. */
+.req-row { margin-bottom: 8px; }
+.req-btn { width: 100%; padding: 10px 14px; border-radius: 12px; border: none;
+  background: linear-gradient(135deg, #e50914, #ff6a3d); color: #fff;
+  font-size: 14px; font-weight: 800; letter-spacing: .3px; cursor: pointer;
+  box-shadow: 0 0 18px rgba(229, 9, 20, .45); white-space: nowrap; }
+.req-btn:active { transform: scale(.98); }
 .search-wrap { position: relative; }
 .s-ico { position: absolute; left: 13px; top: 50%; transform: translateY(-50%); color: var(--muted); }
 #search { width: 100%; padding: 12px 38px 12px 38px; border-radius: 14px; border: 1px solid var(--line);

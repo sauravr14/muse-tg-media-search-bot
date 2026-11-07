@@ -46,3 +46,12 @@ class ShadowingTest(unittest.TestCase):
         self.assertGreaterEqual(body.count("raise ContinuePropagation"), 2)
         # Handling a real pending prompt must still stop propagation.
         self.assertIn("raise StopPropagation", body)
+
+    def test_pending_request_continues_when_not_handling(self):
+        # Same trap for the request-mode capture (2026-11-07): it must
+        # continue to plain_search when no request is pending, and stop
+        # propagation only when it consumes the title.
+        src = BOT_PY.read_text()
+        body = _fn_body(src, "pending_request")
+        self.assertIn("raise ContinuePropagation", body)
+        self.assertIn("raise StopPropagation", body)

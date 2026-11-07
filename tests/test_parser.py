@@ -219,6 +219,31 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(p.title, "The Matrix")
         self.assertEqual(p.quality, "BluRay")
 
+    def test_sprint_is_cam(self):
+        # "HQ S-Print" is a theatre print like HDTS/HDTC, not a clean
+        # print — every separator spelling flags is_cam, and the tag
+        # never leaks into the title. Bare "Sprint" counts too ("480p
+        # Sprint" is the same tag); no movie titled Sprint exists in
+        # the catalog, so there is nothing to mislabel.
+        for name in (
+            "65 2023 Hindi 480p HQ S-Print x264 AAC CineVood.mkv",
+            "Yaariyan 2 Hindi HQ S-Print 1080p x264 AAC.mkv",
+            "Agilan_2023_HQ_SPrint_480p_Hindi_StudioDUB_+_Tamil_x264_AAC_source.mkv",
+            "[@ClipmateMovies] Leo (2023) 480p Sprint [Hindi - Tamil] x26.mkv",
+            "Some Movie 2024 Hindi S Print 720p.mkv",
+        ):
+            with self.subTest(name=name):
+                p = parse_filename(name)
+                self.assertTrue(p.is_cam, name)
+        p = parse_filename("[@ClipmateMovies] Leo (2023) 480p Sprint [Hindi - Tamil] x26.mkv")
+        self.assertEqual(p.title, "Leo")
+        p = parse_filename("Yaariyan 2 Hindi HQ S-Print 1080p x264 AAC.mkv")
+        self.assertNotIn("S Print", p.title)
+        self.assertNotIn("Sprint", p.title)
+        # clean releases stay clean
+        p = parse_filename("The Dark Knight 2008 720p BluRay.mkv")
+        self.assertFalse(p.is_cam)
+
     def test_file_size_not_in_title(self):
         p = parse_filename("Vivah (2006) Hindi 1080p BluRay 3.2GB ESub [BollYFlix].mkv")
         self.assertEqual(p.title, "Vivah")

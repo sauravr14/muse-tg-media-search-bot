@@ -117,6 +117,9 @@ class RequestLogTest(unittest.TestCase):
         self.assertIn("Dune &lt;Part Two&gt;", msg)
         self.assertIn("RQ7K2P", msg)
         self.assertIn("/done RQ7K2P", msg)
+        # The whole /done command is one tap-to-copy code span, so the
+        # admin can paste it straight into the bot DM.
+        self.assertIn("<code>/done RQ7K2P</code>", msg)
         self.assertIn("@alice", msg)
         self.assertIn("111", msg)
 

@@ -212,8 +212,9 @@ class RequestWiringTest(unittest.TestCase):
         js = (APP_DIR / "webapp" / "app.js").read_text()
         css = (APP_DIR / "webapp" / "styles.css").read_text()
         self.assertIn('id="reqBtn"', html)
-        # Button sits in its own row directly under the top row
-        # (below the Clean/All toggle), above the search bar.
+        # Button sits in its own row under the Clean/All toggle row,
+        # above the search bar.
+        self.assertLess(html.index("cam-row"), html.index("req-row"))
         self.assertLess(html.index("req-row"), html.index("search-wrap"))
         self.assertIn("t.me/CORETGOFFICIALBOT?start=request", js)
         self.assertIn("openTelegramLink", js)
@@ -221,6 +222,15 @@ class RequestWiringTest(unittest.TestCase):
         # user lands in the bot DM and sees the flow start.
         self.assertIn("tg.close()", js)
         self.assertIn(".req-btn", css)
+        # Clean/All toggle: a real switch — All prints left (default),
+        # Clean prints right, knob slides; both labels printed in small
+        # type, active one bright. No more single label that flips.
+        self.assertIn('id="camToggle"', html)
+        self.assertIn("All prints", html)
+        self.assertIn("Clean prints", html)
+        self.assertIn("cam-knob", html)
+        self.assertIn(".cam-switch", css)
+        self.assertIn("aria-checked", js)
 
 
 if __name__ == "__main__":

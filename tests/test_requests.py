@@ -214,6 +214,9 @@ class RequestWiringTest(unittest.TestCase):
         self.assertLess(html.index("req-row"), html.index("search-wrap"))
         self.assertIn("t.me/CORETGOFFICIALBOT?start=request", js)
         self.assertIn("openTelegramLink", js)
+        # Tapping Request must minimise the Mini App (tg.close) so the
+        # user lands in the bot DM and sees the flow start.
+        self.assertIn("tg.close()", js)
         self.assertIn(".req-btn", css)
 
 

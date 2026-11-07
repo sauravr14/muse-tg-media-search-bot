@@ -231,10 +231,22 @@ class ParserTest(unittest.TestCase):
             "Agilan_2023_HQ_SPrint_480p_Hindi_StudioDUB_+_Tamil_x264_AAC_source.mkv",
             "[@ClipmateMovies] Leo (2023) 480p Sprint [Hindi - Tamil] x26.mkv",
             "Some Movie 2024 Hindi S Print 720p.mkv",
+            "Uunchai 2022 Hindi 720p S-Prints Rip x265 HEVC AAC CineVood.mkv",
+            "Macherla_Niyojakavargam_2022_480p_Proper_HQ_Hindi_Dub_HQ_S_PrintRip.mkv",
         ):
             with self.subTest(name=name):
                 p = parse_filename(name)
                 self.assertTrue(p.is_cam, name)
+        # ...but a bare trailing "s" without Rip is an ordinary word:
+        # "Suicide Sprints" is a real episode title (AMZN WEB-DL) and
+        # "sprinter" is a release group — both stay clean.
+        for name in (
+            "Marvels.Cloak.and.Dagger.S01E02.Suicide.Sprints.1080p.AMZN.W.mkv",
+            "star.wars.rebels.s03e01.1080p.bluray.x264-sprinter.mkv",
+        ):
+            with self.subTest(name=name):
+                p = parse_filename(name)
+                self.assertFalse(p.is_cam, name)
         p = parse_filename("[@ClipmateMovies] Leo (2023) 480p Sprint [Hindi - Tamil] x26.mkv")
         self.assertEqual(p.title, "Leo")
         p = parse_filename("Yaariyan 2 Hindi HQ S-Print 1080p x264 AAC.mkv")

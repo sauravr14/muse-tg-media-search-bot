@@ -48,6 +48,13 @@ CAM_PATTERNS = [
     re.compile(r"\bTSRIP\b", re.I),
     re.compile(r"\bPREDVD\b", re.I),
     re.compile(r"\bHDTC\b", re.I),
+    # S-Print / S Print / SPrint / Sprint — theatre-print tag ("HQ
+    # S-Print", "480p Sprint"). Separators are flattened to spaces
+    # before matching, so one pattern covers every spelling. Bare
+    # "Sprint" is included deliberately: no movie titled Sprint exists
+    # in the catalog, and "480p Sprint" is the same tag — same
+    # trade-off as \bCAM\b (which would also catch a film named Cam).
+    re.compile(r"\bS\s*PRINT\b", re.I),
     re.compile(r"(?<![A-Za-z])TS(?![A-Za-z])"),
     re.compile(r"(?<![A-Za-z])TC(?![A-Za-z])"),
 ]
@@ -351,7 +358,7 @@ class ParsedName:
     is_pack: bool = False  # season pack (episode is None)
     pack_label: str = ""  # "E01–E04" | "Complete"
     ep_range: tuple | None = None  # (first, last) episode a pack covers
-    is_cam: bool = False  # theatre print (HDCAM/CAM/HDTS/PreDVD/...)
+    is_cam: bool = False  # theatre print (HDCAM/CAM/HDTS/HDTC/S-Print/PreDVD/...)
     extra: dict = field(default_factory=dict)
 
 

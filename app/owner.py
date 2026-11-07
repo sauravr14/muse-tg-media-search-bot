@@ -145,6 +145,21 @@ def format_log_message(ts: float, user_id: int, username: str,
     )
 
 
+def format_request_log(ts: float, user_id: int, username: str,
+                       name: str, title: str, code: str) -> str:
+    """The #requested line for the logs channel. The code is the admin's
+    handle: /done <code> closes this exact request."""
+    when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))
+    who = f"@{username}" if username else html.escape(name or "unknown")
+    return (
+        f"#requested — new movie/show request — {when}\n"
+        f"👤 {html.escape(name or '')} ({who}) · <code>{user_id}</code>\n"
+        f"🎬 {html.escape((title or '')[:200])}\n"
+        f"🆔 <code>{code}</code>\n"
+        f"Mark done with /done {code}"
+    )
+
+
 # -- force subscribe ---------------------------------------------------------------
 _FSUB_CACHE: dict = {}        # (chat_id, user_id) -> (joined: bool, expires_at)
 _FSUB_JOINED_TTL = 300.0       # joined users are re-checked every 5 min

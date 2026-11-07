@@ -482,7 +482,7 @@
   function renderCamToggle() {
     const b = $("camToggle");
     b.classList.toggle("on", camOn);
-    b.innerHTML = camOn ? "✨ Clean only" : "🎭 All prints";
+    b.setAttribute("aria-checked", camOn ? "true" : "false");
   }
   $("camToggle").addEventListener("click", () => {
     camOn = !camOn; store.set("camFilter2", camOn); renderCamToggle(); haptic(); route();

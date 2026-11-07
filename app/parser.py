@@ -54,7 +54,12 @@ CAM_PATTERNS = [
     # "Sprint" is included deliberately: no movie titled Sprint exists
     # in the catalog, and "480p Sprint" is the same tag — same
     # trade-off as \bCAM\b (which would also catch a film named Cam).
-    re.compile(r"\bS\s*PRINT\b", re.I),
+    # Suffixes: "PrintRip" ("S_PrintRip") and the plural "S-Prints
+    # Rip" are the same tag. But the plural only counts when followed
+    # by Rip — "Suicide Sprints" is a real episode title (Cloak &
+    # Dagger S01E02, AMZN WEB-DL) and "sprinter" is a release group,
+    # so a bare trailing "s" without Rip must NOT match.
+    re.compile(r"\bS\s*PRINT(?:RIP|S\s+RIP)?\b", re.I),
     re.compile(r"(?<![A-Za-z])TS(?![A-Za-z])"),
     re.compile(r"(?<![A-Za-z])TC(?![A-Za-z])"),
 ]

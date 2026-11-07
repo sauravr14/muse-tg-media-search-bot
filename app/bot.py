@@ -22,6 +22,7 @@ from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
                             InlineKeyboardMarkup, Message, WebAppInfo)
 
 from . import owner as owner_mod
+from . import requests as req_mod
 from .config import Config
 from .db import DB, RES_ORDER, fts_terms
 from .dbthread import run_db, run_db_fast
@@ -336,28 +337,58 @@ class MediaBot:
             self._log_ch_at = now
         return self._log_ch
 
+    def _queue_log(self, channel: int, msg: str) -> None:
+        """Enqueue one log-channel line. Best-effort: a full queue drops
+        the line instead of ever slowing a reply. Shared by the generic
+        DM live log and the #requested log."""
+        if self._log_q is None:
+            self._log_q = asyncio.Queue(maxsize=500)
+            asyncio.create_task(self._log_sender())
+        try:
+            self._log_q.put_nowait((channel, msg))
+        except asyncio.QueueFull:
+            pass  # logs are best-effort; never slow replies
+
     async def _log_user_message(self, m: Message) -> None:
         u = m.from_user
         if not u or not owner_mod.should_log_user(
                 u.id, self._is_privileged(u.id)):
             return
+        text = m.text or m.caption or "[non-text message]"
+        # /request gets its own richer #requested line (see _log_request)
+        # — logging it here too would double every request in the channel.
+        # Same for a plain message typed while the user is in request
+        # mode: _track_private usually runs before the request handler
+        # clears the pending state, so the check below catches it.
+        if text.startswith("/request"):
+            return
+        st = self._pending_get(u.id)
+        if st and st.get("kind") == "request" and not text.startswith("/"):
+            return
         try:
             channel = await self._log_channel()
             if not channel:
                 return
-            text = m.text or m.caption or "[non-text message]"
             msg = owner_mod.format_log_message(
                 time.time(), u.id, u.username or "",
                 f"{u.first_name or ''} {u.last_name or ''}".strip(), text)
-            if self._log_q is None:
-                self._log_q = asyncio.Queue(maxsize=500)
-                asyncio.create_task(self._log_sender())
-            try:
-                self._log_q.put_nowait((channel, msg))
-            except asyncio.QueueFull:
-                pass  # logs are best-effort; never slow replies
+            self._queue_log(channel, msg)
         except Exception as e:
             log.warning("live log failed: %r", e)
+
+    async def _log_request(self, row: dict) -> None:
+        """The #requested line for one stored request, same channel and
+        same paced queue as the DM live log."""
+        try:
+            channel = await self._log_channel()
+            if not channel:
+                return
+            msg = owner_mod.format_request_log(
+                time.time(), row["user_id"], row["username"],
+                row["first_name"], row["title"], row["code"])
+            self._queue_log(channel, msg)
+        except Exception as e:
+            log.warning("request log failed: %r", e)
 
     async def _log_sender(self) -> None:
         """One sender for all live-log lines: ordered, and a Telegram
@@ -375,6 +406,80 @@ class MediaBot:
         entries = await run_db_fast(owner_mod.fsub_list, self.db)
         return await owner_mod.unjoined_channels(
             self.client, user_id, entries, self._is_privileged(user_id))
+
+    async def _unjoined_fresh(self, user_id: int) -> list:
+        """Force-subscribe check that never trusts the membership cache.
+
+        The request flow must verify the user is STILL joined, every
+        time: the cached 'joined' verdict lives up to 5 minutes, so a
+        user who left right after joining could otherwise slip a request
+        through. Forgetting the cache first forces a live
+        get_chat_member per force-sub channel. Only used on the rare,
+        user-initiated request path — never on search, where the cached
+        check is the right trade-off.
+        """
+        await run_db_fast(owner_mod.fsub_forget, user_id)
+        return await self._unjoined(user_id)
+
+    async def _submit_request(self, chat_id: int, user, title: str) -> None:
+        """Shared core of /request and request-mode capture: fresh fsub
+        check, daily cap, store, #requested log, instant reply."""
+        title = (title or "").strip()
+        if not title:
+            await self.client.send_message(
+                chat_id,
+                "Usage: /request <movie or series name>\n"
+                "Example: /request Avengers Endgame")
+            return
+        unjoined = await self._unjoined_fresh(user.id)
+        if unjoined:
+            await self._send_fsub_prompt(chat_id, unjoined)
+            return
+        try:
+            row = await run_db(
+                req_mod.create_request, self.db, user.id,
+                user.username or "",
+                f"{user.first_name or ''} {user.last_name or ''}".strip(),
+                title)
+        except req_mod.DailyCapReached:
+            await self.client.send_message(
+                chat_id,
+                "⛔ You've used your 5 requests for today. "
+                "Try again tomorrow.")
+            return
+        await self._log_request(row)
+        await self.client.send_message(
+            chat_id,
+            "✅ Request sent to admin — "
+            f"<b>{html.escape(row['title'])}</b> will be uploaded soon.\n"
+            f"Your request id: <code>{row['code']}</code>",
+            parse_mode=ParseMode.HTML)
+
+    async def _start_request(self, chat_id: int, user) -> None:
+        """Entry from the Mini App Request button (/start request):
+        fresh fsub check, then arm request mode — the user's next plain
+        message is captured as the request title."""
+        unjoined = await self._unjoined_fresh(user.id)
+        if unjoined:
+            await self._send_fsub_prompt(chat_id, unjoined)
+            return
+        left = req_mod.REQUESTS_PER_DAY - await run_db_fast(
+            req_mod.count_requests_today, self.db, user.id)
+        if left <= 0:
+            await self.client.send_message(
+                chat_id,
+                "⛔ You've used your 5 requests for today. "
+                "Try again tomorrow.")
+            return
+        self._pending_set(user.id, "request")
+        await self.client.send_message(
+            chat_id,
+            "🎬 <b>Request a movie/show</b>\n\n"
+            "Just type the name — no command needed.\n"
+            f"You have {left} of {req_mod.REQUESTS_PER_DAY} "
+            "requests left today.\n"
+            "Or send /request &lt;name&gt; any time.",
+            parse_mode=ParseMode.HTML)
 
     async def _send_fsub_prompt(self, chat_id: int, unjoined: list) -> None:
         await self.client.send_message(
@@ -504,6 +609,12 @@ class MediaBot:
                 # Commands bypass a pending prompt (e.g. /cancel, /start)
                 # — again, continue instead of shadowing the command.
                 raise ContinuePropagation
+            if st.get("kind") == "request":
+                # Not an owner prompt: the request-mode handler below
+                # owns it. Without this, the owner's own title message
+                # would land in _handle_pending's unknown-kind branch
+                # and silently vanish.
+                raise ContinuePropagation
             if st["kind"] != "start_photo" and not self._is_owner(uid):
                 # Sudo tried to complete a non-photo pending prompt
                 # (shouldn't happen — they can't set those). Ignore.
@@ -514,11 +625,33 @@ class MediaBot:
                 log.warning("pending prompt failed: %r", e)
             raise StopPropagation
 
+        # Request-mode capture (all users, not just admins): after the
+        # Mini App Request button sends /start request, the user's next
+        # plain message is the request title — not a search. Registered
+        # BEFORE plain_search, with the same ContinuePropagation guard
+        # as pending_owner so it never shadows search when no request
+        # is pending. Commands bypass it (the filter excludes "/...").
+        @c.on_message(filters.private & filters.text
+                       & ~filters.regex(r"^/"))
+        async def pending_request(_, m: Message):
+            uid = m.from_user.id if m.from_user else 0
+            st = self._pending_get(uid)
+            if not st or st.get("kind") != "request":
+                raise ContinuePropagation
+            self._pending_clear(uid)
+            await self._submit_request(m.chat.id, m.from_user,
+                                       m.text or "")
+            raise StopPropagation
+
         @c.on_message(filters.private & filters.command("start"))
         async def start(_, m: Message):
             arg = (m.text or "").split(maxsplit=1)
             if len(arg) > 1 and arg[1].startswith("file_"):
                 await self._deliver_file(m.chat.id, arg[1][5:], m.from_user.id)
+                return
+            if len(arg) > 1 and arg[1] == "request":
+                # Mini App Request button: arm request mode.
+                await self._start_request(m.chat.id, m.from_user)
                 return
             await self._send_start(m.chat.id, m.from_user.id)
 
@@ -533,7 +666,9 @@ class MediaBot:
                 "🔎 <b>Search</b> — just type a movie/series name.\n"
                 "/search <name> — search the catalog\n"
                 "/recent — recently added\n"
-                "/movies · /series — browse\n\n"
+                "/movies · /series — browse\n"
+                "/request <name> — request a movie/show "
+                "(5 per day)\n\n"
                 "Search replies with <b>one message and one button</b> — tap it "
                 "and the app opens straight on your results, with posters, all "
                 "qualities (480p/720p/1080p) grouped under one title, and "
@@ -551,6 +686,16 @@ class MediaBot:
                 await m.reply_text("Usage: /search <movie or series name>")
                 return
             await self._do_search(m.chat.id, q, m.from_user.id)
+
+        @c.on_message(filters.private & filters.command("request"))
+        async def request_cmd(_, m: Message):
+            title = m.text.partition(" ")[2].strip()
+            if not title:
+                await m.reply_text(
+                    "Usage: /request <movie or series name>\n"
+                    "Example: /request Avengers Endgame")
+                return
+            await self._submit_request(m.chat.id, m.from_user, title)
 
         @c.on_message(filters.private & filters.command("recent"))
         async def recent(_, m: Message):
@@ -753,6 +898,45 @@ class MediaBot:
                 return
             await run_db(self.db.remove_source, cid)
             await m.reply_text(f"Removed <code>{cid}</code>.", parse_mode=ParseMode.HTML)
+
+        # Close out a movie/show request: only the requesting user is
+        # DM'd, nobody else. Owner-only — the uploader is the owner.
+        @c.on_message(filters.private & filters.command("done") & self._owner_filter())
+        async def done_cmd(_, m: Message):
+            code = (m.text.partition(" ")[2].strip() or "").upper()
+            if not code:
+                await m.reply_text("Usage: /done <request id>\n"
+                                   "Example: /done RQ7K2P")
+                return
+            row = await run_db(req_mod.mark_request_done, self.db, code)
+            if not row:
+                await m.reply_text(
+                    f"No request found with id <code>{html.escape(code)}</code>.",
+                    parse_mode=ParseMode.HTML)
+                return
+            if row.get("already_done"):
+                await m.reply_text(
+                    f"Request <code>{row['code']}</code> "
+                    f"(<b>{html.escape(row['title'])}</b>) was already "
+                    "marked done.",
+                    parse_mode=ParseMode.HTML)
+                return
+            try:
+                await self.client.send_message(
+                    row["user_id"],
+                    "🎉 Your requested movie/show "
+                    f"<b>{html.escape(row['title'])}</b> has been uploaded!",
+                    parse_mode=ParseMode.HTML)
+                note = "User notified in DM."
+            except Exception as e:
+                log.warning("done notify failed for %s: %r",
+                            row["user_id"], e)
+                note = ("Marked done, but the user could not be DM'd "
+                        "(bot blocked?).")
+            await m.reply_text(
+                f"✅ Done: <b>{html.escape(row['title'])}</b> "
+                f"(<code>{row['code']}</code>). {note}",
+                parse_mode=ParseMode.HTML)
 
         @c.on_message(filters.private & filters.command("channels") & self._priv_filter())
         async def channels(_, m: Message):

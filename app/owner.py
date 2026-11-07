@@ -156,7 +156,7 @@ def format_request_log(ts: float, user_id: int, username: str,
         f"👤 {html.escape(name or '')} ({who}) · <code>{user_id}</code>\n"
         f"🎬 {html.escape((title or '')[:200])}\n"
         f"🆔 <code>{code}</code>\n"
-        f"Mark done with /done {code}"
+        f"Mark done with <code>/done {code}</code>"
     )
 
 

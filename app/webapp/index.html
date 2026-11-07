@@ -35,9 +35,11 @@
   <div class="toprow">
     <div class="brand"><span class="logo-dot"></span>Core TG</div>
     <div class="top-actions">
-      <button id="camToggle" class="cam-toggle" title="Hide theatre prints">🎭 All prints</button>
       <button id="camInfo" class="info-btn" title="About this filter">i</button>
     </div>
+  </div>
+  <div class="cam-row">
+    <button id="camToggle" class="cam-switch" role="switch" aria-checked="false" title="Toggle clean prints only"><span class="cam-label cam-label-all">All prints</span><span class="cam-label cam-label-clean">Clean prints</span><span class="cam-knob" aria-hidden="true"></span></button>
   </div>
   <div class="req-row">
     <button id="reqBtn" class="req-btn">🎬 Request Movie / Show</button>
@@ -63,7 +65,7 @@
   <div class="modal-box">
     <h3>✨ Clean prints only</h3>
     <p>When this is <b>ON</b>, theatre recordings are hidden across the whole app —
-    <b>HDCAM, CAM, HDTS/TS, PreDVD, HDTC</b> — so you only see proper
+    <b>HDCAM, CAM, HDTS/TS, PreDVD, HDTC, S-Print</b> — so you only see proper
     <b>BluRay / WEB-DL / HDTV</b> releases.</p>
     <p class="muted">Turn it <b>OFF</b> to see everything again, including cam prints.</p>
     <button class="btn" id="camModalClose">Got it</button>

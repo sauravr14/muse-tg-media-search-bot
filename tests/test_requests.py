@@ -231,6 +231,10 @@ class RequestWiringTest(unittest.TestCase):
         self.assertIn("cam-knob", html)
         self.assertIn(".cam-switch", css)
         self.assertIn("aria-checked", js)
+        # Toggle sits right-aligned in its own row, compact (180px),
+        # knob slides on transform for a smooth animation.
+        self.assertIn("justify-content: flex-end", css)
+        self.assertIn("translateX(152px)", css)
 
 
 if __name__ == "__main__":

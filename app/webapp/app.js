@@ -496,8 +496,14 @@
   if (reqBtn) reqBtn.addEventListener("click", () => {
     haptic();
     const url = "https://t.me/CORETGOFFICIALBOT?start=request";
-    if (tg && tg.openTelegramLink) tg.openTelegramLink(url);
-    else window.open(url, "_blank");
+    if (tg && tg.openTelegramLink) {
+      tg.openTelegramLink(url);
+      // Minimise the Mini App so the user lands in the bot DM and can
+      // see the request flow start — otherwise the app stays on top
+      // and the tap looks dead. Small delay so the link event is
+      // processed before the webview closes.
+      setTimeout(() => { if (tg.close) tg.close(); }, 300);
+    } else window.open(url, "_blank");
   });
   $("camInfo").addEventListener("click", () => { $("camModal").hidden = false; });
   $("camModalClose").addEventListener("click", () => { $("camModal").hidden = true; });

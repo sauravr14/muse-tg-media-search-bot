@@ -62,26 +62,28 @@ button { font-family: inherit; }
 /* Clean/All toggle: a real switch. Knob left = All prints (default),
    knob right = Clean prints only. Track goes green when clean, like a
    phone toggle; the labels stay printed in small type on both sides,
-   the active one bright, the other dimmed. It lives in its own row:
-   both labels + knob need ~210px, which does not fit in the top row
-   next to the brand on a 360px phone. */
-.cam-row { margin-bottom: 8px; }
-.cam-switch { position: relative; width: 210px; height: 32px; flex: none; border-radius: 999px;
+   the active one bright, the other dimmed. The switch is right-aligned
+   in its row and compact (180px) — wide enough for both labels plus
+   the knob with balanced padding, short enough not to look stretched.
+   The knob slides on transform (not left) so the animation stays
+   smooth. Label offsets are symmetric (28px each side). */
+.cam-row { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.cam-switch { position: relative; width: 180px; height: 30px; flex: none; border-radius: 999px;
   border: 1px solid var(--line); background: linear-gradient(180deg, #3a3a44, #26262e);
   cursor: pointer; padding: 0; transition: background .25s ease, border-color .25s ease; }
 .cam-switch.on { background: linear-gradient(180deg, #2fd465, #16a34a); border-color: rgba(255, 255, 255, .28); }
 .cam-label { position: absolute; top: 50%; transform: translateY(-50%); font-size: 11px; font-weight: 600;
   letter-spacing: .03em; color: rgba(255, 255, 255, .5); transition: color .25s ease;
   pointer-events: none; white-space: nowrap; }
-.cam-label-all { left: 30px; }
-.cam-label-clean { right: 30px; }
+.cam-label-all { left: 28px; }
+.cam-label-clean { right: 28px; }
 .cam-switch:not(.on) .cam-label-all { color: #fff; }
 .cam-switch.on .cam-label-clean { color: #fff; }
-.cam-knob { position: absolute; top: 2px; left: 2px; width: 26px; height: 26px; border-radius: 50%;
+.cam-knob { position: absolute; top: 3px; left: 2px; width: 24px; height: 24px; border-radius: 50%;
   background: radial-gradient(circle at 35% 30%, #ffffff, #d7d7de 45%, #9a9aa5 80%, #7d7d88);
   box-shadow: 0 1px 4px rgba(0, 0, 0, .5), inset 0 1px 1px rgba(255, 255, 255, .9);
-  transition: left .25s ease; pointer-events: none; }
-.cam-switch.on .cam-knob { left: calc(100% - 28px); }
+  transform: translateX(0); transition: transform .25s ease; pointer-events: none; }
+.cam-switch.on .cam-knob { transform: translateX(152px); }
 .info-btn { width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--line); background: rgba(20, 20, 28, .8);
   color: var(--muted); font: italic 800 13px Georgia, serif; cursor: pointer; line-height: 1; }
 /* Request button: full-width red CTA directly under the top row, above

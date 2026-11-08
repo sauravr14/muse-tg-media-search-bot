@@ -1488,12 +1488,9 @@ class MediaBot:
             except Exception as e:
                 await m.reply_text(f"Can't access that chat: {e}")
                 return
-            invite = ""
-            try:
-                invite = await self.client.export_chat_invite_link(chat.id) or ""
-            except Exception:
-                invite = ""
             username = getattr(chat, "username", "") or ""
+            invite = await owner_mod.create_fsub_invite_link(
+                self.client, chat.id, username)
             if not invite and not username:
                 await m.reply_text(
                     "⚠️ I can't get an invite link for this channel (I'm not "

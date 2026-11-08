@@ -19,10 +19,17 @@ class FakeMember:
         self.status = status
 
 
+class FakeJoiner:
+    def __init__(self, user_id):
+        self.user = type("U", (), {"id": user_id})()
+
+
 class FakeClient:
-    """status map: chat_id -> status string; 'error' raises a generic error."""
-    def __init__(self, statuses):
+    """status map: chat_id -> status string; 'error' raises a generic error.
+    pending map: chat_id -> {user_id, ...} with a pending join request."""
+    def __init__(self, statuses, pending=None):
         self.statuses = statuses
+        self.pending = pending or {}
 
     async def get_chat_member(self, chat_id, user_id):
         s = self.statuses.get(chat_id, "member")
@@ -32,6 +39,10 @@ class FakeClient:
             raise type("UserNotParticipant", (Exception,), {})("nope")
         return FakeMember(s)
 
+    async def get_chat_join_requests(self, chat_id, limit=0, query=""):
+        for uid in self.pending.get(chat_id, ()):
+            yield FakeJoiner(uid)
+
 
 def _db():
     return DB(Path(tempfile.mkdtemp()) / "owner.db")
@@ -40,6 +51,7 @@ def _db():
 class OwnerTest(unittest.TestCase):
     def setUp(self):
         self.db = _db()
+        owner_mod._FSUB_CACHE.clear()
 
     # -- settings kv ---------------------------------------------------------
     def test_start_photo_and_text_round_trip(self):
@@ -78,6 +90,39 @@ class OwnerTest(unittest.TestCase):
             owner_mod.fsub_invite({"chat_id": -1, "username": "chan"}),
             "https://t.me/chan")
 
+    def test_fsub_invite_link_is_admin_approval(self):
+        calls = []
+
+        class LinkClient:
+            async def create_chat_invite_link(self, chat_id, **kwargs):
+                calls.append((chat_id, kwargs))
+                return type("Link", (), {
+                    "invite_link": "https://t.me/+joinreq"})()
+
+        link = asyncio.run(
+            owner_mod.create_fsub_invite_link(LinkClient(), -1001))
+        self.assertEqual(link, "https://t.me/+joinreq")
+        self.assertEqual(calls, [(-1001, {"creates_join_request": True})])
+
+    def test_fsub_invite_link_failure_returns_empty(self):
+        class BoomClient:
+            async def create_chat_invite_link(self, *a, **k):
+                raise RuntimeError("no admin right")
+
+        link = asyncio.run(
+            owner_mod.create_fsub_invite_link(BoomClient(), -1001))
+        self.assertEqual(link, "")
+
+    def test_fsub_invite_link_skipped_for_public_channel(self):
+        class LinkClient:
+            async def create_chat_invite_link(self, *a, **k):
+                raise AssertionError(
+                    "must not create a link for a public channel")
+
+        link = asyncio.run(
+            owner_mod.create_fsub_invite_link(LinkClient(), -1001, "chan"))
+        self.assertEqual(link, "")
+
     def test_unjoined_list_with_fake_client(self):
         entries = [{"chat_id": -1, "title": "A"},
                    {"chat_id": -2, "title": "B"},
@@ -94,6 +139,29 @@ class OwnerTest(unittest.TestCase):
         # empty fsub -> nobody blocked
         got = asyncio.run(owner_mod.unjoined_channels(client, 42, []))
         self.assertEqual(got, [])
+
+    def test_pending_join_request_counts_as_joined(self):
+        entries = [{"chat_id": -1, "title": "A"},
+                   {"chat_id": -2, "title": "B"},
+                   {"chat_id": -3, "title": "C"},
+                   {"chat_id": -4, "title": "D"}]
+        client = FakeClient({-1: "member", -2: "left",
+                             -3: "not_participant", -4: "left"},
+                            pending={-2: {42}, -3: {42}})
+        got = asyncio.run(owner_mod.unjoined_channels(client, 42, entries))
+        self.assertEqual([e["chat_id"] for e in got], [-4])
+
+    def test_pending_check_error_keeps_gate(self):
+        class BoomJoinClient(FakeClient):
+            async def get_chat_join_requests(self, chat_id, limit=0,
+                                             query=""):
+                raise RuntimeError("no admin right")
+                yield
+
+        entries = [{"chat_id": -2, "title": "B"}]
+        client = BoomJoinClient({-2: "left"})
+        got = asyncio.run(owner_mod.unjoined_channels(client, 42, entries))
+        self.assertEqual([e["chat_id"] for e in got], [-2])
 
     def test_parse_chat_arg(self):
         self.assertEqual(owner_mod.parse_chat_arg("@chan"), "chan")

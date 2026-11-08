@@ -77,6 +77,29 @@ def fsub_invite(entry: dict) -> str:
     return ""
 
 
+async def create_fsub_invite_link(client, chat_id: int,
+                                username: str = "") -> str:
+    """Create the invite link stored for a force-sub channel.
+
+    Private channels only: a public channel has a t.me/<username> link,
+    so no stored invite link is needed (returns ""). For a private
+    channel this creates an admin-approval link
+    (creates_join_request=True): tapping it sends a join request the
+    channel admin must approve, instead of letting anyone join directly.
+    Uses create_chat_invite_link (adds a new link) rather than
+    export_chat_invite_link (which revokes the channel's primary link on
+    every call). Returns the URL, or "" on failure.
+    """
+    if username:
+        return ""
+    try:
+        link = await client.create_chat_invite_link(
+            chat_id, creates_join_request=True)
+        return getattr(link, "invite_link", "") or ""
+    except Exception:
+        return ""
+
+
 def get_start_photo(db) -> str:
     return db.get_kv(KV_START_PHOTO, "")
 
@@ -172,7 +195,12 @@ def fsub_forget(user_id: int) -> None:
 
 
 async def _check_one(client, cid, user_id: int) -> bool:
-    """True if joined (or unverifiable -> fail open). Cached."""
+    """True if joined (or unverifiable -> fail open). Cached.
+
+    A user with a pending join request counts as joined: they tapped
+    Join on an admin-approval link, so the gate lets them through while
+    the admin's approval still controls actual channel membership.
+    """
     now = time.monotonic()
     hit = _FSUB_CACHE.get((cid, user_id))
     if hit and hit[1] > now:
@@ -189,10 +217,38 @@ async def _check_one(client, cid, user_id: int) -> bool:
         else:
             log.warning("fsub check failed for %s: %r", cid, e)
             ttl = 30.0
+    if not joined and await _has_pending_request(client, cid, user_id):
+        joined, ttl = True, _FSUB_JOINED_TTL
     if len(_FSUB_CACHE) > 20000:
         _FSUB_CACHE.clear()
     _FSUB_CACHE[(cid, user_id)] = (joined, now + ttl)
     return joined
+
+
+_PENDING_SCAN_CAP = 200
+
+
+async def _has_pending_request(client, cid, user_id: int) -> bool:
+    """True if user_id has a pending join request for cid.
+
+    Scans the channel's pending requests (newest first) with an early
+    exit on match, capped at _PENDING_SCAN_CAP entries so a huge queue
+    can't stall the gate. Any error -> False: the not-joined verdict
+    stands and the user just sees the gate and can retry.
+    """
+    try:
+        seen = 0
+        async for req in client.get_chat_join_requests(
+                cid, limit=_PENDING_SCAN_CAP):
+            seen += 1
+            if getattr(getattr(req, "user", None), "id", None) == user_id:
+                return True
+            if seen >= _PENDING_SCAN_CAP:
+                break
+        return False
+    except Exception as e:
+        log.warning("fsub join-request check failed for %s: %r", cid, e)
+        return False
 
 
 async def unjoined_channels(client, user_id: int, entries: list,

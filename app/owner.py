@@ -14,6 +14,8 @@ import time
 
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from .dbthread import run_db_fast
+
 log = logging.getLogger("mediabot.owner")
 
 KV_START_PHOTO = "settings:start_photo"
@@ -194,12 +196,59 @@ def fsub_forget(user_id: int) -> None:
         _FSUB_CACHE.pop(k, None)
 
 
-async def _check_one(client, cid, user_id: int) -> bool:
+# Pending join requests, recorded as they ARRIVE (see bot.py
+# track_join_request). Bots cannot LIST pending requests: Telegram
+# answers messages.GetChatInviteImporters with 400 BOT_METHOD_INVALID
+# for bots — proven live 2026-11-08, when the gate's poll-the-list
+# check errored on every "I've joined" tap and a user who had
+# requested to join stayed blocked. So the gate consults this table
+# instead. A row older than PENDING_JOIN_TTL stops counting: a request
+# the admin never acts on must not pass the gate forever (the user can
+# re-request). The row is also cleared the moment the user actually
+# joins (bot.py track_member), so a join-then-leave can't pass on a
+# stale row. Caveat: requests sent BEFORE this shipped were never
+# recorded — those users must withdraw and re-send their request.
+PENDING_JOIN_TTL = 7 * 86400.0
+
+
+def record_join_request(db, chat_id: int, user_id: int,
+                        now: float | None = None) -> None:
+    now = now if now is not None else time.time()
+    db.execute(
+        "INSERT OR REPLACE INTO pending_joins"
+        " (chat_id, user_id, requested_at) VALUES (?, ?, ?)",
+        (chat_id, user_id, now))
+    prune_pending_joins(db, now)
+
+
+def clear_join_request(db, chat_id: int, user_id: int) -> None:
+    db.execute("DELETE FROM pending_joins WHERE chat_id=? AND user_id=?",
+               (chat_id, user_id))
+
+
+def has_pending_join_request(db, chat_id: int, user_id: int,
+                             now: float | None = None) -> bool:
+    now = now if now is not None else time.time()
+    row = db.query_one(
+        "SELECT requested_at FROM pending_joins"
+        " WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    return bool(row) and now - row["requested_at"] < PENDING_JOIN_TTL
+
+
+def prune_pending_joins(db, now: float | None = None) -> None:
+    now = now if now is not None else time.time()
+    db.execute("DELETE FROM pending_joins WHERE requested_at < ?",
+               (now - PENDING_JOIN_TTL,))
+
+
+async def _check_one(client, cid, user_id: int, db=None) -> bool:
     """True if joined (or unverifiable -> fail open). Cached.
 
     A user with a pending join request counts as joined: they tapped
     Join on an admin-approval link, so the gate lets them through while
     the admin's approval still controls actual channel membership.
+    The pending check reads the recorded-requests table (db); with
+    db=None it is skipped and only real membership counts.
     """
     now = time.monotonic()
     hit = _FSUB_CACHE.get((cid, user_id))
@@ -217,53 +266,33 @@ async def _check_one(client, cid, user_id: int) -> bool:
         else:
             log.warning("fsub check failed for %s: %r", cid, e)
             ttl = 30.0
-    if not joined and await _has_pending_request(client, cid, user_id):
-        joined, ttl = True, _FSUB_JOINED_TTL
+    if not joined and db is not None:
+        try:
+            if await run_db_fast(has_pending_join_request, db, cid, user_id):
+                joined, ttl = True, _FSUB_JOINED_TTL
+        except Exception as e:
+            log.warning("fsub pending-request lookup failed for %s: %r",
+                        cid, e)
     if len(_FSUB_CACHE) > 20000:
         _FSUB_CACHE.clear()
     _FSUB_CACHE[(cid, user_id)] = (joined, now + ttl)
     return joined
 
 
-_PENDING_SCAN_CAP = 200
-
-
-async def _has_pending_request(client, cid, user_id: int) -> bool:
-    """True if user_id has a pending join request for cid.
-
-    Scans the channel's pending requests (newest first) with an early
-    exit on match, capped at _PENDING_SCAN_CAP entries so a huge queue
-    can't stall the gate. Any error -> False: the not-joined verdict
-    stands and the user just sees the gate and can retry.
-    """
-    try:
-        seen = 0
-        async for req in client.get_chat_join_requests(
-                cid, limit=_PENDING_SCAN_CAP):
-            seen += 1
-            if getattr(getattr(req, "user", None), "id", None) == user_id:
-                return True
-            if seen >= _PENDING_SCAN_CAP:
-                break
-        return False
-    except Exception as e:
-        log.warning("fsub join-request check failed for %s: %r", cid, e)
-        return False
-
-
 async def unjoined_channels(client, user_id: int, entries: list,
-                            is_privileged: bool = False) -> list:
+                            is_privileged: bool = False, db=None) -> list:
     """Channels from `entries` the user has NOT joined.
 
     Fail OPEN on any check error other than UserNotParticipant: a
     channel the bot cannot verify must never block every user.
+    Pass db so a recorded pending join request counts as joined.
     """
     if is_privileged or not entries:
         return []
     import asyncio
     todo = [e for e in entries if e.get("chat_id")]
     results = await asyncio.gather(
-        *(_check_one(client, e["chat_id"], user_id) for e in todo))
+        *(_check_one(client, e["chat_id"], user_id, db) for e in todo))
     return [e for e, ok in zip(todo, results) if not ok]
 
 

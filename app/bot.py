@@ -405,7 +405,8 @@ class MediaBot:
     async def _unjoined(self, user_id: int) -> list:
         entries = await run_db_fast(owner_mod.fsub_list, self.db)
         return await owner_mod.unjoined_channels(
-            self.client, user_id, entries, self._is_privileged(user_id))
+            self.client, user_id, entries, self._is_privileged(user_id),
+            db=self.db)
 
     async def _unjoined_fresh(self, user_id: int) -> list:
         """Force-subscribe check that never trusts the membership cache.
@@ -571,13 +572,23 @@ class MediaBot:
                 new = u.new_chat_member
                 if not new or not new.user:
                     return
-                me_id = await self._self_id()
-                if not me_id or new.user.id != me_id:
-                    return
                 status = getattr(new, "status", "")
                 if hasattr(status, "value"):
                     status = status.value
                 status = str(status).lower().split(".")[-1]
+                if status in ("member", "administrator", "creator",
+                              "restricted"):
+                    # A user who just joined (e.g. the admin approved
+                    # their request) no longer needs the pending row;
+                    # without this, a join-then-leave would keep
+                    # passing the gate on the stale row. Best-effort:
+                    # the 7-day TTL is the backstop if this update
+                    # never arrives.
+                    await run_db(owner_mod.clear_join_request, self.db,
+                                 u.chat.id, new.user.id)
+                me_id = await self._self_id()
+                if not me_id or new.user.id != me_id:
+                    return
                 if status in ("member", "administrator", "creator", "restricted"):
                     await run_db(self.db.upsert_chat, u.chat.id,
                                  self._chat_type_name(u.chat),
@@ -588,6 +599,27 @@ class MediaBot:
                                  (u.chat.id,))
             except Exception as e:
                 log.warning("member track failed: %r", e)
+
+        @c.on_chat_join_request()
+        async def track_join_request(_, req):
+            # Bots cannot LIST pending join requests (Telegram answers
+            # messages.GetChatInviteImporters with BOT_METHOD_INVALID),
+            # so record each request as it ARRIVES; the force-sub gate
+            # consults the recorded table (owner_mod.pending_joins).
+            # The update only fires for channels the bot is admin in,
+            # which covers every force-sub channel. Recording is cheap
+            # and unfiltered — the gate only reads fsub channels.
+            # Requests sent BEFORE this handler shipped were never
+            # recorded: those users must withdraw and re-send theirs.
+            try:
+                chat = getattr(req, "chat", None)
+                user = getattr(req, "user", None)
+                if not chat or not user:
+                    return
+                await run_db(owner_mod.record_join_request, self.db,
+                             chat.id, user.id)
+            except Exception as e:
+                log.warning("join-request track failed: %r", e)
 
         # Owner-only pending prompts (settings flows). Consumes the message
         # so it never also triggers a search or an index flow; /cancel or a
@@ -814,8 +846,17 @@ class MediaBot:
                     owner_mod.fsub_forget(q.from_user.id)
                     unjoined = await self._unjoined(q.from_user.id)
                     if unjoined:
-                        await q.answer("You haven't joined all channels yet.",
-                                       show_alert=True)
+                        # Name the missing channels: the old generic
+                        # alert left the owner guessing which channel
+                        # was still unjoined (2026-11-08: a user had
+                        # requested the private one but never joined
+                        # the public one, and nobody could tell).
+                        names = ", ".join(
+                            (e.get("title") or str(e.get("chat_id")))
+                            for e in unjoined)[:180]
+                        await q.answer(
+                            f"You haven't joined yet: {names}.",
+                            show_alert=True)
                     else:
                         await q.answer("Welcome back!")
                         try:

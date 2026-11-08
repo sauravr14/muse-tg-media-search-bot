@@ -224,6 +224,21 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 CREATE INDEX IF NOT EXISTS idx_requests_code ON requests(code);
 CREATE INDEX IF NOT EXISTS idx_requests_user_day ON requests(user_id, created_at);
+
+-- force-sub join requests (2026-11-09): bots CANNOT list pending join
+-- requests — Telegram answers messages.GetChatInviteImporters with
+-- 400 BOT_METHOD_INVALID for bots (proven live 2026-11-08: the gate's
+-- poll-the-list check errored on every tap). The bot therefore records
+-- each request as it ARRIVES via the ChatJoinRequest update (see bot.py
+-- track_join_request) and the gate consults this table. requested_at is
+-- the safety valve: a row older than PENDING_JOIN_TTL stops counting,
+-- so a request the admin never acts on can't pass the gate forever.
+CREATE TABLE IF NOT EXISTS pending_joins (
+    chat_id      INTEGER NOT NULL,
+    user_id      INTEGER NOT NULL,
+    requested_at REAL NOT NULL,
+    PRIMARY KEY(chat_id, user_id)
+);
 """
 
 

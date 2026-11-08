@@ -19,17 +19,10 @@ class FakeMember:
         self.status = status
 
 
-class FakeJoiner:
-    def __init__(self, user_id):
-        self.user = type("U", (), {"id": user_id})()
-
-
 class FakeClient:
-    """status map: chat_id -> status string; 'error' raises a generic error.
-    pending map: chat_id -> {user_id, ...} with a pending join request."""
-    def __init__(self, statuses, pending=None):
+    """status map: chat_id -> status string; 'error' raises a generic error."""
+    def __init__(self, statuses):
         self.statuses = statuses
-        self.pending = pending or {}
 
     async def get_chat_member(self, chat_id, user_id):
         s = self.statuses.get(chat_id, "member")
@@ -38,10 +31,6 @@ class FakeClient:
         if s == "not_participant":
             raise type("UserNotParticipant", (Exception,), {})("nope")
         return FakeMember(s)
-
-    async def get_chat_join_requests(self, chat_id, limit=0, query=""):
-        for uid in self.pending.get(chat_id, ()):
-            yield FakeJoiner(uid)
 
 
 def _db():
@@ -141,27 +130,54 @@ class OwnerTest(unittest.TestCase):
         self.assertEqual(got, [])
 
     def test_pending_join_request_counts_as_joined(self):
+        # Bots cannot LIST pending requests (GetChatInviteImporters is
+        # BOT_METHOD_INVALID for bots), so the gate reads the recorded
+        # table the join-request handler fills. Rows for -2 and -3 are
+        # recorded for user 42; -4 has none and stays blocked.
+        owner_mod.record_join_request(self.db, -2, 42)
+        owner_mod.record_join_request(self.db, -3, 42)
         entries = [{"chat_id": -1, "title": "A"},
                    {"chat_id": -2, "title": "B"},
                    {"chat_id": -3, "title": "C"},
                    {"chat_id": -4, "title": "D"}]
         client = FakeClient({-1: "member", -2: "left",
-                             -3: "not_participant", -4: "left"},
-                            pending={-2: {42}, -3: {42}})
-        got = asyncio.run(owner_mod.unjoined_channels(client, 42, entries))
+                             -3: "not_participant", -4: "left"})
+        got = asyncio.run(owner_mod.unjoined_channels(client, 42, entries,
+                                                      db=self.db))
         self.assertEqual([e["chat_id"] for e in got], [-4])
 
-    def test_pending_check_error_keeps_gate(self):
-        class BoomJoinClient(FakeClient):
-            async def get_chat_join_requests(self, chat_id, limit=0,
-                                             query=""):
-                raise RuntimeError("no admin right")
-                yield
+    def test_pending_join_request_helpers(self):
+        self.assertFalse(owner_mod.has_pending_join_request(self.db, -2, 42))
+        owner_mod.record_join_request(self.db, -2, 42, now=1000.0)
+        self.assertTrue(owner_mod.has_pending_join_request(
+            self.db, -2, 42, now=1000.0 + 60))
+        # a different user or channel does not inherit the row
+        self.assertFalse(owner_mod.has_pending_join_request(
+            self.db, -2, 43, now=1000.0 + 60))
+        self.assertFalse(owner_mod.has_pending_join_request(
+            self.db, -3, 42, now=1000.0 + 60))
+        # clearing the row (user actually joined) drops the pass
+        owner_mod.clear_join_request(self.db, -2, 42)
+        self.assertFalse(owner_mod.has_pending_join_request(
+            self.db, -2, 42, now=1000.0 + 60))
 
+    def test_pending_join_request_expires(self):
+        # a request older than PENDING_JOIN_TTL no longer counts: the
+        # admin never acted on it, so the user must re-request.
+        owner_mod.record_join_request(self.db, -2, 42, now=1000.0)
+        self.assertFalse(owner_mod.has_pending_join_request(
+            self.db, -2, 42,
+            now=1000.0 + owner_mod.PENDING_JOIN_TTL + 1))
         entries = [{"chat_id": -2, "title": "B"}]
-        client = BoomJoinClient({-2: "left"})
-        got = asyncio.run(owner_mod.unjoined_channels(client, 42, entries))
+        client = FakeClient({-2: "left"})
+        got = asyncio.run(owner_mod.unjoined_channels(
+            client, 42, entries, db=self.db))
         self.assertEqual([e["chat_id"] for e in got], [-2])
+        # prune drops the expired row
+        owner_mod.prune_pending_joins(
+            self.db, now=1000.0 + owner_mod.PENDING_JOIN_TTL + 1)
+        self.assertFalse(owner_mod.has_pending_join_request(
+            self.db, -2, 42, now=1000.0 + owner_mod.PENDING_JOIN_TTL + 2))
 
     def test_parse_chat_arg(self):
         self.assertEqual(owner_mod.parse_chat_arg("@chan"), "chan")

@@ -2,14 +2,17 @@
 import asyncio
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
-from pyrogram.types import InlineKeyboardButton
+from pyrogram.enums import ChatType
+from pyrogram.types import Chat, ChatJoinRequest, InlineKeyboardButton, User
 
 from fastapi.testclient import TestClient
 
 from app import owner as owner_mod
 from app.api import create_app
+from app.bot import _join_request_ids
 from app.config import Config
 from app.db import DB
 
@@ -128,6 +131,22 @@ class OwnerTest(unittest.TestCase):
         # empty fsub -> nobody blocked
         got = asyncio.run(owner_mod.unjoined_channels(client, 42, []))
         self.assertEqual(got, [])
+
+    def test_join_request_ids_reads_from_user(self):
+        # REGRESSION (2026-11-09): the handler read req.user, but
+        # Pyrogram's ChatJoinRequest names the requester `from_user`
+        # and has NO `.user` attribute — every request was silently
+        # dropped (getattr default None -> early return, no log, no
+        # row). Build a REAL ChatJoinRequest so this cannot regress.
+        req = ChatJoinRequest(
+            chat=Chat(id=-1002031421338, type=ChatType.CHANNEL,
+                      title="Apps/Softwares Updates"),
+            from_user=User(id=42, first_name="Test"),
+            date=datetime.now(timezone.utc))
+        self.assertIsNone(getattr(req, "user", None))
+        self.assertEqual(_join_request_ids(req), (-1002031421338, 42))
+        # malformed updates record nothing instead of raising
+        self.assertEqual(_join_request_ids(object()), (None, None))
 
     def test_pending_join_request_counts_as_joined(self):
         # Bots cannot LIST pending requests (GetChatInviteImporters is

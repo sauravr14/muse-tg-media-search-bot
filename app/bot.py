@@ -139,6 +139,21 @@ def _search_start_param(q: str) -> str:
     return param if len(param) <= 64 else ""
 
 
+def _join_request_ids(req):
+    """Extract (chat_id, user_id) from a ChatJoinRequest update.
+
+    Pyrogram names the requester ``from_user``, NOT ``user`` — reading
+    ``req.user`` returns None via getattr and silently drops every
+    request (the 2026-11-09 bug: the handler fired, recorded nothing,
+    and logged nothing). Returns (None, None) for a malformed update.
+    """
+    chat = getattr(req, "chat", None)
+    user = getattr(req, "from_user", None)
+    if not chat or not user:
+        return None, None
+    return chat.id, user.id
+
+
 class MediaBot:
     def __init__(self, cfg: Config, db: DB, indexer: Indexer):
         self.cfg = cfg
@@ -612,12 +627,11 @@ class MediaBot:
             # Requests sent BEFORE this handler shipped were never
             # recorded: those users must withdraw and re-send theirs.
             try:
-                chat = getattr(req, "chat", None)
-                user = getattr(req, "user", None)
-                if not chat or not user:
+                chat_id, user_id = _join_request_ids(req)
+                if chat_id is None:
                     return
                 await run_db(owner_mod.record_join_request, self.db,
-                             chat.id, user.id)
+                             chat_id, user_id)
             except Exception as e:
                 log.warning("join-request track failed: %r", e)
 

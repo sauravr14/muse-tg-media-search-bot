@@ -154,6 +154,45 @@ def _join_request_ids(req):
     return chat.id, user.id
 
 
+async def _apply_member_fsub_update(db, u):
+    """Force-sub bookkeeping for one ChatMemberUpdated (track_member).
+
+    Join -> drop the pending row: a join-then-leave must not keep
+    passing the gate on a stale row (the 7-day TTL is the backstop
+    if this update never arrives).
+    Leave/kicked/banned -> ALSO forget the cached "joined" verdict:
+    _check_one caches joined for 5 min, and with no invalidation a
+    user who joins, passes the gate, then leaves keeps using the bot
+    and the Mini App until the entry expires (reported 2026-11-09:
+    a leaver saw no "join the channel" message). The cache lives in
+    this process, so forgetting here covers the bot and the Mini App
+    API at once. Clearing the pending row too is defence in depth
+    for a missed join update. If Telegram never delivers the leave
+    update, the 5-min cache TTL is the backstop. Malformed updates
+    are ignored, never raised.
+    """
+    try:
+        new = getattr(u, "new_chat_member", None)
+        if not new or not getattr(new, "user", None):
+            return
+        chat = getattr(u, "chat", None)
+        if not chat:
+            return
+        status = getattr(new, "status", "")
+        if hasattr(status, "value"):
+            status = status.value
+        status = str(status).lower().split(".")[-1]
+        if status in ("member", "administrator", "creator", "restricted"):
+            await run_db(owner_mod.clear_join_request, db,
+                         chat.id, new.user.id)
+        elif status in ("left", "kicked", "banned"):
+            owner_mod.fsub_forget(new.user.id)
+            await run_db(owner_mod.clear_join_request, db,
+                         chat.id, new.user.id)
+    except Exception as e:
+        log.warning("member fsub update failed: %r", e)
+
+
 class MediaBot:
     def __init__(self, cfg: Config, db: DB, indexer: Indexer):
         self.cfg = cfg
@@ -583,6 +622,10 @@ class MediaBot:
 
         @c.on_chat_member_updated()
         async def track_member(_, u):
+            # Force-sub bookkeeping (join clears the pending row; leave
+            # also forgets the cached "joined" verdict) lives in the
+            # helper so it is testable against a real ChatMemberUpdated.
+            await _apply_member_fsub_update(self.db, u)
             try:
                 new = u.new_chat_member
                 if not new or not new.user:
@@ -591,16 +634,6 @@ class MediaBot:
                 if hasattr(status, "value"):
                     status = status.value
                 status = str(status).lower().split(".")[-1]
-                if status in ("member", "administrator", "creator",
-                              "restricted"):
-                    # A user who just joined (e.g. the admin approved
-                    # their request) no longer needs the pending row;
-                    # without this, a join-then-leave would keep
-                    # passing the gate on the stale row. Best-effort:
-                    # the 7-day TTL is the backstop if this update
-                    # never arrives.
-                    await run_db(owner_mod.clear_join_request, self.db,
-                                 u.chat.id, new.user.id)
                 me_id = await self._self_id()
                 if not me_id or new.user.id != me_id:
                     return

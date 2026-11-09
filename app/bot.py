@@ -465,13 +465,15 @@ class MediaBot:
     async def _unjoined_fresh(self, user_id: int) -> list:
         """Force-subscribe check that never trusts the membership cache.
 
-        The request flow must verify the user is STILL joined, every
-        time: the cached 'joined' verdict lives up to 5 minutes, so a
-        user who left right after joining could otherwise slip a request
-        through. Forgetting the cache first forces a live
-        get_chat_member per force-sub channel. Only used on the rare,
-        user-initiated request path — never on search, where the cached
-        check is the right trade-off.
+        The request flow — and every Mini App API call — must verify
+        the user is STILL joined, every time: the cached 'joined'
+        verdict lives up to 5 minutes, so a user who left right after
+        joining could otherwise slip a request through, or keep
+        searching + getting files from a minimized app (2026-11-09:
+        the leave update had not arrived yet when the next tap came).
+        Forgetting the cache first forces a live get_chat_member per
+        force-sub channel. The bot-DM search path still uses the
+        cached check — that trade-off stands there.
         """
         await run_db_fast(owner_mod.fsub_forget, user_id)
         return await self._unjoined(user_id)
@@ -544,9 +546,14 @@ class MediaBot:
             parse_mode=ParseMode.HTML,
             reply_markup=owner_mod.fsub_join_keyboard(unjoined))
 
-    async def unjoined_fsub(self, user_id: int) -> list:
-        """Used by the Mini App API (api.py)."""
-        return await self._unjoined(user_id)
+    async def unjoined_fsub_fresh(self, user_id: int) -> list:
+        """Used by the Mini App API (api.py): a FRESH live check on
+        every call — the cached verdict is never trusted here, so a
+        user who leaves is blocked on their very next tap, even
+        seconds after leaving (2026-11-09: the 5-min cache let a
+        leaver keep searching + getting files from a minimized app,
+        because the leave update had not arrived yet)."""
+        return await self._unjoined_fresh(user_id)
 
     def _start_kb(self, is_owner: bool) -> InlineKeyboardMarkup:
         return owner_mod.build_start_keyboard(self._app_button, is_owner)

@@ -1228,11 +1228,8 @@ class MediaBot:
         "qualities (480p/720p/1080p) grouped under one title, and "
         "Get / Play. Files you get self-destruct in 10 minutes, "
         "so forward them to your saved messages.")
-    ABOUT_TEXT = (
-        "🎬 <b>Core TG Media Library</b>\n\n"
-        "Find movies & series from our channels, instantly, with posters "
-        "and every quality grouped under one title.\n\n"
-        "Just type a movie or series name in this chat, or open the app.")
+    # About card shows the same welcome text as /start.
+    ABOUT_TEXT = owner_mod.DEFAULT_START_TEXT
 
     async def _help_about_callback(self, q: CallbackQuery, which: str) -> None:
         text = self.HELP_TEXT if which == "help" else self.ABOUT_TEXT

@@ -5,14 +5,15 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pyrogram.enums import ChatType
-from pyrogram.types import Chat, ChatJoinRequest, InlineKeyboardButton, User
+from pyrogram.enums import ChatMemberStatus, ChatType
+from pyrogram.types import (Chat, ChatJoinRequest, ChatMember,
+                            ChatMemberUpdated, InlineKeyboardButton, User)
 
 from fastapi.testclient import TestClient
 
 from app import owner as owner_mod
 from app.api import create_app
-from app.bot import _join_request_ids
+from app.bot import _apply_member_fsub_update, _join_request_ids
 from app.config import Config
 from app.db import DB
 
@@ -38,6 +39,16 @@ class FakeClient:
 
 def _db():
     return DB(Path(tempfile.mkdtemp()) / "owner.db")
+
+
+def _member_update(chat_id, user_id, old_status, new_status):
+    user = User(id=user_id, first_name="Test")
+    return ChatMemberUpdated(
+        chat=Chat(id=chat_id, type=ChatType.CHANNEL, title="C"),
+        from_user=user,
+        date=datetime.now(timezone.utc),
+        old_chat_member=ChatMember(user=user, status=old_status),
+        new_chat_member=ChatMember(user=user, status=new_status))
 
 
 class OwnerTest(unittest.TestCase):
@@ -148,6 +159,45 @@ class OwnerTest(unittest.TestCase):
         self.assertEqual(_join_request_ids(req), (-1002031421338, 42))
         # malformed updates record nothing instead of raising
         self.assertEqual(_join_request_ids(object()), (None, None))
+
+    def test_leave_update_forgets_cached_join_and_pending_row(self):
+        # REGRESSION (2026-11-09): a user who joined, passed the gate,
+        # then left kept using the bot + Mini App — _check_one caches
+        # "joined" for 5 min and track_member never invalidated it on
+        # leave, so no "join the channel" message appeared. Drive a
+        # REAL ChatMemberUpdated through the helper.
+        owner_mod.record_join_request(self.db, -2, 42)
+        client = FakeClient({-2: "member"})
+        self.assertTrue(asyncio.run(
+            owner_mod._check_one(client, -2, 42, self.db)))
+        self.assertIn((-2, 42), owner_mod._FSUB_CACHE)
+        asyncio.run(_apply_member_fsub_update(
+            self.db, _member_update(-2, 42, ChatMemberStatus.MEMBER,
+                                    ChatMemberStatus.LEFT)))
+        self.assertNotIn((-2, 42), owner_mod._FSUB_CACHE)
+        self.assertFalse(owner_mod.has_pending_join_request(
+            self.db, -2, 42))
+        # the next (live) gate check now blocks again
+        got = asyncio.run(owner_mod.unjoined_channels(
+            FakeClient({-2: "left"}), 42, [{"chat_id": -2, "title": "B"}],
+            db=self.db))
+        self.assertEqual([e["chat_id"] for e in got], [-2])
+
+    def test_join_update_clears_pending_row_but_keeps_cache(self):
+        # the join branch still drops the pending row (so a later
+        # join-then-leave cannot pass on it) without touching the
+        # cached joined verdict.
+        owner_mod.record_join_request(self.db, -2, 42)
+        client = FakeClient({-2: "member"})
+        asyncio.run(owner_mod._check_one(client, -2, 42, self.db))
+        asyncio.run(_apply_member_fsub_update(
+            self.db, _member_update(-2, 42, ChatMemberStatus.LEFT,
+                                    ChatMemberStatus.MEMBER)))
+        self.assertFalse(owner_mod.has_pending_join_request(
+            self.db, -2, 42))
+        self.assertIn((-2, 42), owner_mod._FSUB_CACHE)
+        # malformed updates are ignored, never raised
+        asyncio.run(_apply_member_fsub_update(self.db, object()))
 
     def test_pending_join_request_counts_as_joined(self):
         # Bots cannot LIST pending requests (GetChatInviteImporters is

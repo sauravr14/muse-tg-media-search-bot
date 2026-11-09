@@ -9,7 +9,9 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app import owner as owner_mod
 from app.api import create_app, validate_init_data
+from app.bot import MediaBot
 from app.classify import Classifier
 from app.config import Config
 from app.db import DB
@@ -35,6 +37,20 @@ def _signed_init_data(bot_token: str, user_id: int = 99) -> str:
     sig = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
     pairs["hash"] = sig
     return urllib.parse.urlencode(pairs)
+
+
+class _FakeMember:
+    def __init__(self, status):
+        self.status = status
+
+
+class _FakeClient:
+    """status map: chat_id -> status string (mutable: flip to "left")."""
+    def __init__(self, statuses):
+        self.statuses = statuses
+
+    async def get_chat_member(self, chat_id, user_id):
+        return _FakeMember(self.statuses.get(chat_id, "member"))
 
 
 class ApiTest(unittest.TestCase):
@@ -167,6 +183,68 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         d = self.client.get(f"/api/title/{tid}").json()
         self.assertEqual(len(d["versions"]), 1)  # hidden one gone
+
+
+class ApiFsubFreshTest(unittest.TestCase):
+    """REGRESSION (2026-11-09): the Mini App gate trusted _check_one's
+    5-min cached "joined" verdict, so a user who joined, got a file,
+    left, then reopened the minimized app and searched kept getting
+    results — no fsub menu. The API gate must live-check on EVERY call,
+    so the very next tap after leaving is blocked even though no leave
+    update has arrived and the cache is still warm."""
+
+    def setUp(self):
+        self.db = DB(Path(tempfile.mkdtemp()) / "api-fsub.db")
+        _seed(self.db)
+        owner_mod._FSUB_CACHE.clear()
+        owner_mod.set_fsub(self.db, [{"chat_id": -1001, "title": "Ch1",
+                                      "username": "ch1", "invite_link": ""}])
+        cfg = Config()
+        cfg.bot_token = "test-token"
+        cfg.admin_ids = (99,)
+        self.fake = _FakeClient({-1001: "member"})
+        # Real MediaBot methods, no live Pyrogram Client: __init__
+        # would build one, so instantiate without it and fill the
+        # attributes the gate path reads.
+        bot = object.__new__(MediaBot)
+        bot.cfg = cfg
+        bot.db = self.db
+        bot.client = self.fake
+        bot._sudo_ids = set()
+        self.client = TestClient(create_app(cfg, self.db,
+                                            bot_username="testbot", bot=bot))
+        self.init42 = _signed_init_data("test-token", 42)
+
+    def tearDown(self):
+        owner_mod._FSUB_CACHE.clear()
+
+    def _search_ok(self):
+        r = self.client.get("/api/search", params={"q": "Inception"},
+                            headers={"x-telegram-init-data": self.init42})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.json()["results"]), 1)
+
+    def test_leaver_blocked_on_next_search(self):
+        # joined: search works, and the joined verdict gets cached
+        self._search_ok()
+        self.assertIn((-1001, 42), owner_mod._FSUB_CACHE)
+        # user leaves; NO leave update is delivered, cache still warm
+        self.fake.statuses[-1001] = "left"
+        r = self.client.get("/api/search", params={"q": "Inception"},
+                            headers={"x-telegram-init-data": self.init42})
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(r.json()["fsub_required"])
+        self.assertEqual(r.json()["channels"][0]["chat_id"], -1001)
+
+    def test_leaver_blocked_on_getfile_too(self):
+        # same warm-cache setup, then the Get File step must block too
+        self._search_ok()
+        self.assertIn((-1001, 42), owner_mod._FSUB_CACHE)
+        self.fake.statuses[-1001] = "left"
+        r = self.client.post("/api/getfile", json={},
+                             headers={"x-telegram-init-data": self.init42})
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(r.json()["fsub_required"])
 
 
 class MultiWordSearchTest(unittest.TestCase):

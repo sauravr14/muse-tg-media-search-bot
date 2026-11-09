@@ -52,7 +52,8 @@ class OwnerTest(unittest.TestCase):
         self.assertEqual(owner_mod.get_start_photo(self.db), "FILE123")
         owner_mod.set_start_photo(self.db, "")
         self.assertEqual(owner_mod.get_start_photo(self.db), "")
-        self.assertIn("Core TG", owner_mod.get_start_text(self.db))
+        # default start text (fancy-font title) is returned when unset
+        self.assertIn("𝐂𝐨𝐫𝐞 𝐓𝐆", owner_mod.get_start_text(self.db))
         owner_mod.set_start_text(self.db, "Hello")
         self.assertEqual(owner_mod.get_start_text(self.db), "Hello")
 
@@ -197,6 +198,19 @@ class OwnerTest(unittest.TestCase):
             self.db, now=1000.0 + owner_mod.PENDING_JOIN_TTL + 1)
         self.assertFalse(owner_mod.has_pending_join_request(
             self.db, -2, 42, now=1000.0 + owner_mod.PENDING_JOIN_TTL + 2))
+
+    def test_start_text_fits_photo_caption(self):
+        # /start is sent as a photo caption when a start photo is set,
+        # and Telegram truncates captions at 1024 chars — a longer
+        # welcome would be cut off mid-sentence with no error.
+        text = owner_mod.DEFAULT_START_TEXT
+        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 1024)
+        for section in ("How to use", "Stream instantly", "Copy link",
+                        "Get File", "Request a title"):
+            self.assertIn(section, text)
+        # public copy avoids "movies / web series" wording.
+        self.assertNotIn("movies", text.lower())
+        self.assertNotIn("web series", text.lower())
 
     def test_parse_chat_arg(self):
         self.assertEqual(owner_mod.parse_chat_arg("@chan"), "chan")

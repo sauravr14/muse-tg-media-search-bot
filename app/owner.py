@@ -26,11 +26,28 @@ KV_SUDO_IDS = "settings:sudo_ids"
 LOG_TEXT_MAX = 300
 USERS_PAGE = 25
 
+# NOTE: sent as a photo caption when a start photo is set, so this must
+# stay under Telegram's 1024-char caption limit (see test_start_text).
 DEFAULT_START_TEXT = (
-    "🎬 <b>Core TG Media Library</b>\n\n"
-    "Search movies & series from our channels.\n"
-    "Just type a name, or use:\n"
-    "/search &lt;name&gt; · /recent · /movies · /series · /help"
+    "🎬 <b>𝐂𝐨𝐫𝐞 𝐓𝐆 — 𝐌𝐞𝐝𝐢𝐚 𝐋𝐢𝐛𝐫𝐚𝐫𝐲</b>\n\n"
+    "✦ 13 lakh+ files &amp; 1.8 lakh+ titles — search, stream &amp; "
+    "download, all free.\n\n"
+    "<b>🔍 How to use</b>\n"
+    "• Type any title name here, or tap 🌐 Open Media Library below\n"
+    "• Pick a title, choose 480p / 720p / 1080p\n\n"
+    "<b>▶️ Stream instantly</b>\n"
+    "• Tap ▶ Play to watch right inside the app — no download needed\n\n"
+    "<b>🔗 Copy link &amp; Get file</b>\n"
+    "• 📋 Copy Link — paste it in any browser or player to download "
+    "&amp; stream online directly (valid 1 hour)\n"
+    "• 📥 Get File — the file lands in your DM, deletes in 10 mins, "
+    "so save it quick\n\n"
+    "<b>📩 Request a title</b>\n"
+    "• Can't find it? Tap the 🎬 Request button in the app, or send "
+    "/request &lt;name&gt;\n"
+    "• I'll upload it &amp; DM you when it's ready\n\n"
+    "✨ Free forever — happy watching! 🍿\n\n"
+    "⚡ /search &lt;name&gt; · /request &lt;name&gt; · /help"
 )
 
 JOINED_STATUSES = {"member", "administrator", "creator", "restricted"}

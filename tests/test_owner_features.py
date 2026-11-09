@@ -338,7 +338,7 @@ class OwnerTest(unittest.TestCase):
         class StubBot:
             client = object()
 
-            async def unjoined_fsub(self, user_id):
+            async def unjoined_fsub_fresh(self, user_id):
                 return [{"chat_id": -1001, "title": "Ch1",
                          "username": "ch1", "invite_link": ""}]
 

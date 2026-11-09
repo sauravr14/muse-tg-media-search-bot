@@ -107,6 +107,13 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
     # 403 {"fsub_required": true, "channels": [...]} for unjoined users
     # (or for unverifiable users, so the app can show the join list).
     # Get/stream already require initData, so they gate on the real user id.
+    # The gate live-checks on EVERY call (unjoined_fsub_fresh): the Mini
+    # App must block a leaver on the very next tap, not after the 5-min
+    # membership cache expires (2026-11-09: a leaver kept searching +
+    # getting files from a minimized app). That costs one live
+    # get_chat_member per force-sub channel per call; a check error
+    # still fails open (see unjoined_channels), so a Telegram hiccup
+    # never locks every user out at once.
     # If bot is None (test app without a client), catalog gating fails open
     # — production always passes bot (main.py), so this only affects tests.
     async def _fsub_gate(request: Request, user_id: int | None):
@@ -117,7 +124,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
             return entries
         if bot is None:
             return None
-        unjoined = await bot.unjoined_fsub(int(user_id))
+        unjoined = await bot.unjoined_fsub_fresh(int(user_id))
         return unjoined or None
 
     def _fsub_response(channels):

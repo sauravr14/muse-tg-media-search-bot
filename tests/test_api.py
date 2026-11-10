@@ -288,5 +288,75 @@ class MultiWordSearchTest(unittest.TestCase):
         self.assertEqual(self._titles("good doctor"), ["The Good Doctor"])
 
 
+class SearchRankTest(unittest.TestCase):
+    """Regression (2026-11-10): /api/search ordered purely by TMDB
+    popularity, so searching "A beautiful life" listed "Life Is
+    Beautiful" (1997, famous) first and the exact "A Beautiful Life"
+    (2023) fourth. Exact matches must rank first, then titles starting
+    with / containing the query phrase, then the rest by popularity."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db = DB(Path(tempfile.mkdtemp()) / "api-rank.db")
+        clf = Classifier(cls.db)
+        meta = lambda c, m, n: {"file_name": n, "size": 10, "duration": 5,
+                                "mime": "video/x-matroska", "tg_chat_id": c,
+                                "tg_msg_id": m, "caption": "", "msg_date": 0}
+        for i, n in enumerate(["Life.Is.Beautiful.1997.1080p.mkv",
+                               "A.Beautiful.Life.2023.1080p.mkv"]):
+            clf.ingest(parse_filename(n), meta(-1003, 1 + i, n))
+        # the famous film is far more popular — the old order put it first
+        cls.db.execute("UPDATE titles SET popularity=900 "
+                       "WHERE title='Life Is Beautiful'")
+        cls.db.execute("UPDATE titles SET popularity=50 "
+                       "WHERE title='A Beautiful Life'")
+        cfg = Config()
+        cfg.bot_token = "test-token"
+        cls.client = TestClient(create_app(cfg, cls.db, bot_username="testbot"))
+
+    def _titles(self, q):
+        d = self.client.get("/api/search", params={"q": q}).json()
+        return [r["title"] for r in d["results"]]
+
+    def test_exact_match_first(self):
+        self.assertEqual(self._titles("A beautiful life"),
+                         ["A Beautiful Life", "Life Is Beautiful"])
+
+    def test_phrase_contained_beats_reordered_words(self):
+        # "beautiful life" appears contiguously only in the exact title;
+        # "Life Is Beautiful" has the same words in another order.
+        self.assertEqual(self._titles("beautiful life"),
+                         ["A Beautiful Life", "Life Is Beautiful"])
+
+
+class SearchRankBotTest(unittest.TestCase):
+    """Same ranking bug in the bot DM path: search_titles ordered by
+    popularity only, so the bot's top match for "A beautiful life"
+    was "Life Is Beautiful" too."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db = DB(Path(tempfile.mkdtemp()) / "api-rank-bot.db")
+        clf = Classifier(cls.db)
+        meta = lambda c, m, n: {"file_name": n, "size": 10, "duration": 5,
+                                "mime": "video/x-matroska", "tg_chat_id": c,
+                                "tg_msg_id": m, "caption": "", "msg_date": 0}
+        for i, n in enumerate(["Life.Is.Beautiful.1997.1080p.mkv",
+                               "A.Beautiful.Life.2023.1080p.mkv"]):
+            clf.ingest(parse_filename(n), meta(-1004, 1 + i, n))
+        cls.db.execute("UPDATE titles SET popularity=900 "
+                       "WHERE title='Life Is Beautiful'")
+        cls.db.execute("UPDATE titles SET popularity=50 "
+                       "WHERE title='A Beautiful Life'")
+        bot = object.__new__(MediaBot)
+        bot.db = cls.db
+        cls.bot = bot
+
+    def test_exact_match_first(self):
+        rows = self.bot.search_titles("A beautiful life")
+        self.assertEqual([r["title"] for r in rows],
+                         ["A Beautiful Life", "Life Is Beautiful"])
+
+
 if __name__ == "__main__":
     unittest.main()

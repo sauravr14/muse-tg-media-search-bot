@@ -24,9 +24,10 @@ from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
 from . import owner as owner_mod
 from . import requests as req_mod
 from .config import Config
-from .db import DB, RES_ORDER, fts_terms
+from .db import DB, RES_ORDER, fts_terms, search_rank_order
 from .dbthread import run_db, run_db_fast
 from .indexer import Indexer
+from .parser import normalize_title
 
 log = logging.getLogger("mediabot.bot")
 PAGE = 6
@@ -256,8 +257,13 @@ class MediaBot:
         if kind in ("movie", "series"):
             sql += " AND t.kind=?"
             params.append(kind)
-        sql += " ORDER BY t.popularity DESC NULLS LAST, t.last_file_at DESC LIMIT ? OFFSET ?"
-        params += [limit, offset]
+        # relevance first (2026-11-10): same exact-match-first tiers as
+        # /api/search — popularity alone ranked "Life Is Beautiful"
+        # above the exact "A Beautiful Life", so the bot's top match
+        # was the wrong title too.
+        rank_clause, rank_params = search_rank_order(normalize_title(q))
+        sql += " ORDER BY " + rank_clause + " LIMIT ? OFFSET ?"
+        params += list(rank_params) + [limit, offset]
         try:
             return self.db.query(sql, tuple(params))
         except Exception as e:

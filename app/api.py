@@ -22,8 +22,9 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from .config import Config
-from .db import DB, RES_ORDER, _uj, fts_terms
+from .db import DB, RES_ORDER, _uj, fts_terms, search_rank_order
 from .owner import fsub_list
+from .parser import normalize_title
 from .dbthread import run_db
 from .streamer import (MAX_STREAMS, ByteStreamer, StreamFileNotFound,
                        parse_range, sign_token, stream_secret, verify_token)
@@ -173,6 +174,11 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                 variants.add(t[:-1])
             groups.append("(" + " OR ".join(f'"{v}"*' for v in sorted(variants)) + ")")
         match = " AND ".join(groups)
+        # relevance first (2026-11-10): popularity alone put a famous
+        # partial match ("Life Is Beautiful") above the exact match
+        # ("A Beautiful Life"). search_rank_order tiers exact match,
+        # starts-with, contains-phrase, then the rest by popularity.
+        rank_clause, rank_params = search_rank_order(normalize_title(q))
         per, off = 20, (max(page, 1) - 1) * 20
         try:
             rows = await run_db(
@@ -181,9 +187,10 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                 "WHERE titles_fts MATCH ?"
                 + (" AND t.kind=? " if kind in ("movie", "series") else "")
                 + (CLEAN_ONLY.replace("titles.id", "t.id") if hide_cam else "")
-                + " ORDER BY t.popularity DESC NULLS LAST, t.last_file_at DESC"
-                " LIMIT ? OFFSET ?",
-                tuple([match] + ([kind] if kind in ("movie", "series") else []) + [per, off]))
+                + " ORDER BY " + rank_clause
+                + " LIMIT ? OFFSET ?",
+                tuple([match] + ([kind] if kind in ("movie", "series") else [])
+                      + list(rank_params) + [per, off]))
         except Exception:
             rows = []
         return {"results": [_title_card(t) for t in rows], "page": page}

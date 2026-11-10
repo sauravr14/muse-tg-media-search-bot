@@ -48,6 +48,31 @@ def fts_terms(q: str) -> list:
     terms = [t for t in q.replace('"', "").split() if t]
     return [t for t in terms if t.lower() not in SEARCH_STOPWORDS]
 
+
+def search_rank_order(nq: str) -> tuple[str, tuple]:
+    """Relevance-first ORDER BY for title search (2026-11-10).
+
+    The old popularity-only order put a famous partial match above the
+    exact match: searching "A beautiful life" listed "Life Is Beautiful"
+    (1997) first and the exact "A Beautiful Life" (2023) fourth.
+    Tiers, each broken by popularity then newest file:
+      0 — normalized title equals the normalized query (exact match)
+      1 — title starts with the query phrase
+      2 — query phrase appears anywhere in the title
+      3 — the remaining FTS matches (same words, different order)
+    `nq` must already be normalized with parser.normalize_title, the
+    same function that produced titles.norm_title. LIKE wildcards in
+    the query are escaped so they match literally.
+    """
+    esc = nq.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    clause = (
+        "CASE WHEN t.norm_title=? THEN 0 "
+        "WHEN t.norm_title LIKE ? ESCAPE '\\' THEN 1 "
+        "WHEN t.norm_title LIKE ? ESCAPE '\\' THEN 2 "
+        "ELSE 3 END, t.popularity DESC NULLS LAST, t.last_file_at DESC"
+    )
+    return clause, (nq, esc + "%", "%" + esc + "%")
+
 SCHEMA = f"""
 PRAGMA journal_mode=WAL;
 

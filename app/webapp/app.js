@@ -316,7 +316,9 @@
           if (s.packs && s.packs.length) {
             ph = `<div class="section-title pack-head"><span>📦 Season packs</span><span>▸</span></div><div class="pack-body" hidden>` + s.packs.map((v) => verRow(v, "📦 " + (v.pack_label || "Pack"))).join("") + `</div>`;
           }
-          $("eps").innerHTML = ph + (s.episodes.length ? s.episodes.map((e) =>
+          $("eps").innerHTML = ph + (s.packs && s.packs.length ? `<div class="section-divider"></div>` : ``)
+            + `<div class="section-title">📦 Episodes</div>`
+            + (s.episodes.length ? s.episodes.map((e) =>
             `<div class="ep"><div class="ep-head"><span>E${String(e.ep_no).padStart(2, "0")}${e.title ? " — " + esc(e.title) : ""}</span><span>▸</span></div>
              <div class="ep-body" hidden>${e.versions.length ? e.versions.map((v) => verRow(v)).join("") : `<div class="empty" style="padding:14px">No files.</div>`}</div></div>`).join("")
             : `<div class="empty">No episodes yet.</div>`);

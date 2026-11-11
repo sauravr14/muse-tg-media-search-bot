@@ -314,15 +314,13 @@
           const s = t.seasons[i]; if (!s) return;
           let ph = "";
           if (s.packs && s.packs.length) {
-            ph = `<div class="section-title">📦 Season packs</div>` + s.packs.map((v) =>
-              `<div class="ep"><div class="ep-head"><span>📦 ${esc(v.pack_label || "Pack")}</span><span>▸</span></div>
-               <div class="ep-body" hidden>${verRow(v, "📦 " + (v.pack_label || "Pack"))}</div></div>`).join("");
+            ph = `<div class="section-title pack-head"><span>📦 Season packs</span><span>▸</span></div><div class="pack-body" hidden>` + s.packs.map((v) => verRow(v, "📦 " + (v.pack_label || "Pack"))).join("") + `</div>`;
           }
           $("eps").innerHTML = ph + (s.episodes.length ? s.episodes.map((e) =>
             `<div class="ep"><div class="ep-head"><span>E${String(e.ep_no).padStart(2, "0")}${e.title ? " — " + esc(e.title) : ""}</span><span>▸</span></div>
              <div class="ep-body" hidden>${e.versions.length ? e.versions.map((v) => verRow(v)).join("") : `<div class="empty" style="padding:14px">No files.</div>`}</div></div>`).join("")
             : `<div class="empty">No episodes yet.</div>`);
-          view.querySelectorAll(".ep-head").forEach((el) => el.addEventListener("click", () => {
+          view.querySelectorAll(".ep-head, .pack-head").forEach((el) => el.addEventListener("click", () => {
             const b = el.nextElementSibling; b.hidden = !b.hidden; el.lastElementChild.textContent = b.hidden ? "▸" : "▾"; haptic();
           }));
           bindGet();

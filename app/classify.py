@@ -23,9 +23,11 @@ class Classifier:
     # titles repeat hundreds of times (series episodes, multi-part
     # movies) and every lookup is up to 3 DB queries. Keyed by
     # (norm_title, year, kind) -> title id (or None for a miss).
-    # Titles are append-mostly — rows are created, never renamed — so a
-    # process-lifetime cache is safe; create_title refreshes the entry
-    # and the cache is dropped if it ever grows past the bound.
+    # NOTE: titles are NOT append-only — the enricher merges them and
+    # the orphan cleanup deletes them. A cached id can therefore
+    # outlive its row; every merge/delete path must call
+    # invalidate_title() (and _ingest_one retries once on FK) or the
+    # next ingest for that title dies with FOREIGN KEY.
     _TITLE_CACHE_MAX = 20000
     _CACHE_MISS = object()
 
@@ -38,6 +40,27 @@ class Classifier:
         if len(self._title_cache) >= self._TITLE_CACHE_MAX:
             self._title_cache.clear()
         self._title_cache[(norm_title, year, kind)] = title_id
+
+    def invalidate_title(self, title_id: int | None = None) -> None:
+        """Drop cached title lookups after a merge or delete.
+
+        find_title caches ids in memory and never re-checks the DB, so a
+        cached id can outlive its row: the next ingest for that title
+        then dies with FOREIGN KEY (INSERT OR IGNORE does NOT suppress
+        FK violations in SQLite — verified on 3.45.1). Evict by id after
+        a merge; clear everything after a bulk delete (orphan cleanup,
+        rebuild). Cheap: the next lookup just re-queries.
+        """
+        if title_id is None:
+            self._title_cache.clear()
+            return
+        for key, cached in list(self._title_cache.items()):
+            if cached == title_id:
+                del self._title_cache[key]
+
+    def invalidate_title_key(self, norm_title: str, year, kind: str) -> None:
+        """Drop one cached lookup by its (norm_title, year, kind) key."""
+        self._title_cache.pop((norm_title, year, kind), None)
 
     # -- title lookup ------------------------------------------------------
     def find_title(self, p: ParsedName) -> dict | None:

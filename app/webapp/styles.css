@@ -110,6 +110,7 @@ button { font-family: inherit; }
 @keyframes fade { from { opacity: 0; transform: translateY(6px); } }
 .pad { padding: 0 14px; }
 .section-title { font-size: 17px; font-weight: 800; margin: 18px 14px 10px; display: flex; align-items: baseline; gap: 8px; }
+.pack-head { cursor: pointer; justify-content: space-between; }
 .count { color: var(--muted); font-weight: 400; font-size: 13px; }
 
 /* hero carousel */

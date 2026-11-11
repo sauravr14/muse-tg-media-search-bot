@@ -163,6 +163,54 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(eps["n"], 300)
 
 
+    def test_merge_invalidates_title_cache(self):
+        # Regression test for 2026-11-11: the enricher merged a title
+        # overnight, but the classifier's in-memory title cache kept the
+        # dead id — the next day's files for that show died with
+        # FOREIGN KEY, live and on scan retry (5 files skipped from
+        # onemillianhub copy, msgs 255596-255600).
+        from app.parser import parse_filename
+        meta1 = file_meta(-100, 101, "Lanterns Junk S01E01 1080p WEB-DL.mkv")
+        res1, _ = self.idx._ingest_one(meta1)
+        old_id = res1["title_id"]
+        p1 = parse_filename(meta1["file_name"])
+        # the lookup is cached now (this is the live ingest path's cache)
+        self.assertIn(old_id, self.idx.clf._title_cache.values())
+        # canonical surviving title
+        t2, _, _ = self._mk("Lanterns", "lanterns")
+
+        asyncio.run(self.idx._merge_titles(old_id, t2))
+
+        # the dead id must be gone from the cache
+        self.assertNotIn(old_id, self.idx.clf._title_cache.values())
+        # a later file for the same show ingests instead of FK-failing
+        meta2 = file_meta(-100, 102, "Lanterns Junk S01E02 1080p WEB-DL.mkv")
+        res2, _ = self.idx._ingest_one(meta2)
+        self.assertIsNotNone(res2)
+        f = self.db.query_one(
+            "SELECT title_id FROM files WHERE tg_chat_id=? AND tg_msg_id=?",
+            (-100, 102))
+        self.assertIsNotNone(f)
+        self.assertNotEqual(f["title_id"], old_id)
+
+    def test_ingest_retries_stale_cache(self):
+        # Belt and braces: even if a stale id slips past the merge
+        # invalidation (a merge racing the lookup), one ingest retries
+        # once with the cached id dropped instead of failing.
+        from app.parser import parse_filename
+        meta = file_meta(-100, 103, "Stale Show S01E01 1080p WEB-DL.mkv")
+        p = parse_filename(meta["file_name"])
+        # poison the cache with a title id that does not exist
+        self.idx.clf._title_cache[(p.norm_title, p.year, p.kind)] = 999999
+        res, _ = self.idx._ingest_one(meta)
+        self.assertIsNotNone(res)
+        f = self.db.query_one(
+            "SELECT title_id FROM files WHERE tg_chat_id=? AND tg_msg_id=?",
+            (-100, 103))
+        self.assertIsNotNone(f)
+        self.assertNotEqual(f["title_id"], 999999)
+
+
 if __name__ == "__main__":
     unittest.main()
 

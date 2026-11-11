@@ -314,7 +314,9 @@
           const s = t.seasons[i]; if (!s) return;
           let ph = "";
           if (s.packs && s.packs.length) {
-            ph = `<div class="section-title">📦 Season packs</div>` + s.packs.map((v) => verRow(v, "📦 " + (v.pack_label || "Pack"))).join("");
+            ph = `<div class="section-title">📦 Season packs</div>` + s.packs.map((v) =>
+              `<div class="ep"><div class="ep-head"><span>📦 ${esc(v.pack_label || "Pack")}</span><span>▸</span></div>
+               <div class="ep-body" hidden>${verRow(v, "📦 " + (v.pack_label || "Pack"))}</div></div>`).join("");
           }
           $("eps").innerHTML = ph + (s.episodes.length ? s.episodes.map((e) =>
             `<div class="ep"><div class="ep-head"><span>E${String(e.ep_no).padStart(2, "0")}${e.title ? " — " + esc(e.title) : ""}</span><span>▸</span></div>

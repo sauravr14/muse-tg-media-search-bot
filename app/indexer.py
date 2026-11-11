@@ -136,7 +136,17 @@ class Indexer:
         p = parse_filename(meta["file_name"])
         if not p.title:
             return None, None
-        res = self.clf.ingest(p, meta)
+        try:
+            res = self.clf.ingest(p, meta)
+        except sqlite3.IntegrityError:
+            # Stale-cache race: the title this file was filed under was
+            # merged or deleted after find_title cached its id (merge /
+            # delete paths invalidate now, but a merge racing the lookup
+            # can still slip through). Drop the cached id and retry once
+            # against live DB state; a second failure propagates as
+            # before (live logs it, scan skips the file).
+            self.clf.invalidate_title_key(p.norm_title, p.year, p.kind)
+            res = self.clf.ingest(p, meta)
         if res.get("duplicate"):
             return res, None
         title = self.db.query_one("SELECT id, tmdb_id FROM titles WHERE id=?",
@@ -685,6 +695,10 @@ class Indexer:
             await run_db(self.db.execute, "DELETE FROM episodes")
             await run_db(self.db.execute, "DELETE FROM seasons")
             await run_db(self.db.execute, "DELETE FROM titles")
+            # Every title id the classifier cached is dead now; drop
+            # the cache before re-ingesting or every cached lookup
+            # dies with FOREIGN KEY.
+            self.clf.invalidate_title()
             n = 0
             for f in files:
                 await self._guard_wait()
@@ -912,6 +926,10 @@ class Indexer:
                 orphans += n
                 if n == 0:
                     break
+            if orphans:
+                # Deleted titles may sit in the classifier's cache;
+                # drop it so later ingests re-query live state.
+                self.clf.invalidate_title()
             log.info("catalog cleanup: %d moved, %d kept, %d orphan titles removed",
                      moved, kept, orphans)
             await run_db(self.db.execute, "DELETE FROM kv WHERE key=?",
@@ -1141,6 +1159,11 @@ class Indexer:
         The transaction runs on a worker thread (run_db) so even a big
         merge can never stall the event loop."""
         await run_db(self._merge_titles_sync, old_id, new_id)
+        # The merged-away title's id may sit in the classifier's
+        # in-memory cache: drop it, or the next ingest for that title
+        # dies with FOREIGN KEY (seen live 2026-11-11: 5 files skipped
+        # from onemillianhub copy after an overnight merge).
+        self.clf.invalidate_title(old_id)
 
     def _merge_titles_sync(self, old_id: int, new_id: int) -> None:
         """Sync core of _merge_titles: one transaction, worker thread."""

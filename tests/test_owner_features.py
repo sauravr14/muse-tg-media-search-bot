@@ -307,6 +307,96 @@ class OwnerTest(unittest.TestCase):
         self.assertNotIn(log_ch, got)
         self.assertEqual(len(got), len(set(got)))
 
+    def test_broadcast_recipients_users_only(self):
+        log_ch = -100999
+        self.db.upsert_user(10, "a", "A", "", "")
+        self.db.upsert_user(20, "b", "B", "", "")
+        self.db.upsert_chat(-200, "group", "G", "")
+        self.db.upsert_source(-400, "Src", "")
+        self.assertEqual(
+            owner_mod.collect_broadcast_recipients(self.db, log_ch,
+                                                   users_only=True),
+            [10, 20])
+        # default (and users_only=False) still sends to everyone
+        self.assertEqual(
+            owner_mod.collect_broadcast_recipients(self.db, log_ch),
+            [10, 20, -200, -400])
+
+    def test_broadcast_targets_mark_users_vs_chats(self):
+        log_ch = -100999
+        self.db.upsert_user(10, "a", "A", "", "")
+        self.db.upsert_user(20, "b", "B", "", "")
+        self.db.upsert_chat(-200, "group", "G", "")
+        self.db.upsert_chat(-300, "channel", "C", "")
+        self.db.upsert_source(-300, "C", "")
+        self.db.upsert_source(-400, "Src", "")
+        self.assertEqual(
+            owner_mod.collect_broadcast_targets(self.db, log_ch),
+            [(10, True), (20, True), (-300, False), (-200, False),
+             (-400, False)])
+        self.assertEqual(
+            owner_mod.collect_broadcast_targets(self.db, log_ch,
+                                                users_only=True),
+            [(10, True), (20, True)])
+
+    def test_run_broadcast_scope_and_app_button(self):
+        from app.bot import MediaBot
+
+        class BroadcastFakeClient:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, chat_id, text, **kwargs):
+                self.sent.append({"chat_id": chat_id, "text": text,
+                                  "reply_markup": kwargs.get("reply_markup")})
+
+            async def send_photo(self, chat_id, photo, **kwargs):
+                self.sent.append({"chat_id": chat_id, "photo": photo,
+                                  "caption": kwargs.get("caption"),
+                                  "reply_markup": kwargs.get("reply_markup")})
+
+        cfg = Config()
+        cfg.mini_app_url = "https://muse-tg-media-search-bot-webapp.vercel.app/"
+        cfg.admin_ids = (99,)
+        fake = BroadcastFakeClient()
+        bot = object.__new__(MediaBot)
+        bot.cfg = cfg
+        bot.db = self.db
+        bot.client = fake
+        bot._sudo_ids = set()
+        self.db.upsert_user(10, "a", "A", "", "")
+        self.db.upsert_user(20, "b", "B", "", "")
+        self.db.upsert_chat(-200, "group", "G", "")
+        self.db.upsert_source(-400, "Src", "")
+
+        asyncio.run(bot._run_broadcast(99, {"text": "hello"}, "users"))
+        self.assertEqual([c["chat_id"] for c in fake.sent], [10, 20, 99])
+        # users get the real Mini App (web_app) button
+        for call in fake.sent[:2]:
+            btn = call["reply_markup"].inline_keyboard[0][0]
+            self.assertEqual(btn.text, "🌐 Open Media Library")
+            self.assertIsNotNone(btn.web_app)
+            self.assertEqual(
+                btn.web_app.url,
+                "https://muse-tg-media-search-bot-webapp.vercel.app/")
+        self.assertIn("users only", fake.sent[-1]["text"])
+
+        fake.sent.clear()
+        asyncio.run(bot._run_broadcast(99, {"text": "hello"}, "all"))
+        self.assertEqual([c["chat_id"] for c in fake.sent],
+                         [10, 20, -200, -400, 99])
+        # groups/channels get a plain link button — web_app buttons are
+        # private-chat-only and would fail the whole send there
+        for call in fake.sent[2:4]:
+            btn = call["reply_markup"].inline_keyboard[0][0]
+            self.assertEqual(btn.text, "🌐 Open Media Library")
+            self.assertIsNone(btn.web_app)
+            self.assertEqual(
+                btn.url,
+                "https://muse-tg-media-search-bot-webapp.vercel.app/")
+        self.assertIn("everyone", fake.sent[-1]["text"])
+        self.assertIn("delivered: <b>4</b>", fake.sent[-1]["text"])
+
     # -- live logs ---------------------------------------------------------------
     def test_log_truncation_and_admin_exclusion(self):
         long_text = "x" * 500

@@ -1369,32 +1369,44 @@ class MediaBot:
             await self.client.send_message(chat_id, "No broadcast draft. "
                                            "Use /broadcast or Settings → Broadcast.")
             return
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Send broadcast", callback_data="bc:send"),
-            InlineKeyboardButton("❌ Cancel", callback_data="bc:cancel")]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Send to users only", callback_data="bc:send:users")],
+            [InlineKeyboardButton("📣 Send to everyone", callback_data="bc:send:all")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="bc:cancel")]])
         preview = draft["text"] or draft.get("caption") or "[photo]"
+        note = ("\n\nPick who gets it — every message carries a "
+                "🌐 Open Media Library button.")
         if draft.get("photo"):
             await self.client.send_photo(
-                chat_id, draft["photo"], caption=f"📣 <b>Broadcast preview</b>\n\n{preview[:1000]}",
+                chat_id, draft["photo"], caption=f"📣 <b>Broadcast preview</b>\n\n{preview[:1000]}{note}",
                 parse_mode=ParseMode.HTML, reply_markup=kb)
         else:
             await self.client.send_message(
-                chat_id, f"📣 <b>Broadcast preview</b>\n\n{preview}",
+                chat_id, f"📣 <b>Broadcast preview</b>\n\n{preview}{note}",
                 parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    async def _run_broadcast(self, owner_chat: int, draft: dict) -> None:
+    async def _run_broadcast(self, owner_chat: int, draft: dict, scope: str = "all") -> None:
         log_ch = await run_db(owner_mod.resolve_log_channel, self.db,
                               self.cfg.log_channel_id)
-        recipients = await run_db(owner_mod.collect_broadcast_recipients,
-                                  self.db, log_ch)
+        targets = await run_db(owner_mod.collect_broadcast_targets,
+                               self.db, log_ch, scope == "users")
+        # WebApp buttons are private-chat-only on Telegram's side, so
+        # users get the real Mini App button and groups/channels get a
+        # plain link button to the same Mini App URL.
+        user_kb = InlineKeyboardMarkup([[self._app_button("🌐 Open Media Library")]])
+        link_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌐 Open Media Library", url=self.cfg.mini_app_url)]])
         delivered = failed = 0
-        for i, rid in enumerate(recipients):
+        for i, (rid, is_user) in enumerate(targets):
+            kb = user_kb if is_user else link_kb
             try:
                 if draft.get("photo"):
                     await self.client.send_photo(rid, draft["photo"],
-                                                 caption=draft.get("caption") or "")
+                                                 caption=draft.get("caption") or "",
+                                                 reply_markup=kb)
                 else:
-                    await self.client.send_message(rid, draft.get("text") or "")
+                    await self.client.send_message(rid, draft.get("text") or "",
+                                                   reply_markup=kb)
                 delivered += 1
             except Exception as e:
                 if type(e).__name__ == "FloodWait":
@@ -1403,9 +1415,11 @@ class MediaBot:
                     try:
                         if draft.get("photo"):
                             await self.client.send_photo(rid, draft["photo"],
-                                                         caption=draft.get("caption") or "")
+                                                         caption=draft.get("caption") or "",
+                                                         reply_markup=kb)
                         else:
-                            await self.client.send_message(rid, draft.get("text") or "")
+                            await self.client.send_message(rid, draft.get("text") or "",
+                                                           reply_markup=kb)
                         delivered += 1
                         continue
                     except Exception:
@@ -1414,10 +1428,12 @@ class MediaBot:
             if i and i % 10 == 0:
                 await asyncio.sleep(1)
         try:
+            scope_label = "users only" if scope == "users" else "everyone"
             await self.client.send_message(
                 owner_chat,
-                f"📣 <b>Broadcast done</b> — delivered: <b>{delivered}</b>, "
-                f"failed: <b>{failed}</b>, total: <b>{len(recipients)}</b>.",
+                f"📣 <b>Broadcast done</b> — scope: <b>{scope_label}</b>, "
+                f"delivered: <b>{delivered}</b>, "
+                f"failed: <b>{failed}</b>, total: <b>{len(targets)}</b>.",
                 parse_mode=ParseMode.HTML)
         except Exception as e:
             log.warning("broadcast report failed: %r", e)
@@ -1540,17 +1556,19 @@ class MediaBot:
                 cid, "📣 Send the broadcast message now (text, or a photo with "
                      "a caption). I'll show a preview with Send / Cancel "
                      "before anything goes out. /cancel to abort.")
-        elif data == "bc:send":
+        elif data in ("bc:send", "bc:send:users", "bc:send:all"):
             draft = self._bc_draft.pop(uid, None)
             if not draft:
                 await q.answer("No draft.")
                 return
+            # bare bc:send is an old preview message — same as "all".
+            scope = "users" if data == "bc:send:users" else "all"
             await q.answer("Broadcasting…")
             try:
                 await q.message.edit_text("📣 Broadcasting…")
             except Exception:
                 pass
-            asyncio.create_task(self._run_broadcast(cid, draft))
+            asyncio.create_task(self._run_broadcast(cid, draft, scope))
         elif data == "bc:cancel":
             self._pending_clear(uid)
             await q.answer("Cancelled.")

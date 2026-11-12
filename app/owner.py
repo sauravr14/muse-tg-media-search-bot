@@ -338,12 +338,13 @@ def build_start_keyboard(app_button, is_owner: bool) -> InlineKeyboardMarkup:
 
 
 # -- broadcast recipients ------------------------------------------------------------
-def collect_broadcast_recipients(db, log_channel_id: int) -> list:
-    """Users + group/supergroup chats + channels the bot can post in.
+def collect_broadcast_targets(db, log_channel_id: int,
+                              users_only: bool = False) -> list:
+    """(chat_id, is_user) pairs a broadcast goes to.
 
-    Channels come from both recorded chats and enabled sources (the bot
-    is admin in source channels, so it can post there). Deduplicated,
-    log channel excluded, never the bot itself (it has no user row).
+    Users first, then group/supergroup chats, then enabled source
+    channels (the bot is admin there, so it can post). Deduplicated,
+    log channel excluded. users_only=True skips chats and sources.
     """
     seen: set = set()
     out: list = []
@@ -351,15 +352,24 @@ def collect_broadcast_recipients(db, log_channel_id: int) -> list:
         uid = row["user_id"]
         if uid and uid != log_channel_id and uid not in seen:
             seen.add(uid)
-            out.append(uid)
+            out.append((uid, True))
+    if users_only:
+        return out
     for row in db.query("SELECT chat_id, type FROM chats ORDER BY chat_id"):
         cid = row["chat_id"]
         if cid and cid != log_channel_id and cid not in seen:
             seen.add(cid)
-            out.append(cid)
+            out.append((cid, False))
     for row in db.query("SELECT chat_id FROM sources WHERE enabled=1"):
         cid = row["chat_id"]
         if cid and cid != log_channel_id and cid not in seen:
             seen.add(cid)
-            out.append(cid)
+            out.append((cid, False))
     return out
+
+
+def collect_broadcast_recipients(db, log_channel_id: int,
+                                 users_only: bool = False) -> list:
+    """Chat ids a broadcast goes to (see collect_broadcast_targets)."""
+    return [cid for cid, _ in
+            collect_broadcast_targets(db, log_channel_id, users_only)]

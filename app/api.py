@@ -25,6 +25,7 @@ from .config import Config
 from .db import DB, RES_ORDER, _uj, fts_terms, search_rank_order
 from .owner import fsub_list
 from .parser import normalize_title
+from . import stats as stats_mod
 from .dbthread import run_db
 from .streamer import (MAX_STREAMS, ByteStreamer, StreamFileNotFound,
                        parse_range, sign_token, stream_secret, verify_token)
@@ -193,6 +194,13 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                       + list(rank_params) + [per, off]))
         except Exception:
             rows = []
+        # Count the search (page 1 only — pagination isn't a new search).
+        if page <= 1:
+            try:
+                await run_db(stats_mod.record_event, db, "search", 0, None,
+                             stats_mod.normalize_query(q))
+            except Exception as e:
+                log.warning("stats record failed: %r", e)
         return {"results": [_title_card(t) for t in rows], "page": page}
 
     @app.get("/api/recent")
@@ -361,6 +369,12 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                          (body.get("file_id"),))
         if not f:
             raise HTTPException(404, "not found")
+        # Play tapped: count it (recording never blocks the token).
+        try:
+            await run_db(stats_mod.record_event, db, "play",
+                         int(data["user_id"]), int(f["id"]))
+        except Exception as e:
+            log.warning("stats record failed: %r", e)
         return {"url": "/api/stream/" + sign_token(secret, int(f["id"])),
                 "name": f["file_name"]}
 
@@ -543,6 +557,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
     async def admin_overview(request: Request):
         _admin(request)
         return {"stats": await run_db(db.stats),
+                "activity": await run_db(stats_mod.overview, db),
                 "sources": [dict(s) for s in await run_db(db.list_sources)]}
 
     @app.get("/api/admin/unmatched")

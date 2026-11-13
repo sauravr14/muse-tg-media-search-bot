@@ -110,6 +110,47 @@ class ClassifyTest(unittest.TestCase):
         f = self.db.query_one("SELECT COUNT(*) c FROM files")
         self.assertEqual(f["c"], 2)
 
+    def test_same_name_different_year_splits(self):
+        """Regression: The Intern 2015 vs the 2026 Korean remake.
+        When only the 2015 title exists, a 2026 file must NOT attach to
+        it (the old single-row shortcut ignored the year) — it gets its
+        own 2026 title, and a second 2026 file joins that title."""
+        r15 = self.clf.ingest(parse_filename("The.Intern.2015.720p.mkv"),
+                              _file_meta(-1001, 10, "The.Intern.2015.720p.mkv"))
+        r26 = self.clf.ingest(parse_filename("The.Intern.2026.720p.WEB-DL.x264-Pahe.in.mkv"),
+                              _file_meta(-1001, 11, "The.Intern.2026.720p.WEB-DL.x264-Pahe.in.mkv"))
+        self.assertNotEqual(r26["title_id"], r15["title_id"])
+        row26 = self.db.query_one("SELECT year FROM titles WHERE id=?", (r26["title_id"],))
+        self.assertEqual(row26["year"], 2026)
+        row15 = self.db.query_one("SELECT year FROM titles WHERE id=?", (r15["title_id"],))
+        self.assertEqual(row15["year"], 2015)
+        # second 2026 file joins the 2026 title, not a third one
+        r26b = self.clf.ingest(parse_filename("The.Intern.2026.1080p.WEB-DL.x264-Pahe.in.mkv"),
+                               _file_meta(-1001, 12, "The.Intern.2026.1080p.WEB-DL.x264-Pahe.in.mkv"))
+        self.assertEqual(r26b["title_id"], r26["title_id"])
+        n = self.db.query_one("SELECT COUNT(*) c FROM titles WHERE norm_title='the intern'")
+        self.assertEqual(n["c"], 2)
+
+    def test_same_name_same_year_still_groups(self):
+        # the fix must not split the normal case: same name + same year
+        ids = set()
+        for i, name in enumerate(["The.Intern.2015.720p.mkv",
+                                  "The.Intern.2015.1080p.BluRay.mkv"]):
+            r = self.clf.ingest(parse_filename(name), _file_meta(-1001, 20 + i, name))
+            ids.add(r["title_id"])
+        self.assertEqual(len(ids), 1)
+
+    def test_yearless_title_still_matches_year_known_file(self):
+        """A title with no year has nothing to contradict, so it still
+        matches — same rule as the FTS fallback (year in (p.year, None))."""
+        r0 = self.clf.ingest(parse_filename("The.Intern.720p.mkv"),
+                             _file_meta(-1001, 30, "The.Intern.720p.mkv"))
+        row0 = self.db.query_one("SELECT year FROM titles WHERE id=?", (r0["title_id"],))
+        self.assertIsNone(row0["year"])
+        r26 = self.clf.ingest(parse_filename("The.Intern.2026.720p.mkv"),
+                              _file_meta(-1001, 31, "The.Intern.2026.720p.mkv"))
+        self.assertEqual(r26["title_id"], r0["title_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

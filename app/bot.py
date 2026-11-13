@@ -21,6 +21,7 @@ import aiohttp
 from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
                             InlineKeyboardMarkup, Message, WebAppInfo)
 
+from . import autobroadcast as autobc_mod
 from . import owner as owner_mod
 from . import requests as req_mod
 from .config import Config
@@ -217,6 +218,7 @@ class MediaBot:
                              workers=150)
         self.username = ""
         self.panel = None  # IndexPanel, attached in main.py once indexer exists
+        self.llm = None  # LLTitle, attached in main.py when a key is set
         self._spam: dict[int, float] = {}
         self._log_q = None
         self._log_ch = 0
@@ -932,6 +934,7 @@ class MediaBot:
                         await self._owner_callback(q, data)
                 elif data.startswith("settings:") or data.startswith("fsub:") \
                         or data.startswith("log:") \
+                        or data.startswith("autobc:") \
                         or data.startswith("bc:"):
                     if not self._is_owner(q.from_user.id):
                         await q.answer("Owner only.", show_alert=True)
@@ -1209,6 +1212,13 @@ class MediaBot:
             self._bc_draft[m.from_user.id] = {"text": text, "photo": None}
             await self._broadcast_preview(m.chat.id, m.from_user.id)
 
+        @c.on_message(filters.private & filters.command("autobroadcast") & self._owner_filter())
+        async def autobroadcast_cmd(_, m: Message):
+            st = await run_db(autobc_mod.get_settings, self.db)
+            await m.reply_text(await self._autobc_text(),
+                               parse_mode=ParseMode.HTML,
+                               reply_markup=self._autobc_kb(st))
+
         # ---- owner-only: sudo admin management ----
         @c.on_message(filters.private & filters.command("addsudo") & self._owner_filter())
         async def addsudo_cmd(_, m: Message):
@@ -1294,11 +1304,17 @@ class MediaBot:
         fsub = await run_db(owner_mod.fsub_list, self.db)
         log_ch = await run_db(owner_mod.resolve_log_channel, self.db,
                               self.cfg.log_channel_id)
+        autobc = await run_db(autobc_mod.get_settings, self.db)
+        autobc_line = (f"📣 Auto-broadcast: "
+                       f"{'ON ✅' if autobc['enabled'] else 'OFF ⏸'} · "
+                       f"every {autobc['interval_hours']}h · "
+                       f"{'everyone' if autobc['scope'] == 'all' else 'users only'}")
         return (
             "⚙️ <b>Settings</b> (owner only)\n\n"
             f"📸 Start photo: {'set ✅' if photo else 'not set'}\n"
             f"🔒 Force subscribe: {len(fsub)} channel(s)\n"
             f"📋 Live logs: {'<code>' + str(log_ch) + '</code>' if log_ch else 'off'}\n"
+            f"{autobc_line}\n"
             f"👥 Users recorded: <b>{await run_db(self.db.count_users)}</b>")
 
     def _settings_kb(self) -> InlineKeyboardMarkup:
@@ -1308,6 +1324,7 @@ class MediaBot:
             [InlineKeyboardButton("📋 Live Logs", callback_data="settings:logs")],
             [InlineKeyboardButton("👥 Users", callback_data="settings:users"),
              InlineKeyboardButton("📣 Broadcast", callback_data="settings:broadcast")],
+            [InlineKeyboardButton("📣 Auto-Broadcast", callback_data="settings:autobc")],
         ])
 
     async def _settings_send(self, chat_id: int) -> None:
@@ -1385,7 +1402,7 @@ class MediaBot:
                 chat_id, f"📣 <b>Broadcast preview</b>\n\n{preview}{note}",
                 parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    async def _run_broadcast(self, owner_chat: int, draft: dict, scope: str = "all") -> None:
+    async def _run_broadcast(self, owner_chat: int, draft: dict, scope: str = "all") -> dict:
         log_ch = await run_db(owner_mod.resolve_log_channel, self.db,
                               self.cfg.log_channel_id)
         targets = await run_db(owner_mod.collect_broadcast_targets,
@@ -1396,6 +1413,9 @@ class MediaBot:
         user_kb = InlineKeyboardMarkup([[self._app_button("🌐 Open Media Library")]])
         link_kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🌐 Open Media Library", url=self.cfg.mini_app_url)]])
+        # Auto-broadcast captions carry <b> HTML; manual drafts are plain
+        # text unless the draft says otherwise.
+        parse_mode = draft.get("parse_mode")
         delivered = failed = 0
         for i, (rid, is_user) in enumerate(targets):
             kb = user_kb if is_user else link_kb
@@ -1403,9 +1423,11 @@ class MediaBot:
                 if draft.get("photo"):
                     await self.client.send_photo(rid, draft["photo"],
                                                  caption=draft.get("caption") or "",
+                                                 parse_mode=parse_mode,
                                                  reply_markup=kb)
                 else:
                     await self.client.send_message(rid, draft.get("text") or "",
+                                                   parse_mode=parse_mode,
                                                    reply_markup=kb)
                 delivered += 1
             except Exception as e:
@@ -1416,9 +1438,11 @@ class MediaBot:
                         if draft.get("photo"):
                             await self.client.send_photo(rid, draft["photo"],
                                                          caption=draft.get("caption") or "",
+                                                         parse_mode=parse_mode,
                                                          reply_markup=kb)
                         else:
                             await self.client.send_message(rid, draft.get("text") or "",
+                                                           parse_mode=parse_mode,
                                                            reply_markup=kb)
                         delivered += 1
                         continue
@@ -1437,6 +1461,115 @@ class MediaBot:
                 parse_mode=ParseMode.HTML)
         except Exception as e:
             log.warning("broadcast report failed: %r", e)
+        return {"delivered": delivered, "failed": failed, "total": len(targets)}
+
+    # -- auto-broadcast (scheduled trending-title posts) --------------------
+    async def _autobc_text(self) -> str:
+        st = await run_db(autobc_mod.get_settings, self.db)
+        last = ""
+        if st["last_title_id"]:
+            row = await run_db(self.db.query_one,
+                               "SELECT title, year FROM titles WHERE id=?",
+                               (st["last_title_id"],))
+            if row:
+                when = time.strftime("%d %b %H:%M",
+                                     time.localtime(st["last_post_at"]))
+                last = f"\nLast post: <b>{html.escape(row['title'])}</b>" \
+                       f" ({row['year'] or '?'}) — {when}"
+        if st["enabled"]:
+            due_in = st["last_post_at"] + st["interval_hours"] * 3600 - time.time()
+            nxt = "due now" if due_in <= 0 else f"in ~{max(1, int(due_in // 3600))}h"
+        else:
+            nxt = "paused"
+        caps = "AI ✨ (OpenRouter)" if getattr(self, "llm", None) else "template"
+        return (
+            "📣 <b>Auto-broadcast</b>\n\n"
+            f"Status: <b>{'ON ✅' if st['enabled'] else 'OFF ⏸'}</b>\n"
+            f"Every: <b>{st['interval_hours']}h</b> "
+            f"(tap to cycle 6h → 12h → 24h)\n"
+            f"Scope: <b>{'everyone' if st['scope'] == 'all' else 'users only'}</b>\n"
+            f"Next post: <b>{nxt}</b>{last}\n"
+            f"Captions: {caps}\n\n"
+            "Picks the freshest trending title with a poster that was "
+            "never posted before — no repeats, ever.")
+
+    def _autobc_kb(self, st: dict) -> InlineKeyboardMarkup:
+        toggle = ("⏸ Turn OFF" if st["enabled"] else "▶️ Turn ON")
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle, callback_data="autobc:toggle")],
+            [InlineKeyboardButton(f"⏱ Every {st['interval_hours']}h",
+                                  callback_data="autobc:interval")],
+            [InlineKeyboardButton(
+                f"👥 Scope: {'Everyone' if st['scope'] == 'all' else 'Users only'}",
+                callback_data="autobc:scope")],
+            [InlineKeyboardButton("▶️ Post now", callback_data="autobc:postnow")],
+            [InlineKeyboardButton("⬅ Settings", callback_data="settings:main")],
+        ])
+
+    async def _autobc_caption(self, row: dict) -> str:
+        """AI caption when OpenRouter is available, template otherwise."""
+        llm = getattr(self, "llm", None)
+        if llm is not None:
+            try:
+                ai = await llm.caption(row["title"], row.get("year"),
+                                       row.get("kind", "movie"),
+                                       row.get("rating"))
+                if ai and "<b>" in ai:
+                    return ai
+            except Exception as e:
+                log.warning("auto-broadcast AI caption failed: %r", e)
+        return autobc_mod.build_caption(row)
+
+    async def _autobc_tick(self, force: bool = False) -> dict | None:
+        """One scheduler pass: post now if enabled and due (or forced).
+
+        Returns the _run_broadcast result on a post, else None. A cycle
+        with no fresh poster title is skipped silently — never a repeat.
+        """
+        st = await run_db(autobc_mod.get_settings, self.db)
+        if not st["enabled"] and not force:
+            return None
+        now = time.time()
+        if not force and now - st["last_post_at"] < st["interval_hours"] * 3600:
+            return None
+        row = await run_db(autobc_mod.pick_title, self.db, now)
+        if not row:
+            log.info("auto-broadcast: no fresh poster title, skipping cycle")
+            return None
+        caption = await self._autobc_caption(row)
+        draft = {"photo": row["poster"], "caption": caption,
+                 "parse_mode": ParseMode.HTML}
+        owner_chat = self.cfg.admin_ids[0] if self.cfg.admin_ids else 0
+        res = await self._run_broadcast(owner_chat, draft, st["scope"])
+        if res["delivered"] > 0:
+            await run_db(autobc_mod.record_post, self.db, row["id"], now,
+                         st["scope"])
+            await run_db(autobc_mod.set_settings, self.db,
+                         {"last_post_at": now, "last_title_id": row["id"]})
+            log.info("auto-broadcast: posted %s (%s) to %d/%d",
+                     row["title"], row["year"], res["delivered"], res["total"])
+        else:
+            log.warning("auto-broadcast: %s (%s) reached nobody, not recorded",
+                        row["title"], row["year"])
+        return res
+
+    async def auto_broadcast_loop(self) -> None:
+        """Background loop: first tick immediately (posts right after a
+        deploy when due — the schedule starts ON), then every 5 minutes."""
+        try:
+            await self._autobc_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("auto-broadcast tick failed: %r", e)
+        while True:
+            await asyncio.sleep(300)
+            try:
+                await self._autobc_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("auto-broadcast tick failed: %r", e)
 
     async def _owner_callback(self, q: CallbackQuery, data: str) -> None:
         uid, cid = q.from_user.id, q.message.chat.id
@@ -1556,6 +1689,37 @@ class MediaBot:
                 cid, "📣 Send the broadcast message now (text, or a photo with "
                      "a caption). I'll show a preview with Send / Cancel "
                      "before anything goes out. /cancel to abort.")
+        elif data == "settings:autobc":
+            st = await run_db(autobc_mod.get_settings, self.db)
+            await self._edit_or_send(q, await self._autobc_text(),
+                                     self._autobc_kb(st))
+        elif data == "autobc:toggle":
+            st = await run_db(autobc_mod.get_settings, self.db)
+            st = await run_db(autobc_mod.set_settings, self.db,
+                              {"enabled": not st["enabled"]})
+            await q.answer("Auto-broadcast ON ✅" if st["enabled"]
+                           else "Auto-broadcast OFF ⏸")
+            await self._edit_or_send(q, await self._autobc_text(),
+                                     self._autobc_kb(st))
+        elif data == "autobc:interval":
+            st = await run_db(autobc_mod.get_settings, self.db)
+            st = await run_db(autobc_mod.set_settings, self.db,
+                              {"interval_hours":
+                               autobc_mod.next_interval(st["interval_hours"])})
+            await q.answer(f"Auto-broadcast every {st['interval_hours']}h")
+            await self._edit_or_send(q, await self._autobc_text(),
+                                     self._autobc_kb(st))
+        elif data == "autobc:scope":
+            st = await run_db(autobc_mod.get_settings, self.db)
+            st = await run_db(autobc_mod.set_settings, self.db,
+                              {"scope": "users" if st["scope"] == "all" else "all"})
+            await q.answer("Scope: " + ("users only" if st["scope"] == "users"
+                                        else "everyone"))
+            await self._edit_or_send(q, await self._autobc_text(),
+                                     self._autobc_kb(st))
+        elif data == "autobc:postnow":
+            await q.answer("Posting now…")
+            asyncio.create_task(self._autobc_tick(force=True))
         elif data in ("bc:send", "bc:send:users", "bc:send:all"):
             draft = self._bc_draft.pop(uid, None)
             if not draft:

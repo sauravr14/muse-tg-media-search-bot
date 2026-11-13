@@ -50,6 +50,7 @@ async def amain() -> None:
     indexer = Indexer(bot.client, db, tmdb, llm=llm, mnimdb=mnimdb,
                       guard=LoopGuard())
     bot.indexer = indexer
+    bot.llm = llm  # auto-broadcast captions use it when a key is set
     from .panel import IndexPanel
     bot.panel = IndexPanel(bot.client, db, indexer)
 
@@ -65,6 +66,9 @@ async def amain() -> None:
     # keep retrying scans that die or stall (flaky network), forever
     supervisor_task = asyncio.create_task(indexer.scan_supervisor(),
                                           name="scan-supervisor")
+    # scheduled auto-broadcast: first tick posts immediately when due
+    autobc_task = asyncio.create_task(bot.auto_broadcast_loop(),
+                                      name="auto-broadcast")
     try:
         await server.serve()
     finally:
@@ -73,6 +77,7 @@ async def amain() -> None:
         enrich_task.cancel()
         scan_task.cancel()
         supervisor_task.cancel()
+        autobc_task.cancel()
         await bot.stop()
         await tmdb.close()
         if llm:

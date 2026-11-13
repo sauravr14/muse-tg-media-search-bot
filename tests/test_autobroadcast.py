@@ -36,11 +36,11 @@ class SettingsTest(unittest.TestCase):
     def setUp(self):
         self.db = _db()
 
-    def test_defaults_are_on_12h_everyone(self):
+    def test_defaults_are_on_12h_users_only(self):
         st = autobc_mod.get_settings(self.db)
         self.assertTrue(st["enabled"])
         self.assertEqual(st["interval_hours"], 12)
-        self.assertEqual(st["scope"], "all")
+        self.assertEqual(st["scope"], "users")
         self.assertEqual(st["last_post_at"], 0.0)
         self.assertIsNone(st["last_title_id"])
 
@@ -183,24 +183,25 @@ class TickTest(unittest.TestCase):
         self.db.upsert_source(-400, "Src", "")
 
     def test_tick_posts_once_then_not_due(self):
+        # default scope is users-only: the user gets the photo, the
+        # source channel gets nothing
         res = asyncio.run(self.bot._autobc_tick())
         self.assertIsNotNone(res)
-        self.assertEqual(res["delivered"], 2)
+        self.assertEqual(res["delivered"], 1)
         photos = [s for s in self.fake.sent if "photo" in s]
-        self.assertEqual(len(photos), 2)
+        self.assertEqual(len(photos), 1)
+        self.assertEqual(photos[0]["chat_id"], 10)
         self.assertEqual(photos[0]["photo"], "https://img/spidey.jpg")
         self.assertEqual(photos[0]["parse_mode"], ParseMode.HTML)
         self.assertIn("<b>Spider-Man: Brand New Day</b>", photos[0]["caption"])
-        # Mini App button on every post (web_app for the user, link for chat)
+        # Mini App button on the post (real web_app button for the user)
         btn = photos[0]["reply_markup"].inline_keyboard[0][0]
         self.assertEqual(btn.text, "🌐 Open Media Library")
         self.assertIsNotNone(btn.web_app)
-        btn2 = photos[1]["reply_markup"].inline_keyboard[0][0]
-        self.assertIsNone(btn2.web_app)
         # recorded + timer set, so the next tick is not due
         self.assertTrue(autobc_mod.was_posted(self.db, 1))
         self.assertIsNone(asyncio.run(self.bot._autobc_tick()))
-        self.assertEqual(len(self.fake.sent), 3)  # 2 photos + owner report
+        self.assertEqual(len(self.fake.sent), 2)  # 1 photo + owner report
 
     def test_tick_skips_when_disabled(self):
         autobc_mod.set_settings(self.db, {"enabled": False})
@@ -208,7 +209,7 @@ class TickTest(unittest.TestCase):
         self.assertEqual(self.fake.sent, [])
 
     def test_force_posts_when_disabled(self):
-        autobc_mod.set_settings(self.db, {"enabled": False})
+        autobc_mod.set_settings(self.db, {"enabled": False, "scope": "all"})
         res = asyncio.run(self.bot._autobc_tick(force=True))
         self.assertIsNotNone(res)
         self.assertEqual(res["delivered"], 2)

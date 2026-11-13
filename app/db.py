@@ -264,6 +264,17 @@ CREATE TABLE IF NOT EXISTS pending_joins (
     requested_at REAL NOT NULL,
     PRIMARY KEY(chat_id, user_id)
 );
+
+-- Auto-broadcast dedupe (2026-11-13): one row per title the auto-broadcast
+-- ever posted, so a title is never posted twice. source='manual' marks
+-- titles already broadcast by hand (e.g. VisionQuest, 2026-11-12) so the
+-- picker skips them too.
+CREATE TABLE IF NOT EXISTS auto_broadcast_posts (
+    title_id  INTEGER PRIMARY KEY,
+    posted_at REAL NOT NULL,
+    scope     TEXT NOT NULL DEFAULT 'all',
+    source    TEXT NOT NULL DEFAULT 'auto'
+);
 """
 
 

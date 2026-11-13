@@ -11,7 +11,8 @@ title is skipped silently instead of repeating.
 Settings live in kv `settings:auto_broadcast` as JSON:
 {"enabled": true, "interval_hours": 12, "scope": "all",
  "last_post_at": 0.0, "last_title_id": null}
-Defaults are ON / 12h / everyone, per Saurav's "on by default" call.
+Defaults are ON / 12h / users-only, per Saurav's 2026-11-13 call
+(auto-broadcast goes to users, never channels/groups).
 """
 from __future__ import annotations
 
@@ -27,8 +28,10 @@ RECENT_YEAR = 2024
 
 
 def defaults() -> dict:
+    # Scope is users-only by default (2026-11-13, Saurav: auto-broadcast
+    # goes to users, never channels/groups). The panel can still flip it.
     return {"enabled": True, "interval_hours": DEFAULT_INTERVAL_HOURS,
-            "scope": "all", "last_post_at": 0.0, "last_title_id": None}
+            "scope": "users", "last_post_at": 0.0, "last_title_id": None}
 
 
 def get_settings(db) -> dict:

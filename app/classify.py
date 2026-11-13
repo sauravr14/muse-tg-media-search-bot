@@ -83,8 +83,22 @@ class Classifier:
             "SELECT * FROM titles WHERE norm_title=? AND kind=?", (p.norm_title, p.kind)
         )
         if len(rows) == 1:
-            self._cache_title(p.norm_title, p.year, p.kind, rows[0]["id"])
-            return dict(rows[0])
+            row = rows[0]
+            # Same name, different year is a different film — a remake or
+            # reboot (The Intern 2015 vs the 2026 Korean remake): never
+            # attach a year-known file to a title whose year contradicts
+            # it. A yearless title (year IS NULL) has no year to
+            # contradict, so it still matches. Refusing here falls through
+            # to the None miss below and the caller creates a fresh
+            # year-correct title.
+            year_clash = (
+                p.year is not None
+                and row["year"] is not None
+                and row["year"] != p.year
+            )
+            if not year_clash:
+                self._cache_title(p.norm_title, p.year, p.kind, row["id"])
+                return dict(row)
         if len(rows) > 1 and p.year:
             for r in rows:
                 if r["year"] == p.year:

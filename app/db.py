@@ -275,6 +275,23 @@ CREATE TABLE IF NOT EXISTS auto_broadcast_posts (
     scope     TEXT NOT NULL DEFAULT 'all',
     source    TEXT NOT NULL DEFAULT 'auto'
 );
+
+-- Usage stats (2026-11-13): one row per user action the admin stats panel
+-- counts — download (Get File delivered), play (Play tapped, stream token
+-- minted), search (query run), fsub_block (tap blocked by force-subscribe),
+-- delivery_fail (delivery attempted and failed). file_id joins files ->
+-- titles for top-title and quality breakdowns; detail holds the search
+-- query. Counters start at this deploy — nothing was logged before.
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL,
+    user_id    INTEGER NOT NULL DEFAULT 0,
+    file_id    INTEGER,
+    detail     TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_kind_time ON events(kind, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_file ON events(file_id);
 """
 
 

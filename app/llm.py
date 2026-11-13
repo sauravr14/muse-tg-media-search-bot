@@ -39,6 +39,18 @@ Rules:
 - If you cannot identify it, reply {{"title": null}}."""
 
 
+CAPTION_SYSTEM = (
+    "You write one catchy Telegram caption line for a movie/TV bot. "
+    "Reply with ONLY the caption, no quotes, no explanation."
+)
+CAPTION_USER_TMPL = (
+    "Write one catchy caption line (max 25 words) announcing this trending "
+    "title is now available on the bot: {kind} \"{title}\" ({year}), "
+    "rated {rating}/10. Put the title in <b>...</b> HTML bold tags. "
+    "No hashtags. One line only."
+)
+
+
 class LLTitle:
     def __init__(self, api_key: str, model: str = FREE_MODEL,
                  session: aiohttp.ClientSession | None = None):
@@ -130,3 +142,44 @@ class LLTitle:
             year = None
         kind = obj.get("kind") if obj.get("kind") in ("movie", "series") else "movie"
         return {"title": title, "year": year, "kind": kind}
+
+    async def caption(self, title: str, year, kind: str,
+                      rating) -> str | None:
+        """One catchy caption line for an auto-broadcast post, or None.
+
+        Single attempt, fail-fast: any error/rate-limit/bad reply returns
+        None and the caller falls back to the template caption — a caption
+        must never block the post.
+        """
+        if not self.available or not title:
+            return None
+        if time.time() < self.rate_limited_until:
+            return None
+        kind_label = "TV show" if kind == "series" else "Movie"
+        rating_txt = f"{float(rating):.1f}" if rating else "unrated"
+        try:
+            s = await self._sess()
+            async with s.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}",
+                         "Content-Type": "application/json"},
+                json={"model": self.model,
+                      "messages": [{"role": "system", "content": CAPTION_SYSTEM},
+                                   {"role": "user", "content": CAPTION_USER_TMPL.format(
+                                       kind=kind_label, title=title[:120],
+                                       year=year or "?", rating=rating_txt)}],
+                      "temperature": 0.7,
+                      "max_tokens": 200},
+                timeout=aiohttp.ClientTimeout(total=25),
+            ) as r:
+                if r.status != 200:
+                    log.warning("openrouter caption %s", r.status)
+                    return None
+                data = await r.json()
+            text = (data["choices"][0]["message"].get("content") or "").strip()
+        except Exception as e:
+            log.warning("openrouter caption failed: %r", e)
+            return None
+        if not text or len(text) > 400:
+            return None
+        return text

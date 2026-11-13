@@ -24,6 +24,7 @@ from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
 from . import autobroadcast as autobc_mod
 from . import owner as owner_mod
 from . import requests as req_mod
+from . import stats as stats_mod
 from .config import Config
 from .db import DB, RES_ORDER, fts_terms, search_rank_order
 from .dbthread import run_db, run_db_fast
@@ -1219,6 +1220,12 @@ class MediaBot:
                                parse_mode=ParseMode.HTML,
                                reply_markup=self._autobc_kb(st))
 
+        @c.on_message(filters.private & filters.command("stats") & self._owner_filter())
+        async def stats_cmd(_, m: Message):
+            await m.reply_text(await self._stats_text(),
+                               parse_mode=ParseMode.HTML,
+                               reply_markup=self._stats_kb())
+
         # ---- owner-only: sudo admin management ----
         @c.on_message(filters.private & filters.command("addsudo") & self._owner_filter())
         async def addsudo_cmd(_, m: Message):
@@ -1309,12 +1316,15 @@ class MediaBot:
                        f"{'ON ✅' if autobc['enabled'] else 'OFF ⏸'} · "
                        f"every {autobc['interval_hours']}h · "
                        f"{'everyone' if autobc['scope'] == 'all' else 'users only'}")
+        dl_total, pl_total = await run_db(stats_mod.totals, self.db)
         return (
             "⚙️ <b>Settings</b> (owner only)\n\n"
             f"📸 Start photo: {'set ✅' if photo else 'not set'}\n"
             f"🔒 Force subscribe: {len(fsub)} channel(s)\n"
             f"📋 Live logs: {'<code>' + str(log_ch) + '</code>' if log_ch else 'off'}\n"
             f"{autobc_line}\n"
+            f"📊 Statistics: <b>{dl_total:,}</b> downloads · "
+            f"<b>{pl_total:,}</b> plays\n"
             f"👥 Users recorded: <b>{await run_db(self.db.count_users)}</b>")
 
     def _settings_kb(self) -> InlineKeyboardMarkup:
@@ -1325,6 +1335,7 @@ class MediaBot:
             [InlineKeyboardButton("👥 Users", callback_data="settings:users"),
              InlineKeyboardButton("📣 Broadcast", callback_data="settings:broadcast")],
             [InlineKeyboardButton("📣 Auto-Broadcast", callback_data="settings:autobc")],
+            [InlineKeyboardButton("📊 Statistics", callback_data="settings:stats")],
         ])
 
     async def _settings_send(self, chat_id: int) -> None:
@@ -1464,6 +1475,79 @@ class MediaBot:
         return {"delivered": delivered, "failed": failed, "total": len(targets)}
 
     # -- auto-broadcast (scheduled trending-title posts) --------------------
+    # -- admin usage stats --------------------------------------------------
+    async def _stats_text(self) -> str:
+        o = await run_db(stats_mod.overview, self.db)
+        lines = [
+            "📊 <b>Statistics</b> — counts start 13 Nov 2026",
+            "",
+            f"⬇️ Downloads: <b>{o['downloads_total']:,}</b> "
+            f"(today {o['downloads_today']:,} · "
+            f"7d {o['downloads_7d']:,} · 30d {o['downloads_30d']:,})",
+            f"▶️ Plays: <b>{o['plays_total']:,}</b> "
+            f"(today {o['plays_today']:,} · "
+            f"7d {o['plays_7d']:,} · 30d {o['plays_30d']:,})",
+            f"🔒 Blocked by force-sub: <b>{o['fsub_blocks_total']:,}</b> · "
+            f"❌ Failed deliveries: <b>{o['delivery_fails_total']:,}</b>",
+            "",
+            "📈 <b>Last 7 days</b> (downloads / plays):",
+        ]
+        for d in o["daily"]:
+            lines.append(f"  {d['day']}: {d['downloads']:,} / {d['plays']:,}")
+        lines.append("")
+        lines.append("🔥 <b>Top downloaded</b>:")
+        if o["top_downloads"]:
+            for i, t in enumerate(o["top_downloads"], 1):
+                yr = f" ({t['year']})" if t.get("year") else ""
+                lines.append(f"  {i}. {html.escape(t['title'])}{yr} — {t['c']:,}")
+        else:
+            lines.append("  — none yet")
+        lines.append("")
+        lines.append("🎬 <b>Top played</b>:")
+        if o["top_plays"]:
+            for i, t in enumerate(o["top_plays"], 1):
+                yr = f" ({t['year']})" if t.get("year") else ""
+                lines.append(f"  {i}. {html.escape(t['title'])}{yr} — {t['c']:,}")
+        else:
+            lines.append("  — none yet")
+        lines.append("")
+        lines.append("👥 <b>Top users</b>:")
+        if o["top_users"]:
+            for i, u in enumerate(o["top_users"], 1):
+                who = f"@{u['username']}" if u.get("username") else (
+                    html.escape(u["first_name"] or "") or
+                    f"<code>{u['user_id']}</code>")
+                lines.append(f"  {i}. {who} — {u['c']:,}")
+        else:
+            lines.append("  — none yet")
+        lines.append("")
+        lines.append("🔍 <b>Top searches</b>:")
+        if o["top_searches"]:
+            for i, s in enumerate(o["top_searches"], 1):
+                lines.append(f"  {i}. “{html.escape(s['query'])}” — {s['c']:,}")
+        else:
+            lines.append("  — none yet")
+        lines.append("")
+        if o["quality"]:
+            q = " · ".join(f"{r['resolution']} {r['c']:,}"
+                           for r in o["quality"])
+            lines.append(f"📦 Quality (downloads): {q}")
+        lines.append(f"🎬 Requests: <b>{o['requests_pending']:,}</b> pending · "
+                     f"<b>{o['requests_done']:,}</b> done")
+        lines.append(f"👥 Users: <b>{o['users_total']:,}</b> total · "
+                     f"<b>{o['users_new_today']:,}</b> new today · "
+                     f"<b>{o['users_active_today']:,}</b> active today")
+        cat = o["catalog"]
+        lines.append(f"📚 Catalog: <b>{cat.get('files', 0):,}</b> files · "
+                     f"<b>{cat.get('movies', 0) + cat.get('series', 0):,}</b> titles")
+        return "\n".join(lines)
+
+    def _stats_kb(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data="settings:stats")],
+            [InlineKeyboardButton("⬅ Settings", callback_data="settings:main")],
+        ])
+
     async def _autobc_text(self) -> str:
         st = await run_db(autobc_mod.get_settings, self.db)
         last = ""
@@ -1693,6 +1777,9 @@ class MediaBot:
             st = await run_db(autobc_mod.get_settings, self.db)
             await self._edit_or_send(q, await self._autobc_text(),
                                      self._autobc_kb(st))
+        elif data == "settings:stats":
+            await self._edit_or_send(q, await self._stats_text(),
+                                     self._stats_kb())
         elif data == "autobc:toggle":
             st = await run_db(autobc_mod.get_settings, self.db)
             st = await run_db(autobc_mod.set_settings, self.db,
@@ -1848,6 +1935,8 @@ class MediaBot:
         if unjoined:
             await self._send_fsub_prompt(chat_id, unjoined)
             return
+        await self._record("search", user_id,
+                           detail=stats_mod.normalize_query(q))
         # instant acknowledgement: native typing now, loading sticker if the
         # search drags past LOADING_STICKER_DELAY_S (deleted on arrival).
         try:
@@ -1964,6 +2053,16 @@ class MediaBot:
             pass
         await q.answer()
 
+    async def _record(self, kind: str, user_id: int = 0,
+                      file_id: int | None = None, detail: str = "") -> None:
+        """One stats event. Never raises — a counter must never break the
+        action it counts."""
+        try:
+            await run_db(stats_mod.record_event, self.db, kind, user_id,
+                         file_id, detail)
+        except Exception as e:
+            log.warning("stats record failed: %r", e)
+
     async def deliver_to_user(self, user_id: int, file_id) -> tuple[bool, str]:
         """Copy a catalog file straight into a user's DM.
 
@@ -1973,6 +2072,7 @@ class MediaBot:
         the bot-path net for deep links and callbacks).
         """
         if await self._unjoined(user_id):
+            await self._record("fsub_block", user_id)
             return False, "fsub_required"
         try:
             fid = int(file_id)
@@ -1995,10 +2095,12 @@ class MediaBot:
                 "⏳ The file will be deleted in 10 minutes. "
                 "Forward the files to your saved messages.")
             await self._schedule_delete(user_id, [sent.id, warn.id], delay=600)
+            await self._record("download", user_id, fid)
             return True, "sent"
         except Exception as e:
             log.warning("deliver_to_user failed: %r", e)
             name = type(e).__name__
+            await self._record("delivery_fail", user_id, fid, name)
             if name in ("PeerIdInvalid", "UserIsBlocked", "InputUserDeactivated"):
                 return False, "not_started"
             return False, f"{name}: {e}"[:200]

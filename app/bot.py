@@ -1479,7 +1479,8 @@ class MediaBot:
     async def _stats_text(self) -> str:
         o = await run_db(stats_mod.overview, self.db)
         lines = [
-            "📊 <b>Statistics</b> — counts start 13 Nov 2026",
+            "📊 <b>Statistics</b> — counts start "
+            f"{o.get('since_label', '13 Nov 2026')}",
             "",
             f"⬇️ Downloads: <b>{o['downloads_total']:,}</b> "
             f"(today {o['downloads_today']:,} · "
@@ -1545,7 +1546,16 @@ class MediaBot:
     def _stats_kb(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Refresh", callback_data="settings:stats")],
+            [InlineKeyboardButton("🗑 Reset stats",
+                                  callback_data="settings:stats_reset")],
             [InlineKeyboardButton("⬅ Settings", callback_data="settings:main")],
+        ])
+
+    def _stats_reset_kb(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, reset all stats",
+                                  callback_data="settings:stats_reset_yes")],
+            [InlineKeyboardButton("⬅ Cancel", callback_data="settings:stats")],
         ])
 
     async def _autobc_text(self) -> str:
@@ -1778,6 +1788,22 @@ class MediaBot:
             await self._edit_or_send(q, await self._autobc_text(),
                                      self._autobc_kb(st))
         elif data == "settings:stats":
+            await self._edit_or_send(q, await self._stats_text(),
+                                     self._stats_kb())
+        elif data == "settings:stats_reset":
+            await self._edit_or_send(
+                q,
+                "🗑 <b>Reset statistics?</b>\n\n"
+                "This clears <b>all</b> counted stats — downloads, plays, "
+                "searches, force-sub blocks, failed deliveries, the "
+                "last-7-days series, top titles / users / searches and the "
+                "quality split. Counting restarts from zero.\n\n"
+                "It does <b>not</b> touch requests, users or the catalog.\n\n"
+                "This can't be undone — are you sure?",
+                self._stats_reset_kb())
+        elif data == "settings:stats_reset_yes":
+            n = await run_db(stats_mod.reset_stats, self.db)
+            await q.answer(f"Stats reset — {n:,} events cleared.")
             await self._edit_or_send(q, await self._stats_text(),
                                      self._stats_kb())
         elif data == "autobc:toggle":

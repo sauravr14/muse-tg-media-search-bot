@@ -143,21 +143,96 @@ class OverviewTest(unittest.TestCase):
         stats_mod.record_event(self.db, "download", 10, 11, now=self.now)
         self.assertEqual(stats_mod.totals(self.db), (1, 0))
 
+    def test_reset_clears_events_only(self):
+        self._seed_events()
+        before = stats_mod.overview(self.db, self.now)
+        self.assertEqual(before["downloads_total"], 5)
+        self.assertEqual(before["since_label"], "13 Nov 2026")
+        n = stats_mod.reset_stats(self.db, now=self.now)
+        # 5 downloads + 2 plays + 4 searches + 1 block + 1 fail = 13
+        self.assertEqual(n, 13)
+        o = stats_mod.overview(self.db, self.now)
+        self.assertEqual(o["downloads_total"], 0)
+        self.assertEqual(o["plays_total"], 0)
+        self.assertEqual(o["downloads_today"], 0)
+        self.assertEqual(o["plays_today"], 0)
+        self.assertEqual(o["downloads_7d"], 0)
+        self.assertEqual(o["fsub_blocks_total"], 0)
+        self.assertEqual(o["delivery_fails_total"], 0)
+        self.assertEqual(o["top_downloads"], [])
+        self.assertEqual(o["top_plays"], [])
+        self.assertEqual(o["top_users"], [])
+        self.assertEqual(o["top_searches"], [])
+        self.assertEqual(o["quality"], [])
+        self.assertEqual([d["downloads"] for d in o["daily"]], [0] * 7)
+        self.assertEqual(o["since_label"], "13 Nov 2026")  # reset day
+        self.assertEqual(o["reset_at"], self.now)
+        # requests, users and catalog are NOT stats — untouched.
+        self.assertEqual(o["requests_done"], 1)
+        self.assertEqual(o["requests_pending"], 2)
+        self.assertEqual(o["users_total"], 3)
+        self.assertEqual(o["catalog"]["files"], 3)
+
+    def test_reset_empty_db(self):
+        db = _db()
+        self.assertEqual(stats_mod.reset_stats(db, now=self.now), 0)
+        o = stats_mod.overview(db, self.now)
+        self.assertEqual(o["downloads_total"], 0)
+        self.assertEqual(o["since_label"], "13 Nov 2026")
+
+    def test_since_label_after_reset_on_later_day(self):
+        self._seed_events()
+        later = _epoch_ist(2026, 11, 20, 9, 0)
+        stats_mod.reset_stats(self.db, now=later)
+        o = stats_mod.overview(self.db, later)
+        self.assertEqual(o["since_label"], "20 Nov 2026")
+        # counting restarts: a fresh event after the reset counts again.
+        stats_mod.record_event(self.db, "download", 10, 11, now=later)
+        o = stats_mod.overview(self.db, later)
+        self.assertEqual(o["downloads_total"], 1)
+
 
 class PanelTest(unittest.TestCase):
-    def test_stats_text_renders(self):
-        db = _db()
-        stats_mod.record_event(db, "download", 10, None, now=time.time())
+    def _bot(self, db):
         cfg = Config()
         cfg.admin_ids = (99,)
         bot = object.__new__(MediaBot)
         bot.cfg = cfg
         bot.db = db
+        return bot
+
+    def test_stats_text_renders(self):
+        db = _db()
+        stats_mod.record_event(db, "download", 10, None, now=time.time())
+        bot = self._bot(db)
         text = asyncio.run(bot._stats_text())
         self.assertIn("Statistics", text)
         self.assertIn("Downloads: <b>1</b>", text)
         self.assertIn("Plays: <b>0</b>", text)
         self.assertIn("Top downloaded", text)
+
+    def test_stats_kb_has_reset_button(self):
+        bot = self._bot(_db())
+        kb = bot._stats_kb()
+        datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+        self.assertIn("settings:stats_reset", datas)
+        self.assertIn("settings:stats", datas)  # Refresh
+        self.assertIn("settings:main", datas)  # Back to Settings
+
+    def test_stats_reset_kb_confirms_then_cancels(self):
+        bot = self._bot(_db())
+        kb = bot._stats_reset_kb()
+        datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+        self.assertIn("settings:stats_reset_yes", datas)
+        self.assertIn("settings:stats", datas)  # Cancel goes back to panel
+
+    def test_stats_text_shows_reset_date(self):
+        db = _db()
+        bot = self._bot(db)
+        stats_mod.reset_stats(db, now=_epoch_ist(2026, 11, 20, 9, 0))
+        text = asyncio.run(bot._stats_text())
+        self.assertIn("counts start 20 Nov 2026", text)
+        self.assertIn("Downloads: <b>0</b>", text)
 
 
 if __name__ == "__main__":

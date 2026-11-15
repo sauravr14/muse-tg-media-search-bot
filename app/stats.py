@@ -5,6 +5,9 @@ INSERT at the choke point of each action, so it can never double-count:
 deliver_to_user (Get File, both Mini App and bot DM), stream_token (Play),
 _do_search + /api/search (searches). All aggregates are plain SQL over
 that table; counters start at the deploy that introduced them.
+Reset (owner-only, two taps) deletes every row in `events` and stamps
+the reset time in kv, so the panel header shows the new start date.
+Requests, users and the catalog are NOT stats — reset never touches them.
 """
 from __future__ import annotations
 
@@ -16,6 +19,8 @@ TOP_TITLES = 10
 TOP_USERS = 5
 TOP_SEARCHES = 5
 DAYS_SERIES = 7
+RESET_KV_KEY = "settings:stats_reset_at"
+STATS_START_LABEL = "13 Nov 2026"
 
 
 def day_start(now: float) -> float:
@@ -34,6 +39,38 @@ def record_event(db, kind: str, user_id: int = 0, file_id: int | None = None,
         " VALUES (?, ?, ?, ?, ?)",
         (kind, int(user_id or 0), file_id, detail or "",
          time.time() if now is None else now))
+
+
+def reset_at(db) -> float | None:
+    """Epoch of the last stats reset, or None if never reset."""
+    raw = db.get_kv(RESET_KV_KEY, "")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def since_label(db) -> str:
+    """Header label: reset date if reset, else the original start date."""
+    ra = reset_at(db)
+    if ra is None:
+        return STATS_START_LABEL
+    return time.strftime("%d %b %Y", time.gmtime(ra + IST_OFFSET))
+
+
+def reset_stats(db, now: float | None = None) -> int:
+    """Delete every stats event and stamp the reset time.
+
+    Returns the number of events cleared. Requests, users and the
+    catalog live in other tables and are untouched.
+    """
+    now = time.time() if now is None else now
+    cur = db.execute("DELETE FROM events")
+    n = cur.rowcount if cur is not None else 0
+    db.set_kv(RESET_KV_KEY, str(now))
+    return int(n)
 
 
 def _count(db, kind: str, since: float | None = None,
@@ -65,6 +102,8 @@ def overview(db, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     today = day_start(now)
     out: dict = {
+        "since_label": since_label(db),
+        "reset_at": reset_at(db),
         "downloads_total": _count(db, "download"),
         "plays_total": _count(db, "play"),
         "downloads_today": _count(db, "download", today, today + 86400),

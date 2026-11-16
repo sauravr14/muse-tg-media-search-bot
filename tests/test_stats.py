@@ -234,6 +234,49 @@ class PanelTest(unittest.TestCase):
         self.assertIn("counts start 20 Nov 2026", text)
         self.assertIn("Downloads: <b>0</b>", text)
 
+    def test_enricher_text_renders_night_only_by_default(self):
+        db = _db()
+        bot = self._bot(db)
+        text = asyncio.run(bot._enricher_text())
+        self.assertIn("Enricher", text)
+        self.assertIn("Night-only", text)
+        self.assertIn("Posters so far", text)
+
+    def test_enricher_text_shows_running_when_flag_set(self):
+        db = _db()
+        db.set_kv("settings:enricher_manual", "1")
+        bot = self._bot(db)
+        text = asyncio.run(bot._enricher_text())
+        self.assertIn("Running now", text)
+
+    def test_enricher_kb_toggles(self):
+        bot = self._bot(_db())
+        off_datas = [b.callback_data for row in bot._enricher_kb(False).inline_keyboard
+                     for b in row]
+        self.assertIn("enricher:toggle", off_datas)
+        self.assertIn("settings:main", off_datas)
+        off_labels = [b.text for row in bot._enricher_kb(False).inline_keyboard
+                      for b in row]
+        self.assertIn("▶️ Start enricher", off_labels)
+        on_labels = [b.text for row in bot._enricher_kb(True).inline_keyboard
+                     for b in row]
+        self.assertIn("⏸ Stop enricher", on_labels)
+
+    def test_settings_kb_has_enricher_button(self):
+        bot = self._bot(_db())
+        datas = [b.callback_data for row in bot._settings_kb().inline_keyboard
+                 for b in row]
+        self.assertIn("settings:enricher", datas)
+
+    def test_settings_text_shows_enricher_line(self):
+        db = _db()
+        bot = self._bot(db)
+        text = asyncio.run(bot._settings_text())
+        self.assertIn("Enricher: night-only", text)
+        db.set_kv("settings:enricher_manual", "1")
+        text = asyncio.run(bot._settings_text())
+        self.assertIn("Enricher: <b>running now", text)
+
 
 if __name__ == "__main__":
     unittest.main()

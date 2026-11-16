@@ -28,7 +28,7 @@ from . import stats as stats_mod
 from .config import Config
 from .db import DB, RES_ORDER, fts_terms, search_rank_order
 from .dbthread import run_db, run_db_fast
-from .indexer import Indexer
+from .indexer import ENRICH_MANUAL_KV_KEY, Indexer
 from .parser import normalize_title
 
 log = logging.getLogger("mediabot.bot")
@@ -936,6 +936,7 @@ class MediaBot:
                 elif data.startswith("settings:") or data.startswith("fsub:") \
                         or data.startswith("log:") \
                         or data.startswith("autobc:") \
+                        or data.startswith("enricher:") \
                         or data.startswith("bc:"):
                     if not self._is_owner(q.from_user.id):
                         await q.answer("Owner only.", show_alert=True)
@@ -1316,6 +1317,10 @@ class MediaBot:
                        f"{'ON ✅' if autobc['enabled'] else 'OFF ⏸'} · "
                        f"every {autobc['interval_hours']}h · "
                        f"{'everyone' if autobc['scope'] == 'all' else 'users only'}")
+        enrich_manual = await run_db(self.db.get_kv, ENRICH_MANUAL_KV_KEY, "")
+        enrich_line = ("🔄 Enricher: <b>running now ✅</b> (manual start)"
+                       if enrich_manual == "1"
+                       else "🔄 Enricher: night-only (01:00–06:00 IST)")
         dl_total, pl_total = await run_db(stats_mod.totals, self.db)
         return (
             "⚙️ <b>Settings</b> (owner only)\n\n"
@@ -1323,6 +1328,7 @@ class MediaBot:
             f"🔒 Force subscribe: {len(fsub)} channel(s)\n"
             f"📋 Live logs: {'<code>' + str(log_ch) + '</code>' if log_ch else 'off'}\n"
             f"{autobc_line}\n"
+            f"{enrich_line}\n"
             f"📊 Statistics: <b>{dl_total:,}</b> downloads · "
             f"<b>{pl_total:,}</b> plays\n"
             f"👥 Users recorded: <b>{await run_db(self.db.count_users)}</b>")
@@ -1335,6 +1341,7 @@ class MediaBot:
             [InlineKeyboardButton("👥 Users", callback_data="settings:users"),
              InlineKeyboardButton("📣 Broadcast", callback_data="settings:broadcast")],
             [InlineKeyboardButton("📣 Auto-Broadcast", callback_data="settings:autobc")],
+            [InlineKeyboardButton("🔄 Enricher", callback_data="settings:enricher")],
             [InlineKeyboardButton("📊 Statistics", callback_data="settings:stats")],
         ])
 
@@ -1600,6 +1607,33 @@ class MediaBot:
             [InlineKeyboardButton("⬅ Settings", callback_data="settings:main")],
         ])
 
+    async def _enricher_text(self) -> str:
+        manual = await run_db(self.db.get_kv, ENRICH_MANUAL_KV_KEY, "")
+        on = manual == "1"
+        posters = await run_db(
+            self.db.query_one,
+            "SELECT COUNT(*) AS n FROM titles "
+            "WHERE poster IS NOT NULL AND poster != ''")
+        pending = await run_db(
+            self.db.query_one,
+            "SELECT COUNT(*) AS n FROM titles WHERE tmdb_id IS NULL")
+        return (
+            "🔄 <b>Enricher</b> — poster generation\n\n"
+            f"Status: <b>{'Running now ✅' if on else 'Night-only ⏸'}</b>\n"
+            f"Posters so far: <b>{posters['n']:,}</b> · "
+            f"still unmatched: <b>{pending['n']:,}</b>\n"
+            "Nightly run 01:00–06:00 IST always runs.\n\n"
+            "▶️ Start runs it right now, day or night, until you tap "
+            "Stop. It uses one of the 2 vCPUs, so the bot may feel a "
+            "touch slower while it runs.")
+
+    def _enricher_kb(self, on: bool) -> InlineKeyboardMarkup:
+        toggle = "⏸ Stop enricher" if on else "▶️ Start enricher"
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle, callback_data="enricher:toggle")],
+            [InlineKeyboardButton("⬅ Settings", callback_data="settings:main")],
+        ])
+
     async def _autobc_caption(self, row: dict) -> str:
         """AI caption when OpenRouter is available, template otherwise."""
         llm = getattr(self, "llm", None)
@@ -1787,6 +1821,19 @@ class MediaBot:
             st = await run_db(autobc_mod.get_settings, self.db)
             await self._edit_or_send(q, await self._autobc_text(),
                                      self._autobc_kb(st))
+        elif data == "settings:enricher":
+            manual = await run_db(self.db.get_kv, ENRICH_MANUAL_KV_KEY, "")
+            await self._edit_or_send(q, await self._enricher_text(),
+                                     self._enricher_kb(manual == "1"))
+        elif data == "enricher:toggle":
+            manual = await run_db(self.db.get_kv, ENRICH_MANUAL_KV_KEY, "")
+            on = manual != "1"
+            await run_db(self.db.set_kv, ENRICH_MANUAL_KV_KEY,
+                         "1" if on else "0")
+            await q.answer("Enricher started ▶️ — running now" if on
+                           else "Enricher stopped ⏸ — back to night-only")
+            await self._edit_or_send(q, await self._enricher_text(),
+                                     self._enricher_kb(on))
         elif data == "settings:stats":
             await self._edit_or_send(q, await self._stats_text(),
                                      self._stats_kb())

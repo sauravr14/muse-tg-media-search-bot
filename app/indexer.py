@@ -41,6 +41,11 @@ log = logging.getLogger("mediabot.indexer")
 ENRICH_TZ = timezone(timedelta(hours=5, minutes=30))
 ENRICH_START_HOUR = 1
 ENRICH_END_HOUR = 6
+# Manual start/stop (Settings → 🔄 Enricher, 2026-11-16): when the owner
+# taps Start, kv `settings:enricher_manual` is "1" and the enricher runs
+# immediately, ignoring the nightly window, until Stop clears it. The
+# 01:00-06:00 IST nightly window always runs, flag or no flag.
+ENRICH_MANUAL_KV_KEY = "settings:enricher_manual"
 
 MEDIA_TYPES = ("video", "document")
 BATCH = 100
@@ -977,6 +982,11 @@ class Indexer:
                 hour=ENRICH_START_HOUR, minute=0, second=0, microsecond=0)
         return max(0.0, (target - now).total_seconds())
 
+    async def _manual_enrich_requested(self) -> bool:
+        """True when the owner tapped Start in Settings → Enricher."""
+        return await run_db(self.db.get_kv, ENRICH_MANUAL_KV_KEY,
+                            "") == "1"
+
     async def enricher_loop(self) -> None:
         """Background: attach TMDB metadata to unmatched titles.
 
@@ -994,8 +1004,12 @@ class Indexer:
         while self._running:
             # Night-only schedule: outside 01:00-06:00 IST the enricher
             # sleeps so both vCPUs serve user traffic. Sleep in capped
-            # chunks so shutdown stays responsive.
+            # chunks so shutdown stays responsive. The owner's manual
+            # Start (Settings → Enricher) overrides the gate: the loop
+            # runs immediately until Stop, checked again every pass.
             pause_s = self._enrich_pause_seconds()
+            if pause_s > 0 and await self._manual_enrich_requested():
+                pause_s = 0.0
             if pause_s > 0:
                 await asyncio.sleep(min(pause_s, 300))
                 continue

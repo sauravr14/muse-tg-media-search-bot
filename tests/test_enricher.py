@@ -102,5 +102,49 @@ class EnricherDeferralTest(unittest.TestCase):
         _a.run(main())
 
 
+class ManualFlagTest(unittest.TestCase):
+    """Settings → Enricher Start/Stop (2026-11-16): the manual flag is
+    the only thing that opens the gate outside 01:00-06:00 IST."""
+
+    def test_manual_flag_reads_kv(self):
+        import asyncio as _a
+        db = DB(Path(tempfile.mkdtemp()) / "manual.db")
+        idx = Indexer(None, db, TMDB(db, ""))
+        self.assertFalse(_a.run(idx._manual_enrich_requested()))
+        db.set_kv("settings:enricher_manual", "1")
+        self.assertTrue(_a.run(idx._manual_enrich_requested()))
+        db.set_kv("settings:enricher_manual", "0")
+        self.assertFalse(_a.run(idx._manual_enrich_requested()))
+        db.set_kv("settings:enricher_manual", "yes")
+        self.assertFalse(_a.run(idx._manual_enrich_requested()))
+
+    def test_manual_flag_opens_gate_in_daytime(self):
+        import asyncio as _a
+        db = DB(Path(tempfile.mkdtemp()) / "manual2.db")
+        idx = Indexer(None, db, TMDB(db, ""))
+        calls = []
+
+        async def fake_enrich(tid):
+            calls.append(tid)
+
+        idx._enrich_one = fake_enrich
+        idx._enrich_queue.put_nowait(123)
+        db.set_kv("settings:enricher_manual", "1")
+
+        async def main():
+            task = _a.create_task(idx.enricher_loop())
+            for _ in range(70):
+                if calls:
+                    break
+                await _a.sleep(0.1)
+            idx.stop()
+            task.cancel()
+
+        # 10:00 IST is outside the nightly window; with the flag set the
+        # loop must still enrich instead of sleeping until 01:00.
+        _a.run(main())
+        self.assertEqual(calls, [123])
+
+
 if __name__ == "__main__":
     unittest.main()

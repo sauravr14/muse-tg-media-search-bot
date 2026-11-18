@@ -76,7 +76,11 @@ class RateLimiter:
 def _file_dict(f) -> dict:
     return {"id": f["id"], "name": f["file_name"], "resolution": f["resolution"],
             "quality": f["quality"], "codec": f["codec"], "size": f["size"],
-            "duration": f["duration"], "pack_label": f["pack_label"] or ""}
+            "duration": f["duration"], "pack_label": f["pack_label"] or "",
+            # caption (first 600 chars — its first line is usually the full
+            # original filename): the frontend reads split-part numbers from
+            # the name OR the caption, whichever carries them.
+            "caption": (f["caption"] or "")[:600]}
 
 
 CLEAN_ONLY = (" AND EXISTS (SELECT 1 FROM files f WHERE f.title_id=titles.id"

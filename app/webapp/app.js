@@ -528,6 +528,16 @@
     else home();
   }));
   searchInput.addEventListener("input", onSearchInput);
+  // Brand logo: like any website logo, a tap takes you home from anywhere —
+  // same steps as the Home tab (clear search, clear a title hash, render home).
+  $("brandHome").addEventListener("click", () => {
+    haptic(); searchInput.value = ""; clearBtn.hidden = true; recentBox.hidden = true;
+    const wasTitle = /^#\/title\//.test(location.hash);
+    setTab("home");
+    if (wasTitle) { location.hash = ""; return; }   // hashchange -> route()
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    home();
+  });
   clearBtn.addEventListener("click", () => { searchInput.value = ""; clearBtn.hidden = true; route(); });
 
   function renderCamToggle() {

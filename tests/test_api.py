@@ -358,5 +358,22 @@ class SearchRankBotTest(unittest.TestCase):
                          ["A Beautiful Life", "Life Is Beautiful"])
 
 
+class FileDictCaptionTest(unittest.TestCase):
+    """_file_dict carries the caption (truncated) so the Mini App can read
+    split-part numbers from the name OR the caption."""
+
+    def test_caption_passthrough_and_truncation(self):
+        from app.api import _file_dict
+        base = {"id": 1, "file_name": "Movie.2024.1080p.mkv", "resolution": "1080p",
+                "quality": "WEB-DL", "codec": "x264", "size": 10,
+                "duration": 5, "pack_label": None, "caption": ""}
+        d = _file_dict({**base, "caption": "Movie.2024.part002.mkv"})
+        self.assertEqual(d["caption"], "Movie.2024.part002.mkv")
+        d = _file_dict({**base, "caption": "x" * 900})
+        self.assertEqual(len(d["caption"]), 600)
+        d = _file_dict({**base, "caption": None})
+        self.assertEqual(d["caption"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

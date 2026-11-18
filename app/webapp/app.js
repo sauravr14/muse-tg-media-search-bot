@@ -403,6 +403,9 @@
     if (m) return { num: +m[1], total: 0 };
     m = n.match(/\bpt[\s._-]?(\d{1,3})\b/i);
     if (m) return { num: +m[1], total: 0 };
+    // 2-CD splits: "CD 1" / "CD1"
+    m = n.match(/\bcd[\s._-]?(\d{1,2})\b/i);
+    if (m) return { num: +m[1], total: 0 };
     m = n.match(/\.(\d{3})$/);
     if (m) return { num: +m[1], total: 0 };
     m = n.match(/\.z(\d{2})$/i);
@@ -412,7 +415,9 @@
   function verRow(v, label) {
     const res = v.resolution || "";
     const langs = detectAudio(v.name);
-    const part = detectPart(v.name);
+    // part number lives in the file name OR the caption (captions usually
+    // repeat the full original filename) — name wins, caption is the fallback
+    const part = detectPart(v.name) || detectPart(v.caption);
     return `<div class="ver"><div><div class="q">${label ? esc(label) : ""}${res ? `<span class="res r${esc(res)}">${esc(res.replace("2160p", "4K"))}</span>` : ""}
       ${v.quality ? `<span>${esc(v.quality)}</span>` : ""}${!res && !v.quality && !label ? "Unknown" : ""}</div>
       <div class="s">${fmtSize(v.size)}${v.codec ? " · " + esc(v.codec) : ""}</div>

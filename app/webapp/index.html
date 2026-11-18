@@ -10,7 +10,10 @@
 <link rel="preconnect" href="https://image.tmdb.org" crossorigin>
 <link rel="dns-prefetch" href="https://image.tmdb.org">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
-<link rel="stylesheet" href="styles.css?v=2">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css?v=3">
 </head>
 <body>
 <div id="bg" aria-hidden="true"><i class="aurora a1"></i><i class="aurora a2"></i><i class="grain"></i></div>
@@ -33,7 +36,7 @@
 
 <header id="topbar">
   <div class="toprow">
-    <div class="brand"><span class="logo-dot"></span>Core TG</div>
+    <button class="brand" id="brandHome" type="button" aria-label="Core TG — go to home"><span class="brand-core">Core</span><span class="brand-sep" aria-hidden="true"></span><span class="brand-tg">TG</span></button>
     <div class="top-actions">
       <button id="camInfo" class="info-btn" title="About this filter">i</button>
     </div>
@@ -84,6 +87,6 @@
     <button id="playFsClose" aria-label="Exit fullscreen">✕</button>
   </div>
 </div>
-<script src="app.js"></script>
+<script src="app.js?v=3"></script>
 </body>
 </html>

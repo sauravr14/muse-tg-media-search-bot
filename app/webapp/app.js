@@ -386,12 +386,37 @@
     if (/org\s?audi?o/.test(joined)) return ["Original Audio"];
     return [];
   }
+  // ---- split-part detection from the raw filename ----
+  // Telegram caps files at ~4 GB, so big releases arrive split as
+  // .part001/.part002 or .zip.001/.zip.002 … — surface "Part N" under the size.
+  // Whole-token matching, so "partner"/"department" never hit, and a bare
+  // "Part 1" followed by a year (a title like "…Part 1 2010") is skipped.
+  function detectPart(name) {
+    if (!name) return null;
+    const n = String(name);
+    let m;
+    m = n.match(/\bpart[\s._-]?(\d{1,2})\s*(?:of|\/)\s*(\d{1,2})\b/i);
+    if (m) return { num: +m[1], total: +m[2] };
+    m = n.match(/[.\[]part[\s._-]?(\d{1,3})\b/i);
+    if (m) return { num: +m[1], total: 0 };
+    m = n.match(/\bpart[\s._-]?(\d{1,3})\b(?!\s*(?:19|20)\d{2}\b)/i);
+    if (m) return { num: +m[1], total: 0 };
+    m = n.match(/\bpt[\s._-]?(\d{1,3})\b/i);
+    if (m) return { num: +m[1], total: 0 };
+    m = n.match(/\.(\d{3})$/);
+    if (m) return { num: +m[1], total: 0 };
+    m = n.match(/\.z(\d{2})$/i);
+    if (m) return { num: +m[1], total: 0 };
+    return null;
+  }
   function verRow(v, label) {
     const res = v.resolution || "";
     const langs = detectAudio(v.name);
+    const part = detectPart(v.name);
     return `<div class="ver"><div><div class="q">${label ? esc(label) : ""}${res ? `<span class="res r${esc(res)}">${esc(res.replace("2160p", "4K"))}</span>` : ""}
       ${v.quality ? `<span>${esc(v.quality)}</span>` : ""}${!res && !v.quality && !label ? "Unknown" : ""}</div>
       <div class="s">${fmtSize(v.size)}${v.codec ? " · " + esc(v.codec) : ""}</div>
+      ${part ? `<div class="part">◆ Part ${part.num}${part.total ? " of " + part.total : ""}</div>` : ""}
       ${langs.length ? `<div class="langs">${langs.map((l) => `<span class="lang">${esc(l)}</span>`).join("")}</div>` : ""}</div>
       <div class="ver-btns"><button class="btn ghost" data-play="${v.id}">▶ Play</button><button class="btn" data-file="${v.id}">Get</button></div></div>`;
   }

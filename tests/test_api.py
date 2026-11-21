@@ -375,5 +375,32 @@ class FileDictCaptionTest(unittest.TestCase):
         self.assertEqual(d["caption"], "")
 
 
+class FastPoolRoutingTest(unittest.TestCase):
+    """Mini App catalog reads must use the reserved reply pool (run_db_fast),
+    never the general pool shared with scans/enricher — 2026-11-21 the API
+    hung 60s+ while direct DB queries took <1s because reads queued behind
+    heavy jobs. Writes stay on run_db."""
+
+    def test_catalog_reads_use_fast_pool(self):
+        src = Path(__file__).resolve().parent.parent.joinpath(
+            "app", "api.py").read_text()
+        for frag in ("await run_db_fast(db.query",
+                     "await run_db_fast(db.query_one",
+                     "await run_db_fast(db.get_kv",
+                     "await run_db_fast(db.stats",
+                     "await run_db_fast(fsub_list"):
+            self.assertIn(frag, src, frag)
+        for frag in ("await run_db(db.query", "await run_db(db.query_one",
+                     "await run_db(db.get_kv", "await run_db(db.stats",
+                     "await run_db(fsub_list"):
+            self.assertNotIn(frag, src, frag)
+
+    def test_writes_stay_on_general_pool(self):
+        src = Path(__file__).resolve().parent.parent.joinpath(
+            "app", "api.py").read_text()
+        self.assertIn("await run_db(stats_mod.record_event", src)
+        self.assertIn("await run_db(db.execute", src)
+
+
 if __name__ == "__main__":
     unittest.main()

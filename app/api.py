@@ -26,7 +26,7 @@ from .db import DB, RES_ORDER, _uj, fts_terms, search_rank_order
 from .owner import fsub_list
 from .parser import normalize_title
 from . import stats as stats_mod
-from .dbthread import run_db
+from .dbthread import run_db, run_db_fast
 from .streamer import (MAX_STREAMS, ByteStreamer, StreamFileNotFound,
                        parse_range, sign_token, stream_secret, verify_token)
 
@@ -123,7 +123,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
     # If bot is None (test app without a client), catalog gating fails open
     # — production always passes bot (main.py), so this only affects tests.
     async def _fsub_gate(request: Request, user_id: int | None):
-        entries = await run_db(fsub_list, db)
+        entries = await run_db_fast(fsub_list, db)
         if not entries:
             return None
         if user_id is None:
@@ -186,7 +186,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         rank_clause, rank_params = search_rank_order(normalize_title(q))
         per, off = 20, (max(page, 1) - 1) * 20
         try:
-            rows = await run_db(
+            rows = await run_db_fast(
                 db.query,
                 "SELECT t.* FROM titles_fts f JOIN titles t ON t.id=f.rowid "
                 "WHERE titles_fts MATCH ?"
@@ -220,7 +220,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         where = " WHERE tmdb_id IS NOT NULL AND poster != '' "
         if kind in ("movie", "series"):
             where += "AND kind=? "
-        rows = await run_db(
+        rows = await run_db_fast(
             db.query,
             "SELECT * FROM titles" + where
             + (CLEAN_ONLY if hide_cam else "")
@@ -246,7 +246,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
 
         heroes: list = []
         for kind in ("movie", "series"):
-            heroes += await run_db(
+            heroes += await run_db_fast(
                 db.query,
                 # tmdb_id IS NOT NULL is load-bearing: it lets SQLite use
                 # the idx_titles_home partial index. Without it the planner
@@ -258,7 +258,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         heroes.sort(key=lambda t: t["last_file_at"], reverse=True)
 
         async def rail(kind: str, label: str) -> dict:
-            rows = await run_db(
+            rows = await run_db_fast(
                 db.query,
                 # 2026 releases with posters (2026-10-29): "recently added"
                 # by file date went stale when the channel scans finished,
@@ -269,7 +269,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                 + " ORDER BY popularity DESC NULLS LAST LIMIT 18", (kind,))
             return {"title": label, "results": [_title_card(t) for t in rows]}
 
-        trending = await run_db(
+        trending = await run_db_fast(
             db.query,
             "SELECT * FROM titles WHERE tmdb_id IS NOT NULL AND poster != ''"
             + clean
@@ -284,13 +284,13 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         new_posters: list = []
         try:
             recent_ids = json.loads(
-                await run_db(db.get_kv, "recent_matches", "[]") or "[]")
+                await run_db_fast(db.get_kv, "recent_matches", "[]") or "[]")
         except Exception:
             recent_ids = []
         recent_ids = [int(i) for i in recent_ids
                       if isinstance(i, int)][:18]
         if recent_ids:
-            fetched = await run_db(
+            fetched = await run_db_fast(
                 db.query,
                 "SELECT * FROM titles WHERE id IN (%s)"
                 " AND tmdb_id IS NOT NULL AND poster != ''"
@@ -303,7 +303,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         # ordered by popularity. Pure rating DESC surfaces obscure 10.0s
         # (one-vote titles); the popularity order keeps it to titles
         # people actually watch. Measured 0.00s on the live catalog.
-        top_rated = await run_db(
+        top_rated = await run_db_fast(
             db.query,
             "SELECT * FROM titles WHERE tmdb_id IS NOT NULL AND poster != ''"
             " AND rating >= 7.5" + clean
@@ -368,7 +368,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
             body = await request.json()
         except Exception:
             raise HTTPException(400, "bad request")
-        f = await run_db(db.query_one,
+        f = await run_db_fast(db.query_one,
                          "SELECT id, file_name FROM files WHERE id=? AND status='ok'",
                          (body.get("file_id"),))
         if not f:
@@ -395,7 +395,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         file_id = verify_token(secret, token)
         if not file_id:
             raise HTTPException(403, "bad or expired link")
-        f = await run_db(db.query_one,
+        f = await run_db_fast(db.query_one,
                          "SELECT * FROM files WHERE id=? AND status='ok'",
                          (file_id,))
         if not f:
@@ -469,10 +469,10 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         params: list = [kind] if kind in ("movie", "series") else []
         if hide_cam:
             where += CLEAN_ONLY
-        total = (await run_db(db.query_one,
+        total = (await run_db_fast(db.query_one,
                               f"SELECT COUNT(*) c FROM titles {where}",
                               tuple(params)))["c"]
-        rows = await run_db(
+        rows = await run_db_fast(
             db.query,
             f"SELECT * FROM titles {where}ORDER BY {order} LIMIT ? OFFSET ?",
             tuple(params + [per, (page - 1) * per]))
@@ -484,7 +484,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
         gated = await _catalog_gate(request)
         if gated is not None:
             return gated
-        t = await run_db(db.query_one, "SELECT * FROM titles WHERE id=?",
+        t = await run_db_fast(db.query_one, "SELECT * FROM titles WHERE id=?",
                          (title_id,))
         if not t:
             raise HTTPException(404, "not found")
@@ -493,7 +493,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                     "overview": t["overview"], "popularity": t["popularity"],
                     "lang": t["lang"], "added_at": t["added_at"]})
         if t["kind"] == "movie":
-            files = await run_db(
+            files = await run_db_fast(
                 db.query,
                 "SELECT * FROM files WHERE title_id=? AND episode_id IS NULL "
                 "AND season_id IS NULL AND status='ok'"
@@ -506,7 +506,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
             # (was: 2 queries per episode -> 18s for Game of Thrones)
             by_ep: dict[int, list] = {}
             packs_by_season: dict[int, list] = {}
-            for f in await run_db(
+            for f in await run_db_fast(
                     db.query,
                     "SELECT * FROM files WHERE title_id=? AND status='ok'" + cam
                     + " ORDER BY " + RES_ORDER + " DESC", (title_id,)):
@@ -514,7 +514,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
                     by_ep.setdefault(f["episode_id"], []).append(f)
                 elif f["season_id"]:
                     packs_by_season.setdefault(f["season_id"], []).append(f)
-            season_rows = await run_db(
+            season_rows = await run_db_fast(
                 db.query, "SELECT * FROM seasons WHERE title_id=? ORDER BY season_no",
                 (title_id,))
             # ONE episode query for all seasons (was: one query per season,
@@ -523,7 +523,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
             sids = [se["id"] for se in season_rows]
             if sids:
                 ph = ",".join("?" for _ in sids)
-                for e in await run_db(
+                for e in await run_db_fast(
                         db.query,
                         f"SELECT * FROM episodes WHERE season_id IN ({ph}) "
                         "ORDER BY season_id, ep_no",
@@ -546,7 +546,7 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
 
     @app.get("/api/deeplink/file/{file_id}")
     async def deeplink(file_id: int):
-        f = await run_db(db.query_one, "SELECT id FROM files WHERE id=?",
+        f = await run_db_fast(db.query_one, "SELECT id FROM files WHERE id=?",
                          (file_id,))
         if not f or not bot_username:
             raise HTTPException(404, "not found")
@@ -554,20 +554,20 @@ def create_app(cfg: Config, db: DB, bot_username: str = "", bot=None) -> FastAPI
 
     @app.get("/api/stats")
     async def stats():
-        return await run_db(db.stats)
+        return await run_db_fast(db.stats)
 
     # -- admin ----------------------------------------------------------------------
     @app.get("/api/admin/overview")
     async def admin_overview(request: Request):
         _admin(request)
-        return {"stats": await run_db(db.stats),
-                "activity": await run_db(stats_mod.overview, db),
-                "sources": [dict(s) for s in await run_db(db.list_sources)]}
+        return {"stats": await run_db_fast(db.stats),
+                "activity": await run_db_fast(stats_mod.overview, db),
+                "sources": [dict(s) for s in await run_db_fast(db.list_sources)]}
 
     @app.get("/api/admin/unmatched")
     async def admin_unmatched(request: Request, limit: int = 50):
         _admin(request)
-        rows = await run_db(
+        rows = await run_db_fast(
             db.query,
             "SELECT * FROM files WHERE title_id IS NULL ORDER BY indexed_at DESC LIMIT ?",
             (min(limit, 200),))
